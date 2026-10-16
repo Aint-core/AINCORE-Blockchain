@@ -26,8 +26,8 @@ pub struct EpochStart {
     /// H_{E−1}'s height: activation waits for its QC (EP-4).
     #[serde(default)]
     pub prev_height: u64,
-    /// H_{E−1}'s BFT timestamp: RC-3 re-arms a node whose guards were lost
-    /// only in an epoch that began after it booted (`resume_point`).
+    /// H_{E−1}'s BFT timestamp (RC-3 read it before B405, which judges by
+    /// `prev_height`).
     #[serde(default)]
     pub prev_timestamp: u64,
 }
@@ -377,28 +377,48 @@ pub fn stage_boundary(
 /// derived. Written as `alarm:committee_mismatch:{E+1:020}`; ordering halts.
 pub const COMMITTEE_MISMATCH: &str = "COMMITTEE_MISMATCH";
 
-/// RC-3: where a node that lost its guards may resume signing.
+/// RC-3: where a node that lost its guards may resume signing. Present
+/// while it abstains: empty until a block carrying one of its proof-of-boot
+/// transactions is seen in this run (`note_boot_proof`), then the height it
+/// held then (B405: a height the chain proves later than this boot, never a
+/// time or a peer's word).
 pub const GUARD_RESUME_KEY: &str = "consensus:guard_resume_after";
 
-/// RC-3: the resume point of a node whose guards are not continuous, written
-/// once at its first such boot (a later boot keeps it). The margin covers
-/// clock skew both ways (this node's clock and the BFT time of honest
-/// vertices, each within `MAX_FUTURE_DRIFT_SECS`): a boundary block whose BFT
-/// time is later than the point was made after the boot, so the epoch it
-/// opens began after the guards were lost and holds no earlier signature.
-pub fn resume_point(storage: &StateDB, now: u64) -> Result<u64, String> {
-    if let Some(held) = storage
+/// B405: a node opened without continuous guards starts abstaining: the
+/// proof that a block was made after this boot is sought again in this run
+/// (one from an earlier run, or in a database copied from another key, says
+/// nothing of when this key last signed).
+pub fn begin_abstaining(storage: &StateDB) -> Result<(), String> {
+    storage.put(GUARD_RESUME_KEY, "").map_err(|e| e.to_string())
+}
+
+/// B405: the proven height (`None`: not abstaining, or no proof yet).
+pub fn level_height(storage: &StateDB) -> Result<Option<u64>, String> {
+    Ok(storage
         .get(GUARD_RESUME_KEY)
         .map_err(|e| e.to_string())?
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        return Ok(held);
+        .and_then(|v| v.trim().parse::<u64>().ok()))
+}
+
+/// B405: whether this node abstains and has no proof yet.
+pub fn awaits_boot_proof(storage: &StateDB) -> Result<bool, String> {
+    Ok(storage
+        .get(GUARD_RESUME_KEY)
+        .map_err(|e| e.to_string())?
+        .is_some_and(|v| v.trim().is_empty()))
+}
+
+/// B405: a proof-of-boot transaction of this run has a receipt while this
+/// node holds `height`, so the block that carries it, at or below `height`,
+/// was made after this boot. Kept only while the node abstains, and only
+/// the first: a later, higher height would only postpone the re-arm.
+pub fn note_boot_proof(storage: &StateDB, height: u64) -> Result<(), String> {
+    if !awaits_boot_proof(storage)? {
+        return Ok(());
     }
-    let point = now.saturating_add(2 * crate::ingress_v4::MAX_FUTURE_DRIFT_SECS);
     storage
-        .put(GUARD_RESUME_KEY, &point.to_string())
-        .map_err(|e| e.to_string())?;
-    Ok(point)
+        .put(GUARD_RESUME_KEY, &height.to_string())
+        .map_err(|e| e.to_string())
 }
 
 /// `consensus:epoch_active`: the active epoch, written at activation.
@@ -632,22 +652,35 @@ impl Engine {
         self.last_floor = self.gc_floor();
         self.own.clear();
         self.collectors.clear();
-        let began_at = next.prev_timestamp;
+        let boundary = next.prev_height;
         self.set_active(next);
         // RC-3: a node that abstained resumes at the activation of an epoch
         // that began after its guards were lost (review HIGH: "the next
         // activation it performs" re-armed a re-syncing node inside an epoch
-        // it had already signed in).
-        let began_after_loss = self.resume_after.is_some_and(|point| began_at > point);
-        if !self.guards_continuous && began_after_loss {
-            let origin = guard_origin(
-                &self.cfg.chain_id,
-                &self.cfg.genesis_identity,
-                &self.cfg.node_key,
-            );
-            if self.storage.put("consensus:guard_origin", &origin).is_ok() {
+        // it had already signed in). B405: an epoch whose boundary block is
+        // above the height this node held when a block carrying one of its
+        // proof-of-boot transactions was seen (`note_boot_proof`). That block
+        // was made after this boot, so a higher boundary closes an epoch that
+        // ran after the loss, and the epoch it opens holds no earlier
+        // signature. Neither a clock nor a peer's word is read: a time point
+        // taken at boot from a clock an hour behind (a Pi before NTP)
+        // re-armed at a boundary replayed while catching up, inside an epoch
+        // the old database had signed in.
+        if !self.guards_continuous {
+            let after_proof = level_height(&self.storage)
+                .ok()
+                .flatten()
+                .is_some_and(|proven| boundary > proven);
+            let rearmed = after_proof && {
+                let origin = guard_origin(
+                    &self.cfg.chain_id,
+                    &self.cfg.genesis_identity,
+                    &self.cfg.node_key,
+                );
+                self.storage.put("consensus:guard_origin", &origin).is_ok()
+            };
+            if rearmed {
                 self.guards_continuous = true;
-                self.resume_after = None;
                 let _ = self.storage.delete(GUARD_RESUME_KEY);
             }
         }

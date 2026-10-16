@@ -156,6 +156,67 @@ async function main(): Promise<void> {
         (axios as any).get = get;
     }
 
+    // B329: a REST read is asked again on a rate limit or a busy answer
+    // (it threw at the first 429), a rate-limited node is up, an indexer's
+    // failure is an error (it read as "no trades"), and the delegation
+    // reads name the node's snake_case fields in camelCase (they were
+    // passed on as they came, always undefined).
+    {
+        const limited = (status: number) => {
+            const e: any = new Error(`Request failed with status code ${status}`);
+            e.response = { status, data: '' };
+            return e;
+        };
+        const slow = new Connection('http://127.0.0.1:8002/rpc', 'http://127.0.0.1:3001');
+        slow.busyBackoffMs = 0;
+        let gets = 0;
+        (axios as any).get = async () => {
+            gets += 1;
+            if (gets < 3) throw limited(gets === 1 ? 429 : 503);
+            return { status: 200, data: { network: 'AINCORE-TESTNET-V9', latest_block: 1 } };
+        };
+        try {
+            const info = await slow.getNetworkInfo();
+            if (info.chain_id !== 'AINCORE-TESTNET-V9' || gets !== 3) {
+                throw new Error(`a rate-limited REST read was not asked again: ${JSON.stringify([info, gets])}`);
+            }
+            (axios as any).get = async () => { throw limited(429); };
+            if (!(await slow.checkHealth())) {
+                throw new Error('a rate-limited node read as down');
+            }
+            (axios as any).get = async () => { throw new Error('ECONNREFUSED'); };
+            if (await slow.getDexMarkets().then(() => true, () => false)) {
+                throw new Error("an indexer's failure read as no markets");
+            }
+        } finally {
+            (axios as any).get = get;
+        }
+        (slow as any).client.post = async () => ({
+            status: 200,
+            data: { result: [{ validator: 'ab', amount: '5', pending_rewards: '7' }] },
+        });
+        const delegations = await slow.getDelegations('cd');
+        if (delegations[0]?.pendingRewards !== '7' || delegations[0]?.amount !== '5') {
+            throw new Error(`the delegation fields: ${JSON.stringify(delegations)}`);
+        }
+        (slow as any).client.post = async () => ({
+            status: 200,
+            data: { result: [{ validator: 'ab', amount: '5', unlock_time: 99 }] },
+        });
+        const unbonding = await slow.getUnbondingDelegations('cd');
+        if (unbonding[0]?.unlockTime !== 99) {
+            throw new Error(`the unbonding fields: ${JSON.stringify(unbonding)}`);
+        }
+        (slow as any).client.post = async () => ({
+            status: 200,
+            data: { result: [{ address: 'ab', total_delegated: '9', commission_rate: 5, delegator_count: 2 }] },
+        });
+        const pools = await slow.getValidatorsWithDelegation();
+        if (pools[0]?.totalDelegated !== '9' || pools[0]?.delegatorCount !== 2) {
+            throw new Error(`the pool fields: ${JSON.stringify(pools)}`);
+        }
+    }
+
     // B260: a busy answer is asked again (one heavy call at a time a
     // client, so a dapp's parallel receipts failed at once), at most
     // `busyRetries` times; any other error is not.

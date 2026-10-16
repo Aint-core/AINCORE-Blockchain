@@ -464,6 +464,66 @@ pub fn signed_publish_with(
     canonical_json(&tx)
 }
 
+/// B405: the execution gas a proof-of-boot transaction offers. A transfer
+/// to itself uses far less; only its inclusion counts, so even an abort
+/// would serve.
+pub const PROOF_EXECUTION_GAS: u64 = 100_000;
+
+/// B405: a transaction that did not exist before this boot: `key`'s account
+/// sends itself `amount` quanta (chosen at random by the caller, so its
+/// bytes are new), at its committed sequence number and twice the committed
+/// base fee. Any block that carries it was made after this boot: RC-3's
+/// resume point. Returns its canonical JSON and its id (the receipt's key).
+pub fn proof_of_boot_tx(
+    db: &storage::StateDB,
+    chain_id: &str,
+    key: &crypto::SigningKey,
+    amount: u128,
+) -> Result<(String, String), String> {
+    use crypto::Signer;
+    use move_core_types::{account_address::AccountAddress, identifier::Identifier};
+    let public = key.verifying_key().to_bytes();
+    let sender = crypto::derive_address(&public).map_err(|e| format!("{e:?}"))?;
+    let me = crate::parse_move_address(&sender).ok_or("the key's address is not a Move address")?;
+    let module = move_core_types::language_storage::ModuleId::new(
+        AccountAddress::ONE,
+        Identifier::new("coin").map_err(|e| e.to_string())?,
+    );
+    let call = vm_move::EntryFunctionCall {
+        module,
+        function: "transfer".to_string(),
+        ty_args: vec![crate::aincore_coin_type()],
+        args: vec![
+            bcs::to_bytes(&me).map_err(|e| e.to_string())?,
+            bcs::to_bytes(&me).map_err(|e| e.to_string())?,
+            bcs::to_bytes(&amount).map_err(|e| e.to_string())?,
+        ],
+    };
+    let payload = vm_move::TransactionPayload::EntryFunction(call);
+    let mut tx = Transaction {
+        chain_id: chain_id.to_string(),
+        sender: sender.clone(),
+        input_objects: vec![],
+        payload: hex::encode(bcs::to_bytes(&payload).map_err(|e| e.to_string())?),
+        args: vec![],
+        gas_limit: 0,
+        gas_price: crate::committed_base_fee(db).saturating_mul(2).max(1),
+        sequence_number: crate::committed_sequence_number(db, &sender),
+        public_key: hex::encode(public),
+        // The signature's own size counts: a placeholder of the same length.
+        signature: hex::encode([0u8; 64]),
+        paymaster: None,
+        paymaster_signature: None,
+        zkp_proof: None,
+    };
+    let unsized_len = canonical_json(&tx).len();
+    tx.gas_limit = gas_limit_covering(unsized_len, PROOF_EXECUTION_GAS);
+    tx.signature = hex::encode(key.sign(signing_message(&tx).as_bytes()).to_bytes());
+    let json = canonical_json(&tx);
+    let id = crate::tx_hash_hex(&json);
+    Ok((json, id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

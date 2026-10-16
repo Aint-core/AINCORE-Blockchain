@@ -1,3 +1,5 @@
+/// B349: the environment a node reads, checked at boot.
+pub mod env_check;
 /// B21: transactions forwarded from outside the committee.
 pub mod forward;
 pub mod genesis;
@@ -6,6 +8,44 @@ pub mod qc_rpc;
 pub mod sessions;
 pub const API_PORT: u16 = 8002;
 pub mod metrics;
+
+/// B326: another node database in `datadir` (`validator_{port}.db`) when
+/// there is none for `port`: this node's own chain under another port. The
+/// default port moved (9001 to 9002, B305), and a node started without
+/// `--port` opened an empty database beside its own, ran genesis again and
+/// synced from height 0, its own chain left behind.
+pub fn other_validator_db(datadir: &std::path::Path, port: u16) -> Option<String> {
+    if datadir.join(format!("validator_{port}.db")).exists() {
+        return None;
+    }
+    std::fs::read_dir(datadir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .find(|name| name.starts_with("validator_") && name.ends_with(".db"))
+}
+
+#[cfg(test)]
+mod datadir_tests {
+    /// B326 witness: a datadir holding another port's database, and none
+    /// for this one, names it; its own, or none at all, names nothing.
+    #[test]
+    fn another_ports_database_is_named() {
+        let dir = storage::test_dir::process_dir().join(format!("b326_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(super::other_validator_db(&dir, 9002), None);
+        std::fs::create_dir_all(dir.join("validator_9001.db")).unwrap();
+        assert_eq!(
+            super::other_validator_db(&dir, 9002).as_deref(),
+            Some("validator_9001.db")
+        );
+        assert_eq!(super::other_validator_db(&dir, 9001), None);
+        std::fs::create_dir_all(dir.join("validator_9002.db")).unwrap();
+        assert_eq!(super::other_validator_db(&dir, 9002), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
 #[cfg(test)]
 mod public_claims_tests;
 

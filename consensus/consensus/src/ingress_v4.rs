@@ -513,12 +513,42 @@ pub fn v4_verdict_checked(
     verified: impl Fn(&ParentRef) -> bool,
     gate: impl FnOnce(&Vertex) -> PayloadGate,
 ) -> (Verdict, Ran) {
+    v4_verdict_judged(false, raw_len, v, ctx, local_cert, verified, gate)
+}
+
+/// B442: `v4_verdict_checked`; `authenticated`: `v` is a body this node
+/// kept PENDING on its parents' certificates, after Layer S passed it under
+/// the active epoch's record, and kept without transport fields. Layer S
+/// is not run again for it: its digest binds every field Layer S reads and
+/// the record is the one it passed under (activation empties the buffer),
+/// so only the epoch, Layer E and the payload are. Each wake ran it again,
+/// over up to 768 KiB, uncounted.
+pub(crate) fn v4_verdict_judged(
+    authenticated: bool,
+    raw_len: usize,
+    v: &Vertex,
+    ctx: &Context<'_>,
+    local_cert: impl Fn(&ParentRef) -> Option<CompactCert>,
+    verified: impl Fn(&ParentRef) -> bool,
+    gate: impl FnOnce(&Vertex) -> PayloadGate,
+) -> (Verdict, Ran) {
     let mut ran = Ran::default();
-    let verdict = v4_verdict_inner(raw_len, v, ctx, local_cert, verified, gate, &mut ran);
+    let verdict = v4_verdict_inner(
+        authenticated,
+        raw_len,
+        v,
+        ctx,
+        local_cert,
+        verified,
+        gate,
+        &mut ran,
+    );
     (verdict, ran)
 }
 
+#[allow(clippy::too_many_arguments)] // the verdict's inputs, and what it ran
 fn v4_verdict_inner(
+    authenticated: bool,
     raw_len: usize,
     v: &Vertex,
     ctx: &Context<'_>,
@@ -613,21 +643,27 @@ fn v4_verdict_inner(
         // vertex at any round would otherwise be kept).
         return Verdict::Drop(format!("round {} beyond the next epoch's lead", v.round));
     }
-    if let Err(e) = transport_shape(v, record) {
-        crate::work::note_failed_check();
-        return Verdict::Invalid(e);
-    }
-    if let Err(e) = layer_s_auth(v, record, ctx.chain_id, ctx.genesis_identity) {
-        return Verdict::Invalid(e);
+    // B442: a kept body of the active epoch passed Layer S already.
+    let woken = authenticated && v.epoch == active.epoch;
+    if !woken {
+        if let Err(e) = transport_shape(v, record) {
+            crate::work::note_failed_check();
+            return Verdict::Invalid(e);
+        }
+        if let Err(e) = layer_s_auth(v, record, ctx.chain_id, ctx.genesis_identity) {
+            return Verdict::Invalid(e);
+        }
     }
     ran.authenticated = true;
-    if let Err(e) = layer_s_shape(v, record) {
-        // B204: refused for what its author signed: charged (no honest
-        // author signs one), and the engine refuses its copies before Layer
-        // S (each ran the hash and the signature again, uncharged).
-        crate::work::note_failed_check();
-        ran.signed_refusal = true;
-        return Verdict::Invalid(e);
+    if !woken {
+        if let Err(e) = layer_s_shape(v, record) {
+            // B204: refused for what its author signed: charged (no honest
+            // author signs one), and the engine refuses its copies before
+            // Layer S (each ran the hash and the signature again, uncharged).
+            crate::work::note_failed_check();
+            ran.signed_refusal = true;
+            return Verdict::Invalid(e);
+        }
     }
     if v.epoch > active.epoch {
         // Its payload is checked before it is kept.

@@ -40,7 +40,7 @@ async function main() {
         const tx = Transaction.createTransfer(
             genesisKeypair,
             newWallet.address,
-            500,
+            500n,
             senderAccount.sequence_number
         );
         tx.sign(genesisKeypair);
@@ -56,7 +56,7 @@ async function main() {
         const finalBalance = await connection.getBalance(newWallet.address);
         console.log('💰 New Wallet Final Balance:', finalBalance);
 
-        if (finalBalance === initialBalance + 500) {
+        if (finalBalance === initialBalance + 500n) {
             console.log('🎉 Balance Check PASSED!');
         } else {
             console.error('❌ Balance Check FAILED: Balance mismatch');

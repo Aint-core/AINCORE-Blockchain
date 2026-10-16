@@ -4,7 +4,8 @@
 - **Basis:** `docs/research/epoch_and_rewards.md` (derivations, production precedents,
   findings F1–F8), `docs/research/emission_rate_decision.md` (1.90 %/yr),
   `docs/research/clock_and_deadlines.md` (amendment A1: the clock, unbonding, commission
-  and unclaimed stake, with every source), the G1 and G3 contracts. Every number below is
+  and unclaimed stake, with every source), `docs/research/participation.md` (amendment A5:
+  pay and seats by participation), the G1 and G3 contracts. Every number below is
   derived there, from the measured block time, or from a production chain; none is a guess.
 - **Amendment A1 (2026-09-30, after S1 `65cc92a`).** S1 counted every deadline in block
   heights. That is exact only while the real block time equals the one measured at genesis:
@@ -78,10 +79,31 @@ from the RPC. It created proposals from one node's RPC with that node's wall clo
 (`SystemTime::now()`), so deadlines differed per node, and executing such a proposal would
 change state on only some nodes. G3's write gate already refuses those RPC writes on the
 new chain, so the path is dead there; it is deleted, not converted. Move governance loses
-`update_epoch_duration` (see P-1) and keeps signalling proposals. It has no voting period and
-no timelock (the 24-hour timelock was the Rust crate's), so it has no parameter: a pinned
-value nothing reads is dead state. At the permissioned launch, parameters change by
-software upgrade.
+`update_epoch_duration` (see P-1) and keeps signalling proposals only: `create_proposal`
+accepts only `action_type == 0` (`EUNSUPPORTED_ACTION`), and a resolved proposal changes
+nothing but its own `executed` flag. B386: this paragraph used to say Move governance has no
+voting period and no parameter; `core/vm_move/stdlib/sources/governance.move` has these
+rules, all fixed in the stdlib (bound by the stdlib hash that genesis pins, like P-1's
+stdlib constants; none is in `Params`, and none is governable):
+- **Proposal fee.** `create_proposal` withdraws 10,000 AIN from the proposer (`fee_amount`
+  = 10²² base units) and burns it (`staking::burn_ain`), on every proposal, whatever its
+  outcome.
+- **Voting period.** `VOTING_PERIOD_SECS = 604,800` (7 days of consensus time τ, B71; Aptos
+  mainnet's `voting_duration_secs`). A proposal stores `voting_ends = chain::time() +
+  VOTING_PERIOD_SECS`; `vote` requires `chain::time() < voting_ends` (`EVOTING_CLOSED`), and
+  `execute_proposal` requires `chain::time() ≥ voting_ends` (`EVOTING_OPEN`).
+- **Votes lock coins.** `vote` withdraws `amount > 0` AIN (`EZERO_WEIGHT`) into the voter's
+  `VoteEscrow`: one lock per proposal (`EALREADY_VOTED`), at most `MAX_LOCKS = 16` open
+  locks per account (`ETOO_MANY_LOCKS`). `claim_vote_tokens` returns every lock whose
+  proposal's voting has ended or that was resolved, whatever the outcome.
+- **Quorum and majority.** `execute_proposal` requires `votes_for + votes_against ≥`
+  1,000,000 AIN (`min_quorum` = 10²⁴ base units) and `votes_for > votes_against`, else
+  `EINSUFFICIENT_VOTES`; it then sets `executed`, which is a signal and nothing more.
+- **Description.** At most `MAX_DESCRIPTION_BYTES = 1,024` bytes (`EDESCRIPTION_TOO_LONG`).
+
+There is no timelock (the 24-hour timelock was the Rust crate's). `fee_amount` and
+`min_quorum` are literals inside `create_proposal` and `execute_proposal`, not named
+constants. At the permissioned launch, parameters change by software upgrade.
 
 **P-1 (parameters).** Two kinds, both immutable after genesis:
 
@@ -129,9 +151,9 @@ mints at most C_τ of emission.
 (G1 EP-2), not the live set.
 - **Weights and exclusions.** Jailed members are excluded. Weights are the committee stake,
   in whole AIN; a member's share is pot × w / W (Amendment A4, BW-7 removed the saturation
-  clip).
+  clip), times its participation in the period paid (Amendment A5, PA-2).
 - **Fees.** Per-block fees go to the same committee, split as today: 20 % to the anchor
-  leader, 80 % by committee stake (research b.6).
+  leader, 80 % by committee stake (research b.6), each part scaled by participation (PA-2).
 - **The committee record.** The executor records each committee in state as
   `sys:validator_set:epoch:{E}` at H_{E−1}; epoch 0 uses the genesis committee.
 - **One rule for both sides.** The executor applies the same rule consensus uses (EP-2's
@@ -160,12 +182,26 @@ remainder κ, a principal escrow (C plus unbonding) and a reward escrow.
 - **Split.** A payout gives member v its share r_v (EM-2), split with the frozen
   record (s_v, d_v) of its epoch, b_v = s_v + d_v:
   - r_s = ⌊r_v·s_v/b_v⌋ and r_d = ⌊r_v·d_v/b_v⌋;
-  - the commission m = ⌊r_d·c*/10⁴⌋, with c* the rate in force at the start of the reward
+  - the part the pool earns, r_e = r_d while its active principal holds its weight
+    (C ≥ d_v AIN), else ⌊r_d·C/(d_v AIN)⌋ (B451, `delegation::pool_payout`);
+  - the commission m = ⌊r_e·c*/10⁴⌋, with c* the rate in force at the start of the reward
     period (CM-1);
-  - π = r_d − m.
+  - π = r_e − m.
 - **Minting.** r_s + m is minted to the validator. π is minted into the pool's reward escrow
   with ρ += ⌊(π·S + κ)/P⌋ and κ ← remainder. If the pool is not open or holds fewer than
-  10¹⁸ points, neither π nor m is minted; that part stays in the reserve.
+  10¹⁸ points, neither π nor m is minted; that part stays in the reserve, as does r_d − r_e.
+- **Leavers.** A delegator stops earning at its leave transaction (EM-3), but d_v sizes the
+  pool's part until the epoch ends. Spread over the live points, r_d went to whoever stayed
+  or joined: a 2 AIN position left alone in a pool that weighed 1,000,000 AIN took about
+  16 times its stake in one epoch, and its validator the commission on the leavers' weight
+  (B451, 2026-10-15; the research residual of one epoch's yield assumed P ≈ d_v). With r_e
+  no point earns more per AIN than the frozen weight does, and the leavers' part stays in
+  the reserve, as a missing weight's share does below s_min (BW-7).
+  - Trade-off: the leavers' tickets stay slashable for the epoch (SL-1) and are paid nothing
+    for its rest. Paying them, as Aptos pays its pending-inactive stake, needs per-ticket
+    reward accounting.
+  - The operator's own part r_s is not capped: it is the operator's whatever its live stake,
+    so nobody else can take it, and its seat's work for the epoch is still owed.
 - **Nothing beyond e.** The payout draws e as one `staking::Emission`, a value with no
   abilities: Move forces every unit either to a recipient or back to the reserve within
   the same transaction, and nothing but drawn coins can go back. Nothing else mints for
@@ -176,7 +212,11 @@ remainder κ, a principal escrow (C plus unbonding) and a reward escrow.
 - **Positions.** A position of p points with snapshot σ is owed ⌊p·(ρ − σ)/S⌋, paid (clamped to
   the escrow) whenever it changes or on claim.
 - **Joiners.** A new position starts at σ = ρ, so it earns nothing from before it joined. It
-  earns from the next payout; its weight counts from the next epoch.
+  earns from the next payout; its weight counts from the next epoch. Until then it shares
+  r_e, at no more than the frozen weight's rate per AIN, whoever left: at most that rate on
+  its own stake for one epoch (accepted, docs/research/delegation_pools.md residual 2). It is
+  paid by the pool's other delegators or, while the pool is below its frozen weight, from
+  the leavers' part that would return to the reserve.
 - **Escrow.** The reward escrow covers every position's claim. It exceeds their sum by at
   most P/S + (positions) + 1 base units: the carry κ, plus the flooring. A claim is clamped
   to the escrow, so this dust never makes a claim abort.
@@ -234,9 +274,30 @@ per epoch (DL-1). Tickets created after the slash are not cut twice.
     stake in C_{E_i}: its frozen delegated weight, plus the part of an AIN that whole-AIN
     weights drop (B149, 2026-10-06). A delegation made after E_i began weighed nothing in
     C_{E_i} and was burned too; Cosmos sizes a slash by the stake at the infraction height.
-  - Residual, bounded: a pool that both took deposits (n) and lost in-scope stake to
-    tickets (t) after E_i began is cut by at most f·min(n, t) too much at settlement, and a
-    later raise to 100 % (a certificate conflict) by at most min(n, the first cut).
+  - Residual, bounded, accepted (B149, B474): a ticket event cuts every unpaid in-scope
+    ticket by its whole fraction; only the active principal is capped at what the pool had
+    at stake.
+    - At settlement, a pool that both took deposits (n) and lost in-scope stake to tickets
+      (t) after E_i began is cut by at most f·min(n, t) too much.
+    - A later raise to 100 % (a certificate conflict, SL-6) caps the active principal at
+      what either committee weighed the pool at, but its event burns every unpaid in-scope
+      ticket whole, including those made after the first settlement (a closed pool earns
+      nothing, so its delegators leave). It over-cuts by up to n, every coin in scope that
+      weighed in neither committee: a deposit made after the conflict's epoch began, or made
+      after E_i began and withdrawn before the conflict's epoch. The bound min(n, the first
+      cut) written here before held only when nobody left between the settlement and the
+      raise (round-30 audit, B474). Example: d = 10,000 AIN at stake, n = 90,000 AIN
+      delegated after the conflict's epoch began, the twins settled at ~10 %. Every
+      delegator then leaves, and the raise burns the 99,000 AIN of tickets: 90,000 more
+      than was at stake.
+    - Why accepted: it needs a certificate conflict, so more than a third of the committee
+      Byzantine; it is the same on every node and only burns; and it falls only on coins
+      delegated to a validator convicted in full. Capping a ticket event at what was at
+      stake needs each pool's unpaid ticket mass per creation epoch, for every epoch a
+      scope can reach ((W + D + I·C_τ) / epoch length, ~106 entries at 1.9 h epochs, more
+      with faster blocks), and each ticket's value after earlier events (they compound
+      and merge). That rebuilds SL-1's ticket accounting for an attack beyond the threat
+      model. The own side is capped on every call (SL-6, `staking::own_slash_cuts`).
   - A ticket records the pool's slash count when it is made, so it is cut only by later
     events, and only once.
   - Each ticket is cut when withdrawn. The cut is burned.
@@ -272,10 +333,21 @@ that leaves, the remainder of a partial slash, and a delegator that undelegates.
       like any evidence row once ordering resumes after recovery.
 - **Verification.** Evidence is carried through the DAG (`SLASH_EVIDENCE:`) and verified
   against C_E (keys and membership), never the live set.
-- **Age.** It is refused once τ > τ_start(E+1) + W. That is never before W has passed since
-  the latest moment the offense could have happened. It is also refused once C_E's record
-  is gone. Committee records, their splits and τ_start(E) are kept while τ ≤ τ_start(E+1) + W
-  and for at least 8 epochs.
+- **Age.** Evidence carried by block h is judged at τ(h−1), the clock its parent committed
+  (its time and height): it is refused once τ(h−1) > τ_start(E+1) + W. That is never before
+  W has passed since the latest moment the offense could have happened. It is also refused
+  once C_E's record is gone. Committee records, their splits and τ_start(E) are kept while
+  τ ≤ τ_start(E+1) + W and for at least 8 epochs.
+  - **One clock for the builder and every node** (B457, 2026-10-15). A builder verifies the
+    evidence it carries on its parent's state, so at τ(h−1). Execution reads that clock
+    before CL-2 writes τ(h), and judges the block's evidence at it. Judged at τ(h), an item
+    whose W ended within the block's clock growth passed the builder, took one of the block's
+    evidence slots, and was refused on every node.
+  - The window closes at most one block later than at τ(h), so at most C_τ of consensus time,
+    and never earlier. C_E's records still exist in that block: pruning them needs τ past
+    τ_start(E+1) + W too, and runs after the block's evidence is applied.
+  - SL-5's settlement stays final. It runs at τ(h), after the block's evidence is applied,
+    and every later block judges evidence at τ(h) or later.
 - **Tombstone.** A validator's first accepted offense is its only one:
   - it is jailed for good and never re-enters a committee;
   - its `join_validator_set` is refused;
@@ -320,8 +392,30 @@ that leaves, the remainder of a partial slash, and a delegator that undelegates.
   `A = f·b` (bps × weight), `self = min(10⁴, ⌈A/s⌉)`, `pool = min(10⁴, ⌈max(0, A − 10⁴·s)/d⌉)`
   (bps), so an operator without a pool pays exactly f.
 
-- Every unbonding entry of the validator made in epoch e_v or later is cut by `self`. Earlier
-  entries are out of scope.
+- The validator's unbonding entries made in epoch e_v or later are in scope; earlier entries
+  are out of scope. They lose `self` of their total, but of no more than the operator had at
+  stake in C_{e_v}: its frozen own weight s, plus the part of an AIN that whole-AIN weights
+  drop (B392, 2026-10-07), as the pool side (SL-1, B149). Stake added after e_v began (an
+  `add_stake`, or fresh coins after leaving and joining again) weighed nothing in C_{e_v}
+  and was burned too: all of it once a large pool made `self` 100 % (at d ≈ 99·s, a 1 %
+  fault). Cosmos sizes a slash by the stake at the infraction height.
+  - The loss is taken from the oldest in-scope entry first (`staking::own_slash_cuts`).
+    Every removal unbonds the whole own stake and the queue is in creation order, so the
+    stake at stake in C_{e_v} is all in the oldest in-scope entry; a later one holds only
+    stake that joined after e_v began. Pro rata would cut those later coins and spare part
+    of the stake that was at stake.
+  - Residual, bounded: a later raise to 100 % (a certificate conflict) after a settlement
+    below it cuts by at most min(n, the first cut) too much, n the own stake added after
+    e_v began: `own_slash_cuts` caps every call, the raise included, at what the operator
+    had at stake. The pool side's tickets are not capped so (SL-1, B474).
+  - A certificate conflict that raises a lesser offense keeps the earlier of the two scopes.
+    Its split is the conflict's when the conflict is the earlier, and the larger of the two
+    on each side (own, pool) otherwise (`delegation::raised_split`, B411, 2026-10-08). The
+    100 % then reaches what the conflicting committee had at stake. Before, the lesser
+    offense's split was kept, so an offender that let a cheap twin be recorded and then grew
+    its stake and pool within the evidence age paid 100 % of the twin's stake only. Taking
+    the larger keeps the earlier cut when the stake shrank between them; it is never more
+    than one of the two committees weighed the offender at.
 - The pool is cut by `pool` (SL-1).
 - At f = 100 % both are 100 %, so the cost of an attack is unchanged.
 - An isolated fault reaches delegators only when f·b > s.
@@ -388,7 +482,9 @@ MEDIUM defects. Each fix below has a witness in the release manifest.
     each convict's lesser offense: an unsettled one settles at 100 % with the earlier scope, a
     settled one loses what remains in scope at once (`report_certificate_conflict`;
     `validator:convicted_full` marks the end). Witness
-    `g5_a_certificate_conflict_raises_a_lesser_offense_to_full`.
+    `g5_a_certificate_conflict_raises_a_lesser_offense_to_full`. The raise is sized by the
+    conflict's committee too, not only the lesser offense's (SL-6, B411). Witness
+    `a_later_conflict_cuts_what_its_committee_had_at_stake`.
   - *Slashable stake cannot leave before settlement* (MEDIUM). An offender's unbonding entries
     of its scope are frozen from acceptance to settlement (`staking::FrozenPayouts`), and a
     delegator's ticket in an unsettled scope waits too. Settlement handles at most 32 offenses
@@ -514,8 +610,8 @@ the leave transaction itself, so a leave and a rejoin inside one epoch keep noth
 
 **BW-7 (rewards and fees).** A member's share of a payout is pot × w / max(W, s_min): its
 weight over the paid committee's whole weight, as Cosmos, Ethereum and Solana pay, or over
-s_min when the committee weighs less. Bootstrap weight counts in the member's own part, never
-its pool's: delegators did not provide it.
+s_min when the committee weighs less, times its participation (A5, PA-2). Bootstrap weight
+counts in the member's own part, never its pool's: delegators did not provide it.
 - While the bootstrap lasts W = s_min, so the whole draw is paid. When forfeits or the cap
   (BW-11) leave the committee below s_min, the missing weight's share stays in the reserve:
   nobody earns more per AIN of weight because another member lost weight (second review
@@ -537,7 +633,12 @@ its pool's: delegators did not provide it.
   (BW-11). Whether the founder's bootstrap weight is paid at all is the founder's decision
   (`genesis_bootstrap.md`, "The founder's earnings"); if every party restakes, the founder
   ends the bootstrap holding about 27 % of owned stake (second review MEDIUM-6).
-- Fees are unchanged: 20 % to the anchor leader, 80 % by committee weight.
+- Fees follow the same floor (B393, B403): 20 % is the anchor leader's bonus and 80 % is
+  shared by committee weight, both scaled by W / max(W, s_min). Leaders are drawn by stake
+  from the committee, so below s_min a survivor leads w / W of the blocks; an unscaled
+  bonus would rise by s_min / W after a rival's forfeit. The part a committee below s_min
+  leaves unpaid is burned (the fee was destroyed when it was charged, so no reserve holds
+  it).
 
 **BW-8 (never coins).** Bootstrap weight never enters a CoinStore, `ValidatorSet` stake, the
 total supply, or the emission reserve's accounting. At each boundary the executor records
@@ -604,11 +705,10 @@ refunded after unbonding) displaced operators that own 0 AIN and forfeited their
   epoch: a forfeit takes effect one epoch late (review LOW-8), and if a member was dropped a
   survivor can exceed a third for that epoch (second review L1). The kept committee is
   consensus's own derivation (EP-2), which the cap cannot reweigh without changing it.
-- Participation is measured by leader slots only. A member that authors only its leader-round
-  vertices and signs no one else's certificates scores 100 % and is paid in full, as owned
-  validators are under G5 (second review MEDIUM-5). Measuring every round needs the authors
-  of each block's committed vertices bound into the block, a G1 block-format change; it is
-  open, for owned and bootstrap weight alike.
+- Participation was measured by leader slots only (second review MEDIUM-5). B4 bound the
+  authors of each block's committed vertices into the block and added the vertex share to
+  BW-6; Amendment A5 (B464) now pays and seats every member, owned or bootstrap weight, by
+  that count.
 - An owned stake of a third or more is never cut (only bootstrap weight is); CH-1 bounds how
   fast it can be bought (review INFO).
 - The founder's share (≤ 30 %) and the operator count are rules of the genesis ceremony, not
@@ -647,7 +747,7 @@ refunded after unbonding) displaced operators that own 0 AIN and forfeited their
 | A 65,536-round scan could cost seconds | LOW | BW-6: 4,096 anchor rounds |
 | Convictions ignored the snapshot; partial epochs; undelegations matched by sender only | LOW | IT-7: the jail round decides; membership by blocks; matched by pool |
 | Witnesses missing; untested branches (pruning, all protected, the boundary schedule) | LOW | added |
-| Participation by leader slots only (a free rider is paid in full) | MEDIUM | open, see Known |
+| Participation by leader slots only (a free rider is paid in full) | MEDIUM | B4: the vertex share in BW-6; B464: Amendment A5 pays and seats every member by it |
 | The founder accumulates owned stake if it restakes | MEDIUM | the founder's decision (`genesis_bootstrap.md`) |
 
 **Stages.**
@@ -660,6 +760,117 @@ refunded after unbonding) displaced operators that own 0 AIN and forfeited their
 | A4-S4 | BW-10 RPC, operator guide | `get_bootstrap_reports_the_state` |
 | A4-S5 | Crash pin re-proof, mutation campaign, two independent review rounds | campaign 3 below: 69 of 69 killed; findings fixed |
 | A4-S6 | Incentivized-testnet scoring (`genesis-tool score-testnet`, `gen-multi --allocations-file`) producing P0 (operators' genesis stake and bootstrap weight, the public track's accounts) from testnet chain data | `the_testnet_scores_operators_by_their_leader_slots`, `a_jail_counts_only_up_to_the_snapshot`, `the_public_track_counts_points_on_three_days` |
+
+## Amendment A5: participation (B464, 2026-10-15)
+
+The round-30 audit (B464, MEDIUM) found that pay and seats ignored participation. A member
+that ran no node, never proved its boot (RC-3) or lost its key was paid its whole share of
+emission and of the fee pool for ever, at no cost and with nothing to slash, and was never
+removed. Dark stake only accumulated; once dark plus Byzantine stake reached a third, no
+certificate could form. B4 had bound the measure into every block and used it for bootstrap
+weight only. Derivations and sources: `docs/research/participation.md`.
+
+**PA-1 (the measure).** A block that closes rounds (r_prev, r] (r its anchor round, r_prev
+the previous block's) gives every member of its epoch's committee those rounds to take part
+in. It credits each member with the committed vertices it authored (`committed_authors`,
+bound in the header since B4).
+- The executor keeps, in `0x1::staking::Participation`, the rounds and each member's
+  vertices (in C_E's address order) for the committee epoch and for the reward period since
+  the last payout.
+- A member's participation is p = min(1, vertices / rounds), in parts per million.
+- A block whose anchor round is not past the last counts nothing (consensus never builds
+  one). A gap counts at most 4,096 anchor rounds, BW-6's bound. Members are counted on a
+  chain with `0x1::chain::Params`; boot refuses a chain without them (CL-2).
+- Why vertices: B4 bound them, an online member authors one in every round, and every node
+  counts the same. Signing (attestations) is not measured: a certificate holds only its
+  first quorum (B4).
+- Why not leader slots for pay: about 15 % of anchors are skipped with four honest
+  validators (S6), through no fault of their leaders, and a reward period holds about 23
+  anchor rounds, so a small member's share of them is noise. BW-6 still uses them for
+  bootstrap weight.
+
+**PA-2 (pay by participation).** A payout pays each member pot × w / max(W, s_min) × p,
+with p its participation in the period the payout pays (`delegation::participation_share`),
+and p = 1 when the period counted no round.
+- A block's fee pool and leader bonus are shared by the weights w × p of the last period
+  paid (`0x1::staking::PeriodParticipation`), against max(W, s_min) of the unscaled
+  weights (`fee_payouts`).
+- What a member did not take part for stays in the reserve (emission) or is burned (fees).
+  Nobody earns more because another took no part (BW-7's rule), so nobody gains by
+  censoring a rival.
+- The leader's bonus scales with the weight that took part: absent members' anchors are
+  skipped, so the members that lead take more of the blocks.
+- Precedents: Aptos pays stake × rate × successful / total proposals; Solana pays by vote
+  credits; Ethereum withholds each missed duty's reward.
+- The vertices of a period's last anchor round are committed in the next period's first
+  block, so that anchor's leader has one vertex more than the period's rounds and one fewer
+  in the next. One vertex beyond the rounds carries into the next period. No more carries,
+  so late vertices cannot be banked for an absence.
+- Fees lag one period (R blocks): a member that goes dark keeps its last period's rate for
+  one period's fees. Emission is exact for the period it pays.
+
+**PA-3 (seats).** At the boundary H_E, a member of C_{E−1} and C_E whose participation was
+below one half in both epochs is out from E+1 (`0x1::staking::Inactive`).
+- Its weight in the live set is 0, so EP-2 does not elect it, and consensus derives the
+  same committee from the same post-state.
+- Its stake stays bonded. Nothing is slashed or unbonded: downtime is not slashed.
+- `staking::reactivate` takes it off the list, and the executor restores its live weight
+  at once, so its node seeks its proof of boot (RC-3) and the next boundary elects it.
+  A join clears a stale entry, and each boundary keeps only members still live with stake.
+- Bar ½: the Cosmos SDK's default `MinSignedPerWindow` and BW-6's bar. To remove a member,
+  an outage must cover half of each of two consecutive epochs: at least one epoch's length
+  across their boundary (~1.9 h at I = 1,000 and 6.75 s). Honest members author nearly
+  every round; on V4 they committed 88–92 % even of their leader slots, which also need
+  the anchor's votes.
+- Two epochs: one epoch below the bar never removes a member. A joiner abstaining for its
+  first member epoch under RC-3 (B441), or a node restored without its guards, keeps its
+  seat, and a member that returns gets the same epoch of grace.
+- Counted in epochs because committees change only at boundaries. Cosmos jails a validator
+  that signed under the bar within its window (SDK default: 50 % of 100 blocks; the Hub:
+  5 % of 10,000 blocks, ~17 h), slashes it (default 1 %, the Hub 0.01 %) and readmits it on
+  `MsgUnjail`. Here nothing is slashed.
+- Dark stake no longer accumulates: weight that goes dark leaves the committee within two
+  and a half epochs (~4.7 h at launch), and the fault margin returns to a third less the
+  Byzantine stake.
+
+**Bootstrap weight (with A4).** An operator that is out keeps its ceiling. BW-5 forfeits on
+leaving the Move set, a jail, a conviction or the score, never on being out.
+- Each epoch that closes while it is out scores 0 in BW-6 (the epoch it reactivates in scores
+  nothing), so a dark operator forfeits on BW-6's schedule (~5.9 days) whether or not it
+  is out.
+- Its weight stays reserved under C0, and nobody gains it.
+- BW-4's P, BW-11's cap and the bootstrap's end count only the members the next committee
+  can hold, so the cap holds for the committee actually elected. Example (witness): F
+  weighs 6,000 of 22,000 with the operator but would hold a third of the 18,000 without
+  it, so F's bootstrap weight is cut.
+- `aincore_getBootstrap` reports P as BW-4 counts it, without the members that are out.
+  The protected list a boundary writes (BW-12) holds the elected committee, so a member
+  that is out is protected only as a bootstrap operator.
+
+**Known, accepted.**
+- A member can alternate one epoch at or above one half with one below and keep its seat.
+  It is paid by p, so it gains nothing, and its weight is dark at most one epoch in two.
+- The pool of a member that is out still takes delegations (it is still a validator).
+  They earn nothing until it returns, and they count against the epoch's churn allowance
+  (CH-1).
+- The period's count restarts at every payout. A payout that aborts leaves its emission in
+  the reserve for the next payout, which is scaled by its own period's count.
+- A member may raise its count with late vertices above the GC floor (~50 rounds) that
+  consensus still certifies and commits; at most one vertex carries between periods.
+- B389's refresh of the protected list before a join into a full set still counts a member
+  that is out as electable. Until the next boundary it can therefore spare such a member
+  from displacement (one whose own stake is the smallest, while its own stake and pool
+  would elect it). That only delays the displacement of stake that earns nothing.
+- No RPC shows participation or the inactive list yet, and no CLI command or operator-guide
+  step sends `reactivate`: tooling, not consensus.
+
+**Witnesses.** Executor: `b464_emission_pays_each_member_by_its_participation`,
+`b464_fees_pay_each_member_by_its_last_period`, `b464_fees_are_shared_by_participation`,
+`b464_one_vertex_carries_between_periods`,
+`b464_a_member_silent_two_epochs_leaves_the_committee_until_it_reactivates`,
+`b464_a_member_out_that_leaves_and_joins_again_starts_afresh`,
+`b464_an_operator_out_keeps_its_ceiling_and_the_cap_counts_the_committee`. Move
+(`pool_reward_tests.move`): `a_member_is_paid_by_its_participation`.
 
 ## End-of-G5 mutation campaigns (2026-10-01/02)
 
@@ -728,9 +939,9 @@ end of G5, as with G1.
 | **S1** (done, `65cc92a`) | CL-1, CL-2, P-1, GV-1 counted in heights: the `0x1::chain` clock and parameters, heights in Move, genesis pins and derivation, the Rust governance path removed | every deadline expires exactly at its height; a halt ages nothing; the pins are bound by the identity; genesis-tool reproduces the table | a deadline in seconds; an unpinned parameter; governance able to change a parameter |
 | **S1b** | Amendment A1: CL-1 τ, BT-1's quorum guard, CL-2 writing τ from the block timestamp, P-1's new split (C_τ pinned; U, N, Δc, K constants; G removed), SL-2 unlock by τ, UB-1, CM-1 | with fast or slow blocks unbonding completes at 21 d of block time, not at a block count; a 10-day timestamp jump advances τ by C_τ; a corrupted timestamp stream cannot unlock before U / C_τ blocks; a below-quorum sample does not advance T; one author at +30 s cannot move T out of the honest range; a matured entry is paid once, at the first boundary at or after its unlock, in queue order; a commission increase applies exactly at N and never earlier, above Δc it is refused, a decrease applies at once | τ uncapped; cap ignored after a halt; quorum guard removed; unlock from h without I·C_τ; burn restored; payout not bounded by K; increase cap removed |
 | **S2** | EM-1..EM-3: payouts every R blocks by Δτ, committee recipients from a state record shared with consensus, fees to the committee, boundary order, rotation independent of Move, I = 1,000 written by genesis-tool | a payout mints exactly the EM-1 integer form and a day's draw compounds to 1.90 %/yr; the emission over the same τ matches (within 10⁻⁶) for 1 s or 7 s blocks and R ∈ {1, 20}; a payout after a long gap covers one day; a joiner is paid from its first committee epoch and a leaver until its last; fees pay C_{E(h)}, not the live set; a jailed member gets nothing; an invalid live set keeps the committee; the executor's record equals consensus's committee on real nodes | Δτ ignored; the cap removed; the live set paid; jailed paid; fees to the live set; rotation skipped when Move aborts; consensus cross-check removed |
-| **S3** | DL-1..DL-3, CM-1 in the payout, the atomic slash: pools of aggregates with per-account positions and tickets; the reward split from the frozen record; bonded weight at boundaries; `math` u256 mul_div; the RPC reads the Move state | conservation: principal escrow = C + unbonding, Σ points = P, reward escrow covers every claim within dust; ρ·P + κ = S·Σπ exactly; each payout's two parts match the frozen split to the unit, and a mid-epoch joiner does not move it; a delegator is paid ⌊p·Δρ/S⌋ to the unit and a joiner nothing from before; weight changes at the next epoch only; commission uses the rate at the period start; the active and ticket slash follow SL-1 in one call; a closed pool refuses deposits; a pool's stored size does not grow with its delegators; a full account cannot block another's undelegation; exits and deposits round the pool's way; a claim past u128 works and a 1-unit shortfall does not abort | the carry dropped; points rounded up on deposit; coins rounded up on exit; deposits into a dead pool; tickets of an earlier epoch slashed; live stake used in the split; a vector of delegators in the pool; the escrow clamp removed; u128 intermediates |
+| **S3** | DL-1..DL-3, CM-1 in the payout, the atomic slash: pools of aggregates with per-account positions and tickets; the reward split from the frozen record; bonded weight at boundaries; `math` u256 mul_div; the RPC reads the Move state | conservation: principal escrow = C + unbonding, Σ points = P, reward escrow covers every claim within dust; ρ·P + κ = S·Σπ exactly; each payout's two parts match the frozen split to the unit while the pool holds its weight, and a mid-epoch joiner does not move it; a pool whose delegators left is paid only on the principal still in it (r_e), the commission only on r_e, and r_d − r_e stays in the reserve (B451); a delegator is paid ⌊p·Δρ/S⌋ to the unit and a joiner nothing from before; weight changes at the next epoch only; commission uses the rate at the period start; the active and ticket slash follow SL-1 in one call; a closed pool refuses deposits; a pool's stored size does not grow with its delegators; a full account cannot block another's undelegation; exits and deposits round the pool's way; a claim past u128 works and a 1-unit shortfall does not abort | the carry dropped; points rounded up on deposit; coins rounded up on exit; deposits into a dead pool; tickets of an earlier epoch slashed; live stake used in the split; the pool part not capped by C; the commission taken on r_d; a vector of delegators in the pool; the escrow clamp removed; u128 intermediates |
 | **S4a** | Amendment A2 policy: SL-4..SL-6, acceptance and settlement in Move, the offense ledger, the tombstone, W = 7 d and D = 1 d pinned | SL-4 to the basis point (isolated 1/4, 1/10, 1/100 of weight; a third); offenses within D count together, beyond D they do not; 3Q ≥ T settles at once at 100 %; otherwise nothing settles before τ_v + D + I·C_τ + W; the waterfall leaves delegators whole when the operator covers A; in-scope own unbonding is cut, earlier entries are not; a leaver that equivocates before its unlock loses its unbonding stake; every in-scope entry is still unpaid at settlement; a tombstoned join is refused | floor dropped; linear instead of square; threshold at half; D unbounded or zero; settlement before the deadline; waterfall reversed; pool left open at acceptance; out-of-scope entries cut |
-| **S4b** | SL-3: V4 proposer twins detected when a slot stages a second digest, kept in durable epoch-keyed rows before GC, carried through the DAG and verified against C_E with the age bound | a twin pair from real V4 nodes is recorded, carried in a block and jails its author on every node; a pair signed by a non-member of C_E (even a live validator), from another domain, of two slots or of an unrecorded epoch is refused; evidence of epoch 0 is accepted until τ_start(1) + W exactly and refused after; accepted, the offense is recorded in the evidence's own epoch | live-set membership; no age bound; a round-only key; the V3 hash |
+| **S4b** | SL-3: V4 proposer twins detected when a slot stages a second digest, kept in durable epoch-keyed rows before GC, carried through the DAG and verified against C_E with the age bound | a twin pair from real V4 nodes is recorded, carried in a block and jails its author on every node; a pair signed by a non-member of C_E (even a live validator), from another domain, of two slots or of an unrecorded epoch is refused; evidence of epoch 0 is accepted until τ_start(1) + W exactly and refused after; a block judges its evidence at its parent's clock, the clock its builder judged it at (B457); accepted, the offense is recorded in the evidence's own epoch | live-set membership; no age bound; the block's own clock for the age; a round-only key; the V3 hash |
 | **S4d** | SL-3's certificate-conflict kind: `join_validator_set` and committee validation refuse a BLS key already held; the attestation and certificate types move to `blockchain::attest`, so the executor checks the aggregates; the halting node keeps the pair; every signer in both is convicted | real V4 nodes keep the pair where CE-3 halts, and it convicts exactly the members in both; two convicts forming half the committee settle at 100 % at once; one digest, no member in both, another committee, a bit past the committee or a forged aggregate is refused; a shared BLS key is refused at join and in a committee | a duplicate key accepted; the intersection taken from one certificate |
 | **S4c** | G1 S11b part 2: V3 ingress, producer, boot recovery, checkpoints, pruning and evidence deleted from `dag.rs`; a database without the V4 format is refused at boot (`verify_genesis_integrity`) and a node opened on one is inert; only V4 evidence kinds pass the block split; the node routes no V3 prefix to consensus | the five V3-fixture witnesses re-expressed on V4 with their schedules: the accepted block's QC work survives a process crash after acceptance (one-member committee); a follower holding block and QC adopts all-or-nothing across a crash inside and after adoption; observers given a complete history, then three replays and a reopen, decide what the other decided; thin one-parent Byzantine vertices are refused on every node and round r's leader commits; a round-skipping anchor citing three certified round-r parents (a stake quorum) is refused while every honest vertex is admitted; a V4 node never records V3 evidence; an inert node writes nothing; a V3 database does not boot | Layer S without `parent_refs_admissible_above`; the round clause dropped; QC work staged after the acceptance commit; the adoption height written outside the adoption transaction; the decision row not persisted; the inert gate removed; the boot format check removed |
 | **S5** | DOC-1: RPC fields, README, WHITEPAPER, CLAUDE.md | the supply and economics RPCs report the Move emission state and nothing of a halving; README, WHITEPAPER and CLAUDE.md name no halving (node witnesses `public_documents_name_no_halving`, `the_economics_rpcs_report_the_move_emission_state`) | — |

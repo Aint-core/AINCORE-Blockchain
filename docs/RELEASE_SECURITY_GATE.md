@@ -1,9 +1,42 @@
 # Release security witness gate
 
 This is a necessary release-asset gate, not a mainnet-readiness certificate.
-The current implementation is intentionally RED because required security
-properties are still violated. Do not turn these failures into exclusions to
-ship a binary. Repairs need protocol review and adversarial regression evidence.
+Determine the current result by running the gate on the candidate source tree.
+The historical results below do not establish the status of later revisions.
+Do not turn failures into exclusions to ship a binary. Repairs need protocol
+review and adversarial regression evidence.
+
+## 2026-10-16 local hardening checkpoint
+
+This checkpoint preserves the pending round-19-through-30 audit work. It is not
+an independent review of every earlier change, a release tag, or authorization
+to activate new consensus rules on a running network.
+
+Local verification exposed and repaired these integration problems:
+
+- Workspace lockfile edges for `chain_sync -> da` and `vm_move -> rayon` were
+  missing. No dependency versions or checksums were changed.
+- The release regression command selected the removed `governance` package.
+- The B464 rejoin fixture used six integer literals outside its `u8` key seed
+  range; all references now consistently use distinct in-range seeds.
+- `staking.mv` and `delegation.mv` were stale relative to their sources. In
+  particular, reward execution supplied six arguments to old five-argument
+  bytecode. They were regenerated and checked against the pinned Move compiler.
+- Gas simulation deducts zero fees. After B460, an unchanged simulated payer
+  CoinStore therefore omitted history gas that a real fee deduction incurs.
+  Estimates now include that history exactly once, including when the payload
+  already changes the payer's balance. Execution pricing itself is unchanged
+  by this estimator repair.
+- Crash fixtures' old 100K execution budgets no longer paid for retained
+  history. Both transfers are now funded and execute before injected crashes.
+  Their golden root was repinned for the changed fixture funds, limits and
+  stdlib; crash/replay still compares all rows to a separate clean run.
+- Generated SDK modules exported by `dist/index.js` are now tracked together
+  with the existing distribution, including address, BCS, DA and state proofs.
+
+The B458 pricing change and its limitations are described below. No live
+database, service, signing key, or genesis was changed. Bytecode/gas changes
+still need an explicitly approved, coordinated activation plan.
 
 ## Run locally
 
@@ -24,8 +57,9 @@ tools, timeout, inventory errors, missing tests or a red witness.
 
 ## Contract
 
-- Enumerate library tests and ignored library tests separately in `chain_sync`,
-  `consensus` and `executor`. Inventory counts and names must agree.
+- Enumerate library tests and ignored library tests separately in `blockchain`,
+  `chain_sync`, `consensus`, `executor`, `node`, `state_commit`, `storage` and
+  `vm_move`. Inventory counts and names must agree.
 - Every required exact name must exist. Every ignored test in those inventories
   must be required or have a checked-in exclusion reason. Stale exclusions fail.
 - Run each required test with `--exact --include-ignored --test-threads=1`.
@@ -36,12 +70,41 @@ tools, timeout, inventory errors, missing tests or a red witness.
 - Classification lives in `scripts/release_security_witnesses.json`. It needs
   code review, like the tests themselves; there is no CLI skip/waiver option.
 
-This inventory is deliberately limited to three library targets. It does not
+This inventory is deliberately limited to these eight library targets. It does not
 certify every ignored integration test or every crate/feature combination. The
 existing ignored node libp2p smoke test is outside this inventory and is not proof
 of cross-process delivery. That remains a separate networking gate.
 
-## Current local evidence
+## Round 28-30 regression coverage
+
+The required manifest includes the VM stack ownership and foreign-pool tests,
+the depth-bound VM stack test, the three publish-time layout/entry-return
+bounds tests, and native-reference/resource-size gas tests (B434, B458, B461).
+The stack witness is named
+`gas::tests::a_value_at_the_depth_bound_fits_the_vm_stack`; the older
+`a_value_at_the_depth_bound_fits_a_default_stack` name is obsolete.
+
+A passing package or mutation total cannot substitute for any required witness.
+The gate tests exercise both a missing stack witness alongside passing VM tests
+and an inventoried witness that runs zero tests. Both must fail the gate.
+The B458 accounting follow-up charges 16 gas per additional struct occurrence
+in a first resource access's type arguments. Native calls pay 16 per struct in
+all type arguments before entering the native, plus the type name's size;
+an empty vector still pays for its element type. The executor's 9,216-node
+per-root work cap derives from the same price at 576 nodes/gas. Cached resource
+accesses do not pay a second layout charge. Required witnesses cover branching
+and vector-wrapped types, multiple native arguments, cache hits and insufficient
+gas. This changes consensus gas accounting and requires coordinated protocol
+activation; it is not authorization to deploy or change genesis.
+
+The upstream resource loader still constructs a layout before invoking the gas
+hook. This change prices completed accesses; it does not preempt the first
+layout build on a failing or out-of-gas access. Publish bounds still limit that
+work, and modules accepted before those bounds need separate treatment. These
+limits and independent review remain open; a current compiled gate report is
+required before claiming even the selected regression set passes.
+
+## Historical local evidence (before the V4/G3 integration)
 
 The actual runner completed with **7 passed controls, 7 failed witnesses**, exit
 1. All six inventory commands succeeded, all 14 names matched and no unknown
@@ -67,15 +130,18 @@ isolated decision function is sound.
 
 ## Workflow enforcement and limits
 
-Latest local validation after the durable QC recovery increment: eight Python
-tests passed; the selected normal Cargo regression command below passed with
+At that historical checkpoint after the durable QC recovery increment, eight Python
+tests passed; the then-selected normal Cargo regression command passed with
 471 passed, zero failed and 13 ignored; JavaScript fixed vectors passed.
 Storage/chain_sync/consensus/node all-targets clippy with `-D warnings` passed
-(31.33s). The local node release build passed (17.78s). These build results do
-not override the seven red witnesses or prove hosted workflow execution.
+(31.33s). The local node release build passed (17.78s). These build results
+did not override the seven red witnesses or prove hosted workflow execution.
+The commands below reflect the current package list: the removed `governance`
+package is no longer selected. The historical counts above are not results of
+rerunning these commands on the current tree.
 
 ```sh
-cargo test --locked --offline -p blockchain -p chain_sync -p consensus -p executor -p governance -p node -p storage -p vm_move -- --test-threads=1
+cargo test --locked --offline -p blockchain -p chain_sync -p consensus -p executor -p node -p storage -p vm_move -- --test-threads=1
 node scripts/tests/block_identity_v2_vectors.mjs
 cargo clippy --locked --offline -p storage -p chain_sync -p consensus -p node --all-targets -- -D warnings
 cargo build --locked --offline --release -p node --bins
@@ -96,15 +162,16 @@ reproducibility, dependency/supply-chain audit, or signed binary provenance.
 
 The workflow still triggers on `release.created`: the release record can already
 exist before testing. This change gates its workflow-produced binary assets, not
-manual release creation, manual uploads or external publishing systems. Until
-reviewed and pushed, the workflow change exists only in this local worktree.
+manual release creation, manual uploads or external publishing systems. A push
+alone does not prove that the hosted workflow has run or passed.
 
 Local Python tests and YAML/dependency-structure checks are not a hosted Actions
 run. No release was created, uploaded, dispatched or deployed while developing
 this gate. Live nodes, genesis, signing keys and databases were not touched.
 
-Still required: canonical identity integration and trusted activation, a complete
-consensus/dissemination design, authenticated state/recovery, durable QC backfill,
-network resource/authorization gates, differential execution/economics replay,
-physical failure exercises, independent review and sustained multi-operator
-operational evidence. Passing this witness list alone does not close them.
+Before release, independent review must validate canonical identity and trusted
+activation, consensus/dissemination, authenticated state/recovery, durable QC
+backfill, network resource/authorization gates, and differential
+execution/economics replay. Physical failure exercises and sustained
+multi-operator operational evidence remain separate gates. Passing this witness
+list alone does not establish them.

@@ -592,6 +592,131 @@ mod tests {
         }
     }
 
+    /// B456 witness: the checked reads refuse what the unchecked ones read
+    /// as data: a row that is not UTF-8 (`get` reads it as absent, a scan
+    /// converts it lossily), a height that does not parse (read as 0), and
+    /// a range past its bound (cut at the limit). In a transaction view a
+    /// corrupt row also refuses the commit, as one read by `get` does.
+    #[test]
+    fn checked_reads_refuse_what_unchecked_ones_read_as_data() {
+        let db = temp_db("b456_checked_reads");
+        let _seed = db.seeding();
+        for i in 0..3 {
+            db.put(&format!("ok:{i}"), &i.to_string()).unwrap();
+        }
+        let mut batch = crate::rocksdb::WriteBatch::default();
+        batch.put("bad:0", "fine");
+        batch.put("bad:1", [0xff_u8, 0xfe]);
+        db.write_batch(batch).unwrap();
+
+        // Control: a clean range, whole and within its bound.
+        assert_eq!(db.try_scan_prefix("ok:").unwrap(), db.scan_prefix("ok:"));
+        assert_eq!(db.try_scan_prefix_at_most("ok:", 3).unwrap().len(), 3);
+        assert!(db.try_scan_prefix("absent:").unwrap().is_empty());
+        // Past its bound: an error, where the unchecked scan stops.
+        assert_eq!(db.scan_prefix_limited("ok:", 2).len(), 2);
+        assert!(db.try_scan_prefix_at_most("ok:", 2).is_err());
+        // Not UTF-8: an error, where the unchecked reads miss or convert it.
+        assert_eq!(db.scan_prefix("bad:").len(), 2);
+        assert!(db.try_scan_prefix("bad:").is_err());
+        assert_eq!(db.get("bad:1").unwrap(), None);
+        assert!(db.try_get("bad:1").is_err());
+        assert_eq!(db.try_get("bad:0").unwrap().as_deref(), Some("fine"));
+        assert_eq!(db.try_get("absent").unwrap(), None);
+        // A height that does not parse: an error, where it read as 0.
+        assert_eq!(db.try_chain_height().unwrap(), 0, "a fresh database");
+        db.put("latest_height", "7").unwrap();
+        assert_eq!(db.try_chain_height().unwrap(), 7);
+        db.put("latest_height", "seven").unwrap();
+        assert_eq!(db.get_chain_height(), 0);
+        assert!(db.try_chain_height().is_err());
+
+        let scanned = db.transaction(|view| {
+            assert!(view.try_scan_prefix("bad:").is_err());
+            view.put("ok:3", "3")?;
+            Ok(())
+        });
+        assert!(scanned.is_err(), "a corrupt row authorized a commit");
+        let ignored = db.transaction(|view| {
+            assert!(view.try_get("bad:1").is_err());
+            view.put("ok:4", "4")?;
+            Ok(())
+        });
+        assert!(ignored.is_err(), "a corrupt row authorized a commit");
+        // The unchecked scan keeps the row (lossily) and refuses the commit.
+        let lossy = db.transaction(|view| {
+            assert_eq!(view.scan_prefix("bad:").len(), 2);
+            view.put("ok:5", "5")?;
+            Ok(())
+        });
+        assert!(lossy.is_err(), "a corrupt row authorized a commit");
+        assert_eq!(db.get("ok:3").unwrap(), None);
+        assert_eq!(db.get("ok:4").unwrap(), None);
+        assert_eq!(db.get("ok:5").unwrap(), None);
+        // Control: a clean scan, then the same write, commits.
+        db.transaction(|view| {
+            assert_eq!(view.scan_prefix("ok:").len(), 3);
+            assert_eq!(view.try_scan_prefix("ok:")?.len(), 3);
+            view.put("ok:6", "6")
+        })
+        .expect("a view that read no corrupt row commits");
+        assert_eq!(db.get("ok:6").unwrap().as_deref(), Some("6"));
+    }
+
+    /// B456 witness: a read error (here a table block whose checksum fails,
+    /// as bit rot does) is an error of the checked reads, not a shorter
+    /// scan or height 0, and the tx-index migration does not mark itself
+    /// done over it. The unchecked scan ends at the error and, outside a
+    /// transaction view, nothing reports it: the CE-3 pin check read such a
+    /// cut scan as "the other twin was not ordered".
+    #[test]
+    fn a_read_error_in_a_scan_is_an_error_not_a_shorter_answer() {
+        let path = crate::test_dir_str("b456_read_error");
+        let block = r#"{"header":{"hash":"h1","height":1},"transactions":["t"]}"#;
+        {
+            let db = StateDB::open(&path).expect("open");
+            let _seed = db.seeding();
+            db.put("block_1", block).unwrap();
+            db.put("latest_height", "7").unwrap();
+            for i in 0..3 {
+                db.put(&format!("w:{i}"), &"x".repeat(100)).unwrap();
+            }
+            db.flush().expect("flush");
+        }
+        // Damage the table's first data block: it starts the file.
+        let table = fs::read_dir(&path)
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .find(|file| file.extension().is_some_and(|ext| ext == "sst"))
+            .expect("the flush wrote a table");
+        let mut bytes = fs::read(&table).unwrap();
+        for byte in bytes.iter_mut().take(4) {
+            *byte ^= 0xff;
+        }
+        fs::write(table, bytes).unwrap();
+
+        let db = StateDB::open(&path).expect("reopen");
+        assert!(
+            db.get("w:0").is_err(),
+            "control: the damaged block cannot be read"
+        );
+        assert!(db.try_scan_prefix("w:").is_err());
+        assert!(
+            db.scan_prefix("w:").is_empty(),
+            "the unchecked scan reads the error as the end of the range"
+        );
+        assert!(db.try_get("w:0").is_err());
+        assert_eq!(db.get_chain_height(), 0, "the unchecked height");
+        assert!(db.try_chain_height().is_err());
+        assert!(db.backfill_tx_index().is_err());
+        assert!(
+            !matches!(db.get(StateDB::TX_INDEX_BACKFILL_SENTINEL), Ok(Some(_))),
+            "the migration marked itself done over blocks it never read"
+        );
+        drop(db);
+        let _ = fs::remove_dir_all(path);
+    }
+
     #[test]
     fn test_federation_key() {
         let db = temp_db("federation");

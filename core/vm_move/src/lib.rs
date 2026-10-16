@@ -11,6 +11,7 @@ use std::sync::Arc;
 use storage::StateDB;
 
 mod gas;
+pub use gas::LAYOUT_GAS_PER_STRUCT;
 mod overlay;
 pub mod state_keys;
 use gas::AINCOREGasMeter;
@@ -21,7 +22,137 @@ use serde::{Deserialize, Serialize};
 mod move_unit_tests;
 mod tests;
 
+/// B340: the abort code of a `std::vector` native called as a function (the
+/// compiler emits its opcode instead; see `AINCOREVM::natives`).
+pub const BYTECODE_ONLY_NATIVE: u64 = 0xB340;
+
+/// B430: the stack every Move session runs on. move-vm walks values
+/// recursively (sizing, copy, equality, drop, (de)serialization), and the
+/// publish checks let a value nest 128 + 256 * 4 = 1,152 levels (B343,
+/// `deps::check_struct_depths`). On a caller's own thread (a tokio worker,
+/// a rayon worker, an RPC thread, a test thread: 2 MiB by default) such a
+/// value could overflow the stack and abort the node. Measured on 2 MiB
+/// (round 28, x86-64): in a debug build, copy and equality of a value 768
+/// levels deep overflowed (B343's witness aborted its whole test binary);
+/// in a release build all of build, size, copy, equality and drop fit at
+/// 1,152. Frames differ by build and by target (the Pi is aarch64), so the
+/// margin is taken here, once: ~30 times what the debug build needed. It
+/// is address space: only the pages a session touches are committed.
+pub const VM_STACK_BYTES: usize = 64 << 20;
+
+/// B430: the threads Move sessions run on, one per CPU, each with
+/// `VM_STACK_BYTES` of stack. Callers block while their session runs.
+/// B447: the node's own work only (blocks, system calls, genesis): a dry
+/// run never runs here (`on_dry_run_thread`).
+static VM_POOL: std::sync::LazyLock<rayon::ThreadPool> = std::sync::LazyLock::new(|| {
+    rayon::ThreadPoolBuilder::new()
+        .thread_name(|i| format!("move-vm-{i}"))
+        .stack_size(VM_STACK_BYTES)
+        .build()
+        // A node that cannot start these threads cannot execute a block the
+        // way its peers do: it stops (fail closed), never runs a session on
+        // a smaller stack.
+        .expect("CRITICAL: the Move VM threads could not be started")
+});
+
+/// B430: run `work` (one or more Move sessions) on the VM's own stack.
+/// B434: from a VM thread it runs inline. From a worker of another rayon
+/// pool it runs on a thread of its own and the worker blocks without taking
+/// other work: rayon lets a worker waiting on another pool run its own
+/// pool's jobs on its own stack meanwhile, and a block's parallel batch
+/// nested its transactions that way until the 2 MiB stack overflowed. From
+/// any other thread it runs on the VM's threads. B447: on a dry run's
+/// thread (`on_dry_run_thread`) it runs inline too.
+fn on_vm_stack<T: Send>(work: impl FnOnce() -> T + Send) -> T {
+    if VM_POOL.current_thread_index().is_some() || DRY_RUN_THREAD.with(|dry| dry.get()) {
+        return work();
+    }
+    if rayon::current_thread_index().is_some() {
+        #[cfg(test)]
+        FOREIGN_POOL_HANDOFFS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        return std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .name("move-vm-handoff".into())
+                .stack_size(VM_STACK_BYTES)
+                .spawn_scoped(scope, work)
+                // As VM_POOL: no smaller stack, ever (fail closed).
+                .expect("CRITICAL: no thread for a Move session")
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        });
+    }
+    VM_POOL.install(work)
+}
+
+/// B434 (tests): sessions asked from another rayon pool's worker.
+#[cfg(test)]
+pub(crate) static FOREIGN_POOL_HANDOFFS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// B434: run `work`, which may fan out with rayon (a block's parallel
+/// batch), on the VM's own threads: every session it opens then runs
+/// inline on a `VM_STACK_BYTES` stack.
+pub fn on_vm_threads<T: Send>(work: impl FnOnce() -> T + Send) -> T {
+    VM_POOL.install(work)
+}
+
+thread_local! {
+    /// B447: whether this thread is a dry run's (`on_dry_run_thread`).
+    static DRY_RUN_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// B447: run `work`, a dry run (`aincore_estimateGas`: free, unsigned, up
+/// to MAX_GAS_LIMIT of Move), on a thread of its own with `VM_STACK_BYTES`
+/// of stack, where every session it opens runs inline. On `VM_POOL` (B430)
+/// an estimate held one of the threads a block's sessions run on for its
+/// whole length, and each of the block's sessions (a batch, a fee payout,
+/// an epoch or slash call) queued behind it: the pool takes jobs in order
+/// and a busy thread takes no other, while the block held the ordering
+/// lock, `BLOCK_EXECUTION_LOCK` and the storage writer gate. With one or
+/// two VM threads (a 2-core host, or a container's CPU quota) two
+/// estimates stalled every block. Here an estimate only shares the CPU,
+/// as before B430, and its caller blocks without taking other work (B434).
+/// `Err`: no thread could be started; the dry run fails, the node does not.
+pub fn on_dry_run_thread<T: Send>(work: impl FnOnce() -> T + Send) -> std::io::Result<T> {
+    std::thread::scope(|scope| -> std::io::Result<T> {
+        let thread = std::thread::Builder::new()
+            .name("move-vm-dry-run".into())
+            .stack_size(VM_STACK_BYTES)
+            .spawn_scoped(scope, move || {
+                DRY_RUN_THREAD.with(|dry| dry.set(true));
+                work()
+            })?;
+        Ok(thread
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
+    })
+}
+
+/// B430 (tests): the thread each session was opened on.
+#[cfg(test)]
+pub(crate) static SESSION_THREADS: std::sync::Mutex<Vec<String>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn note_session_thread() {
+    let name = std::thread::current().name().unwrap_or("").to_string();
+    SESSION_THREADS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(name);
+}
+
 /// Storage adapter for Move VM backed by RocksDB (StateDB)
+///
+/// B429 (checked, no change): a read error here becomes an `Err`, which
+/// move-vm turns into an aborted transaction. On the block path that never
+/// reaches a committed root: the executor runs a block on a transaction view
+/// (`StateDB::block_transaction`), whose `get` marks the view on any
+/// RocksDB error (and a non-UTF-8 row), and the view then refuses to commit
+/// anything the block staged ("transaction encountered a storage read
+/// error"): the block fails on that node and is retried. A row that is not
+/// hex is the same on every node (it is committed state), so the abort it
+/// causes is too; a panic there would halt every node instead.
 pub struct AINCOREStorage {
     db: Arc<StateDB>,
 }
@@ -108,7 +239,10 @@ pub struct AINCOREVM {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum TransactionPayload {
-    Script(Vec<u8>), // Deprecated/Disabled
+    // Disabled: refused at admission, never executed (B473: the VM has no
+    // call that runs a script). Kept so the other variants' BCS tags stay
+    // 1 and 2.
+    Script(Vec<u8>),
     EntryFunction(EntryFunctionCall),
     PublishModule(Vec<Vec<u8>>),
 }
@@ -149,6 +283,11 @@ impl AINCOREVM {
     ///
     /// This changes gas_used, hence balances, hence the state root: it is a
     /// consensus-breaking change and must ship with a fresh genesis.
+    ///
+    /// B461: these price what a native writes or hashes, not what it reads
+    /// through a reference (`bcs::to_bytes` deep-copies the value behind its
+    /// argument): the meter prices every native argument by the size behind
+    /// it before the native runs (`charge_native_function_before_execution`).
     fn native_gas_params() -> move_stdlib::natives::GasParameters {
         use move_stdlib::natives::{bcs, hash, signer, string, type_name, vector};
         move_stdlib::natives::GasParameters {
@@ -254,10 +393,49 @@ impl AINCOREVM {
         }
     }
 
+    /// The native functions the VM runs: the stdlib's, but (B340) the ones
+    /// `std::vector` declares `#[bytecode_instruction]` abort
+    /// (`BYTECODE_ONLY_NATIVE`). The compiler turns every call of them into
+    /// its opcode (no stdlib module calls one), so only a hand-made module
+    /// reaches the native, and the native `push_back` took the pushed value
+    /// off the memory quota while the vector kept it (the meter credits a
+    /// native's by-value arguments): the quota stopped bounding memory, and
+    /// `push_back` and `pop_back` walked whole values for a flat price. They
+    /// cannot be dropped: the loader refuses a module declaring a native it
+    /// does not know.
+    pub fn natives() -> move_vm_runtime::native_functions::NativeFunctionTable {
+        move_stdlib::natives::all_natives(system_address(), Self::native_gas_params())
+            .into_iter()
+            .map(|(address, module, name, native)| {
+                if module.as_str() == "vector" {
+                    (address, module, name, Self::bytecode_only_native())
+                } else {
+                    (address, module, name, native)
+                }
+            })
+            .collect()
+    }
+
+    /// B340: a native that aborts with `BYTECODE_ONLY_NATIVE`, charged its
+    /// base.
+    fn bytecode_only_native() -> move_vm_runtime::native_functions::NativeFunction {
+        Arc::new(
+            |_: &mut move_vm_runtime::native_functions::NativeContext,
+             _: Vec<move_vm_types::loaded_data::runtime_types::Type>,
+             _: std::collections::VecDeque<move_vm_types::values::Value>|
+             -> move_binary_format::errors::PartialVMResult<
+                move_vm_types::natives::function::NativeResult,
+            > {
+                Ok(move_vm_types::natives::function::NativeResult::err(
+                    10.into(),
+                    BYTECODE_ONLY_NATIVE,
+                ))
+            },
+        )
+    }
+
     pub fn new(db: Arc<StateDB>) -> Self {
-        let natives =
-            move_stdlib::natives::all_natives(system_address(), Self::native_gas_params());
-        let vm = MoveVM::new_with_config(natives, Self::vm_config()).unwrap_or_else(|e| {
+        let vm = MoveVM::new_with_config(Self::natives(), Self::vm_config()).unwrap_or_else(|e| {
             eprintln!("⚠️  WARNING: Failed to create MoveVM: {}", e);
             panic!("Critical: MoveVM initialization failed")
         });
@@ -276,26 +454,25 @@ impl AINCOREVM {
     // branch reading `pqc_pubkey_{sender}`) was deleted with B8: nothing on
     // the node called it. Transactions are authenticated once, by
     // `executor::admission::check_stateless`.
-
-    pub fn execute_script(
-        &self,
-        script: Vec<u8>,
-        args: Vec<Vec<u8>>,
-        gas_limit: u64,
-    ) -> ExecutionResult {
-        let mut session = self.vm.new_session(&self.storage);
-        let mut gas_meter = AINCOREGasMeter::new(gas_limit);
-
-        // Deserialize args (assuming they are already BCS encoded or need handling)
-        session.execute_script(script, vec![], args, &mut gas_meter)?;
-        let (changeset, _events) = session.finish()?;
-
-        let vm_changes = self.changeset_to_kv(changeset)?;
-
-        Ok((gas_meter.gas_used(), vm_changes, ExecutionStatus::success())) // Events ignored for now
-    }
+    //
+    // B473: `execute_script` was deleted too. It was public and ran a script
+    // in a session of its own, and move-vm builds a script's signers from the
+    // caller's argument bytes: no `bind_signer_args`, no argument allowlist,
+    // so a script taking a signer and handed the bytes of @0x1 passed
+    // `coin::deposit_fee_reward`'s gate and minted. Nothing on the node
+    // called it (only tests). Every call a session runs now goes through
+    // `run_action` (`every_move_call_runs_through_the_signer_binding`).
 
     pub fn publish_modules(
+        &self,
+        modules: Vec<Vec<u8>>,
+        sender: AccountAddress,
+        gas_limit: u64,
+    ) -> ExecutionResult {
+        on_vm_stack(|| self.publish_modules_here(modules, sender, gas_limit))
+    }
+
+    fn publish_modules_here(
         &self,
         modules: Vec<Vec<u8>>,
         sender: AccountAddress,
@@ -305,6 +482,8 @@ impl AINCOREVM {
             anyhow::bail!("publishing to 0x1 is reserved for genesis/system upgrades");
         }
 
+        #[cfg(test)]
+        note_session_thread();
         let mut session = self.vm.new_session(&self.storage);
         let mut gas_meter = AINCOREGasMeter::new(gas_limit);
         session.publish_module_bundle(modules, sender, &mut gas_meter)?;
@@ -407,6 +586,16 @@ impl AINCOREVM {
         gas_limit: u64,
         prestaged: Vec<(String, Option<String>)>,
     ) -> ExecutionResult {
+        on_vm_stack(|| self.execute_actions_here(actions, sender, gas_limit, prestaged))
+    }
+
+    fn execute_actions_here(
+        &self,
+        actions: Vec<(MoveAction, bool, AccountAddress)>,
+        sender: AccountAddress,
+        gas_limit: u64,
+        prestaged: Vec<(String, Option<String>)>,
+    ) -> ExecutionResult {
         let mut gas_meter = AINCOREGasMeter::new(gas_limit);
 
         // Split at the first non-must_succeed action. Callers build the vector as
@@ -445,6 +634,8 @@ impl AINCOREVM {
         if !prologue_actions.is_empty() {
             let prologue_writes = {
                 let overlay = OverlayStorage::new(&self.storage, &staged);
+                #[cfg(test)]
+                note_session_thread();
                 let mut session = self.vm.new_session(&overlay);
                 for (action, _, auth_signer) in prologue_actions {
                     // A prologue failure discards the transaction entirely.
@@ -467,6 +658,8 @@ impl AINCOREVM {
         // Scoped so the overlay's borrow of `staged` ends before we consume it.
         let (user_writes, status) = {
             let overlay = OverlayStorage::new(&self.storage, &staged);
+            #[cfg(test)]
+            note_session_thread();
             let mut session = self.vm.new_session(&overlay);
             let mut abort_reason: Option<String> = None;
 
@@ -485,7 +678,9 @@ impl AINCOREVM {
                     // discarded along with the TransactionDataCache it owns. Gas
                     // already consumed stays charged (shared gas_meter).
                     drop(session);
-                    println!("⚠️ Payload aborted, user writes discarded: {}", reason);
+                    // B342: not printed here: the executor logs it, bounded,
+                    // and an estimate not at all (the reason carries the
+                    // caller's names verbatim, ~49 KB a line).
                     (Vec::new(), ExecutionStatus::aborted(reason))
                 }
                 None => {
@@ -687,6 +882,9 @@ impl AINCOREVM {
                 .is_some_and(Self::type_tag_permitted_as_entry_arg),
             // Struct, StructInstantiation, Signer in a non-top-level position,
             // references to non-signer types, and anything a future move-vm adds.
+            // B473: admitting a struct (Aptos admits String and Option) must
+            // first walk its fields and type arguments for a signer:
+            // `type_yields_signer` does not.
             _ => false,
         }
     }
@@ -715,10 +913,13 @@ impl AINCOREVM {
     /// signer-rebinding pass cannot reach: inside a vector, behind a reference to
     /// such a vector, or through a type parameter the caller instantiated as
     /// signer. A bare `signer` / `&signer` handed in here (i.e. NOT a top-level
-    /// rebindable slot -- e.g. a vector element) also counts. Struct fields are
-    /// deliberately not traversed: `signer` lacks the `store` ability, so it can
-    /// never be a struct field, and a struct type argument being signer does not
-    /// deserialize any signer value.
+    /// rebindable slot -- e.g. a vector element) also counts. Struct fields and
+    /// struct type arguments are NOT traversed, and that is safe only because
+    /// `entry_arg_type_permitted` refuses every struct argument. B473: a signer
+    /// CAN be a struct field: the verifier accepts `struct H has drop { s:
+    /// signer }` and `Box<T>` instantiated with `signer` (signer has `drop`,
+    /// and a field needs only its struct's abilities), and move-vm would build
+    /// that signer from the caller's bytes.
     fn type_yields_signer(
         ty: &move_vm_types::loaded_data::runtime_types::Type,
         ty_args: &[move_core_types::language_storage::TypeTag],

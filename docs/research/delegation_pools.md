@@ -121,8 +121,8 @@ advisories.
 | delegate a | points ⌊a·P/C⌋ (a when P = 0); C += a, P += points |
 | undelegate a | burn q = ⌈a·P/C⌉ points, ticket x = ⌊q·C/P⌋ coins; a remainder below 1 AIN, or a ≥ the position's value, exits in full |
 | withdraw | pay each matured ticket, cut by every slash event that reaches it; burn the cut |
-| payout (every R blocks, by the executor) | for each committee member: r_s = ⌊r·s/b⌋ and r_d = ⌊r·d/b⌋ from the frozen split; m = ⌊r_d·c*/10⁴⌋ at the rate c* in force when the period began; the validator gets r_s + m; the pool gets π = r_d − m, with ρ += ⌊(π·S + κ)/P⌋ and κ ← the remainder |
-| slash f for epoch E_i | the validator's own stake and the pool in one call; C −= ⌈C·f⌉, burned; the pool closes; if tickets exist, record (E_i, sequence, f, tickets outstanding) |
+| payout (every R blocks, by the executor) | for each committee member: r_s = ⌊r·s/b⌋ and r_d = ⌊r·d/b⌋ from the frozen split; the pool earns r_e = r_d while C ≥ d AIN, else ⌊r_d·C/(d AIN)⌋, and r_d − r_e stays in the reserve (B451, 2026-10-15); m = ⌊r_e·c*/10⁴⌋ at the rate c* in force when the period began; the validator gets r_s + m; the pool gets π = r_e − m, with ρ += ⌊(π·S + κ)/P⌋ and κ ← the remainder |
+| slash for epoch E_i (SL-1, SL-5, SL-6) | the pool closes when the evidence is accepted; at settlement one call cuts the validator's own stake and the pool: C −= ⌈min(C, (d + 1) AIN)·f_p⌉, burned, with f_p the pool's fraction from SL-6's waterfall and d its frozen weight in the offense's committee (B149); if tickets exist, record (E_i, sequence, f_p, tickets outstanding) |
 
 A ticket is reached by an event when it was made before the slash (its recorded slash count
 is at most the event's sequence) and in the infraction's epoch or later. Stake that left
@@ -186,20 +186,34 @@ makes them unnecessary.
 
 ## 6. What is proved, and where
 
-The contract's S3 row lists the witnesses. Each runs real blocks through the executor. Every
-item of the kill list (DL-1..DL-3, CM-1, SL-1) is a mutation that one of them must fail.
+The contract's S3 row lists the witnesses. Each runs real blocks through the executor, except
+the Move unit tests of `pool_payout` (B451), which run on the production VM. Every item of
+the kill list (DL-1..DL-3, CM-1, SL-1) is a mutation that one of them must fail.
 
 - `g5_delegators_are_paid_by_points_from_the_frozen_split`:
-  - each payout's two parts match the frozen split to the unit;
+  - each payout's two parts match the frozen split to the unit while the pool holds its
+    weight (C ≥ d AIN);
   - ρ·P + κ = S·Σπ exactly;
   - a joiner starts at the counter, and a mid-epoch join moves neither the split nor the
     weight;
   - the claim is exact, and the conservation bounds hold.
+- `g5_a_pool_pays_only_the_principal_still_at_stake` (B451): a delegator takes 2,000 of the
+  3,000 AIN its pool weighs out mid-epoch. The next payout pays the pool
+  r_e = ⌊r_d·1,000/3,000⌋ less the commission on r_e, and the validator its own part plus
+  that commission. Total supply grows by those alone, so r_d − r_e stays in the reserve.
+  This pins the call in `pay_member`, which a Move test cannot reach: it cannot draw
+  emission.
+- `pool_reward_tests.move` (B451, Move unit tests) pins `pool_payout` to the unit: a pool
+  its delegators left, a joiner after that exodus, and a pool that holds its weight.
 - `g5_commission_is_charged_at_the_rate_in_force_when_the_period_began`.
-- `g5_slash_cuts_stake_pool_and_reached_tickets_in_one_call`:
-  - the three ticket cases;
-  - the closed pool;
+- `g5_the_operator_pays_first_and_only_in_scope_stake` (S4a's successor of the S3 slash
+  witness, `g5_slash_cuts_stake_pool_and_reached_tickets_in_one_call`):
+  - the ticket cases: one from before the infraction's epoch is not cut, ones from that
+    epoch are, and one made after the settlement is not cut twice;
+  - an offender's pool is closed;
   - the spent event is dropped.
+- `g5_a_tombstoned_validator_is_slashed_once_and_never_rejoins`: a closed pool takes no
+  delegation, even with its validator active again.
 - `g5_a_full_account_blocks_only_its_own_undelegation`.
 - `g5_a_pool_does_not_grow_with_its_delegators`.
 - `g5_pool_arithmetic_rounds_for_the_pool_and_never_aborts_on_dust`: exact rounding at a
@@ -207,15 +221,34 @@ item of the kill list (DL-1..DL-3, CM-1, SL-1) is a mutation that one of them mu
 
 ## 7. Residual risks
 
-1. **Joiners after an infraction are slashed** if they joined before the evidence lands.
-   Polkadot issue #460 and the Cosmos effective fraction behave the same way [V]. Evidence
-   normally lands within rounds, but W allows up to 21 days. The exact fix, join cohorts per
-   epoch, needs per-epoch aggregates. S4 decides the slash fraction; a 100 % fraction makes
-   this sharper.
+1. **Joiners after an infraction are slashed** if they joined before the evidence lands
+   (its acceptance closes the pool, SL-5): they share the pool's cut (SL-1). Polkadot
+   issue #460 and the Cosmos effective fraction behave the same way [V]. Evidence normally
+   lands within rounds, but W, the evidence max age (P-1: 7 d), lets it land up to 7 days
+   after the infraction's epoch ends (SL-3) [C]. The exact fix, join cohorts per epoch,
+   needs per-epoch aggregates. SL-4 and SL-6 set the cut: the operator's own stake pays
+   first, so a fault reaches the pool only when f·b > s, and the 100 % fraction (offenders
+   weighing at least a third of the committee) makes this residual sharpest [C].
 2. **One epoch of weight against reward.** A joiner earns from the next payout but weighs the
-   committee from the next epoch. The gain is at most one epoch's yield, about 4·10⁻⁶ of the
-   stake. Repeating it costs an exit of U with no yield, about 1.1·10⁻³, so it does not pay
-   [I].
+   committee from the next epoch. A pool's part r_d is sized by its frozen weight d, and only
+   its principal up to d AIN earns it (B451, 2026-10-15, `delegation::pool_payout`). So,
+   whoever left, a joiner earns at most the frozen rate on its own stake, for at most one
+   epoch [C, I].
+   - **Who pays it.** The pool's other delegators, whose share it dilutes. Or, while the pool
+     is below its frozen weight, the leavers' part that would return to the reserve. While
+     C + J ≤ d AIN, a joiner of J raises the pool's earned part r_e by r_d·J/(d AIN). That
+     increment, less its commission, is the joiner's, and the others' rate per AIN does not
+     change. Past d AIN, the joiner dilutes the others [I].
+   - **Size.** At launch the committee weighs s_min = 18.5 M AIN (BW-7 calls this weight W;
+     in this list W is the evidence max age), and e ≈ 12.31 AIN per 135 s payout
+     (150 M × 6.0787·10⁻¹⁰ per s × 135 s). The frozen rate is then about 6.65·10⁻⁷ per AIN
+     per payout, so about 3.3·10⁻⁵ of the joiner's stake over an epoch's 50 payouts. It is
+     about 4·10⁻⁶ only if the whole supply is staked (1.90 %/yr over a 1.875 h epoch) [I].
+   - **Repeating it does not pay.** It costs an exit of U = 21 d with no yield: about 9·10⁻³
+     of the stake at launch's 15.6 %/yr, and 1.1·10⁻³ at 1.90 %/yr [I].
+   - **Before B451** this bound assumed P ≈ d. After a mass exit, the points that stayed or
+     joined took the leavers' part: a 2 AIN position left alone in a pool that weighed
+     1,000,000 AIN took about 16 times its stake in one epoch, before commission [I].
 3. **Deferred burn.** A ticket's slashed part is burned when the ticket is withdrawn. Until
    then it counts in `total_supply`. Emission is unaffected, since it is anchored on the
    minted total (AUDIT-#8) [C].

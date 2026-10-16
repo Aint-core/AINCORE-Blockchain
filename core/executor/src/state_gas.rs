@@ -8,6 +8,16 @@
 //! add more than `TARGET_STATE_BYTES` and falls back to its floor while
 //! they add less, so state grows at the target rate however much gas a
 //! block can buy.
+//!
+//! B460: a change to a key also leaves the state tree's history: its old
+//! value row and the stale nodes on its path, which the tree keeps
+//! `state_commit::HISTORY_VERSIONS` blocks and the pruner removes at
+//! `state_commit::PRUNE_ROWS_PER_BLOCK` rows a block. A rewrite added no
+//! state, so it paid I/O gas alone (~180 for ~1.5 KB of rows), and neither
+//! fee moved. Every changed key now pays for its history in plain gas,
+//! which the base fee and the block ceiling count: a block at the gas
+//! target leaves no more rows than the pruner removes, and holds no more
+//! disk over the history window than a block of body bytes over its own.
 
 use std::collections::BTreeMap;
 use storage::class::{classify, KeyClass};
@@ -38,10 +48,36 @@ pub const STATE_BYTE_GAS_CHANGE_DENOMINATOR: u128 = 8;
 /// The state byte gas the next block charges, in state; absent at the floor.
 pub const STATE_BYTE_GAS_KEY: &str = "sys:state_byte_gas";
 
+/// B460: gas per row of tree history (`state_commit::prune`'s unit): the
+/// gas target over the rows the pruner removes per block (100M / 10,000),
+/// so a block at the target leaves no more than the pruner removes. Above
+/// the target the base fee rises 1/8 a block, which bounds the excess.
+pub const GAS_PER_HISTORY_ROW: u64 = crate::TARGET_BLOCK_GAS / state_commit::PRUNE_ROWS_PER_BLOCK;
+/// B460: the history of one changed key: `state_commit::HISTORY_ROWS_PER_KEY`
+/// rows (7 x 10,000). Those rows hold at most 7 x 1,900 bytes for 1,100
+/// blocks, ~209 disk byte-blocks a gas: under the 500 a gas of body bytes
+/// buys (`admission::BYTE_GAS`, 400 a byte stored about twice for 100,000
+/// blocks), so the pruner binds, not the disk.
+pub const HISTORY_GAS_PER_KEY: u64 = state_commit::HISTORY_ROWS_PER_KEY * GAS_PER_HISTORY_ROW;
+/// The blocks a full node keeps (`AINCORE_BLOCK_RETENTION`'s default), over
+/// which `admission::BYTE_GAS` prices a body byte.
+pub const BODY_BLOCKS_KEPT: u64 = 100_000;
+/// B460: the longest the tree keeps a row of history: its window and one
+/// pruning interval (1,100 blocks).
+pub const HISTORY_BLOCKS_HELD: u64 = state_commit::HISTORY_VERSIONS + state_commit::PRUNE_EVERY;
+/// B460: gas per byte of a changed key's previous value, whose value row
+/// (the value in hex: two bytes a byte) the tree keeps `HISTORY_BLOCKS_HELD`
+/// blocks, at the body's price of disk over time: a body byte (400 gas) is
+/// about two disk bytes for 100,000 blocks, so the two factors of two
+/// cancel: 400 x 1,100 / 100,000 = 4.4, rounded up.
+pub const HISTORY_GAS_PER_OLD_BYTE: u64 =
+    (crate::admission::BYTE_GAS * HISTORY_BLOCKS_HELD).div_ceil(BODY_BLOCKS_KEPT);
+
 /// What a set of writes costs, before the byte price.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WriteCost {
-    /// Gas for the writes themselves.
+    /// Gas for the writes themselves: their I/O and (B460) the tree history
+    /// each changed key leaves.
     pub io_gas: u64,
     /// Bytes the writes add to the state: a new key's key, value and
     /// `NEW_KEY_BYTES`, an existing key's growth. A delete or a shrink adds
@@ -77,10 +113,15 @@ pub fn write_cost(db: &StateDB, updates: &[(String, Option<String>)]) -> WriteCo
             .io_gas
             .saturating_add(IO_GAS_PER_WRITE)
             .saturating_add(written.div_ceil(IO_BYTES_PER_GAS));
-        let Some(value) = value else { continue };
         let old = db
             .get(key)
             .expect("CRITICAL: a state read for the write charge failed");
+        // B460: the tree versions a change (a new key, a rewrite, a delete);
+        // the same bytes, or a delete of an absent key, leave nothing.
+        if old.as_deref() != value {
+            cost.io_gas = cost.io_gas.saturating_add(history_gas(old.as_deref()));
+        }
+        let Some(value) = value else { continue };
         let added = match old {
             None => (key.len() + value.len()) as u64 + NEW_KEY_BYTES,
             Some(old) => value.len().saturating_sub(old.len()) as u64,
@@ -88,6 +129,13 @@ pub fn write_cost(db: &StateDB, updates: &[(String, Option<String>)]) -> WriteCo
         cost.new_bytes = cost.new_bytes.saturating_add(added);
     }
     cost
+}
+
+/// B460: the tree history a change to a key holding `old` leaves: its rows,
+/// and its old value's bytes.
+pub fn history_gas(old: Option<&str>) -> u64 {
+    let old_bytes = old.map_or(0, str::len) as u64;
+    HISTORY_GAS_PER_KEY.saturating_add(old_bytes.saturating_mul(HISTORY_GAS_PER_OLD_BYTE))
 }
 
 /// The state byte gas this block charges.

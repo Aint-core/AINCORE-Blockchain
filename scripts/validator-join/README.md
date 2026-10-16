@@ -23,7 +23,7 @@ chain pribadi menjadi jaringan.
 | Mesin | Linux, 4 GB RAM, 20 GB disk (chain tumbuh ~200 MB / 60 jam) |
 | Software | Rust toolchain, `curl`, `python3` |
 | Jaringan | Port P2P bisa dijangkau validator lain (lihat **Jaringan** di bawah) |
-| Stake | **1000 AIN** — minta ke operator jaringan |
+| Stake | **1000 AIN**, plus sedikit AIN untuk gas — operator mengirim 1010 AIN |
 
 ---
 
@@ -67,15 +67,84 @@ export AINCORE_EXPECTED_GENESIS_HASH=<nilai dari operator>   # WAJIB, lihat cata
 export AINCORE_GENESIS_PATH=./genesis.json
 export AINCORE_BOOTNODES=/ip4/192.168.18.202/tcp/9201,/ip4/192.168.18.202/tcp/9205,/ip4/192.168.18.66/tcp/9203
 export AINCORE_P2P_PORT=9301          # pilih port yang bebas di mesinmu
+export AINCORE_REFERENCE_RPC=<URL RPC dari operator>   # disarankan, lihat langkah 3
 
 ./scripts/validator-join/join-validator.sh prepare   # build + bikin kunci, cetak alamatmu
-# → kirim alamatmu ke operator, minta 1000 AIN
+# → kirim alamatmu ke operator, minta 1010 AIN (1000 stake + gas)
 
 ./scripts/validator-join/join-validator.sh start     # jalankan node, biarkan sinkron
-# (di terminal lain, setelah sinkron dan dana masuk)
+# (di terminal lain, setelah sinkron dan dana masuk, di paruh pertama epoch)
 ./scripts/validator-join/join-validator.sh join      # stake + masuk validator set
 ./scripts/validator-join/join-validator.sh verify    # pastikan kamu benar-benar validator
 ```
+
+### Waktu join itu penting (B441)
+
+Validator yang bergabung setelah peluncuran belum punya riwayat tanda tangan,
+jadi node-mu harus membuktikan boot-nya dulu sebelum menandatangani (G1 RC-3).
+Selama kuncimu ada di live set (`/get_validators`), node-mu mengirim sekitar
+sekali semenit **bukti boot**: transfer jumlah acak dari akunmu ke akunmu
+sendiri. Saat melihat blok yang memuat bukti itu, node mencatat N, tinggi yang
+dipegangnya saat itu (langkah 4). Misalkan join-mu masuk di epoch E, yang blok
+batasnya H_E = (E+1)·I (I = `epoch_blocks` di `aincore_getEconomics`). Komite
+epoch E+1 diambil dari live set di H_E, jadi E+1 adalah epoch pertamamu sebagai
+anggota:
+
+- N **di bawah H_E**: node-mu ikut menandatangani sejak aktivasi E+1.
+- N di H_E atau di atasnya (join terlambat di epoch E, atau restart, langkah 1):
+  node-mu abstain selama seluruh epoch pertamanya sebagai anggota, dan
+  menandatangani sejak aktivasi setelah blok batas pertama di atas N. Selama
+  epoch itu ia tidak membuat vertex dan tidak mendapat slot leader, jadi tidak
+  mendapat bonus leader (bagian reward emisi dan fee menurut stake tetap
+  dibayar).
+
+Join yang dikirim di akhir epoch tapi baru masuk setelah blok batas epoch itu
+tidak terlambat: ia masuk di epoch berikutnya, node-mu baru menjadi anggota
+satu epoch sesudahnya, dan buktinya punya satu epoch penuh untuk masuk.
+
+1. **Biarkan node terus jalan dan sinkron** dari join sampai node-mu ikut
+   menandatangani: sejak aktivasi E+1 kalau N di bawah H_E. Setiap start node
+   yang belum menandatangani menghapus bukti yang sudah dicatatnya, jadi restart
+   sebelum aktivasi itu, termasuk restart setelah H_E, membuang bukti tersebut.
+   Node lalu mengirim bukti baru; kalau yang baru tercatat di H_E atau di atasnya
+   (restart di akhir epoch E, atau antara H_E dan aktivasi E+1), tanda tanganmu
+   tertunda paling sedikit satu epoch.
+2. **Sisakan sedikit AIN di atas stake** untuk gas join dan bukti boot (bukti
+   membayar gas dua kali base fee); operator mengirim 1010 AIN dan `join` memeriksa
+   saldo minimal 1001 AIN, jadi join yang batal masih bisa diulang. Jangan kirim
+   transaksi lain dari akun ini sampai bukti tercatat: bukti memakai nomor urut
+   akun berikutnya. Kalau bukti tidak bisa diantrekan, node mencetak
+   `[RC-3] no proof-of-boot transaction this time (<alasan>); the account needs
+   a little AIN for its gas`. Baris itu selalu diakhiri saran soal gas; alasan
+   di dalam kurung-lah yang menjelaskan apa yang terjadi:
+   - `Insufficient balance for gas` atau `no CoinStore`: akun tidak bisa
+     membayar gas bukti. Isi saldonya.
+   - `Duplicate pending nonce`: bukti sebelumnya (atau transaksi lain dari akun
+     ini dengan nomor urut yang sama) masih menunggu blok di mempool node-mu, dan
+     bukti baru ditolak di sampingnya. Ini tidak apa-apa selama ia menunggu: node
+     mencatat bukti begitu ada blok yang memuatnya. Kalau baris ini masih
+     berulang menjelang H_E, periksa peer dan sinkron node.
+   - `Mempool full`: mempool node penuh; node mencoba lagi semenit kemudian.
+3. **Join di paruh pertama epoch.** Node harus mencatat buktinya di bawah H_E,
+   blok batas epoch tempat join-mu masuk. `join` menolak kalau epoch sudah lewat
+   separuh (I paling sedikit 100 blok, jadi tersisa paling sedikit 50 blok untuk
+   bukti yang dikirim sekali semenit); `AINCORE_JOIN_LATE=1` memaksa join
+   sekarang. Pemeriksaan ini membaca tinggi node-mu sendiri, padahal join masuk
+   di tinggi jaringan: node yang masih menyusul lolos walau jaringan sudah di
+   paruh kedua epoch, atau di epoch berikutnya. Set `AINCORE_REFERENCE_RPC` ke
+   URL JSON-RPC node lain di jaringan (minta ke operator; RPC node hanya
+   mendengar di `127.0.0.1` kecuali dibuka, lihat **Jaringan**): `join` lalu
+   menolak selama node-mu tertinggal lebih dari 3 blok darinya, dan menghitung
+   dari tinggi yang lebih tinggi. Tanpa itu `join` hanya memberi peringatan dan
+   menganggap node-mu sudah di ujung jaringan. Join yang gagal dengan abort code
+   589836 (`ECHURN_LIMIT`) berarti jatah stake baru epoch ini (10 % stake
+   komite, G5 CH-1) sudah habis: join lagi di awal epoch berikutnya.
+4. **Lihat log node.** Saat bukti masuk blok, node mencetak
+   `[RC-3] a block after this boot holds a proof transaction: signing resumes at
+   the first boundary above height N`. Node-mu menandatangani sejak aktivasi
+   setelah blok batas pertama di atas N: sejak epoch pertamamu sebagai anggota
+   kalau N di bawah H_E, blok batas epoch tempat join-mu masuk; kalau tidak,
+   satu epoch kemudian atau lebih.
 
 ### Untuk operator jaringan
 
@@ -122,7 +191,11 @@ kamu memang mau membukanya; kalau iya, batasi ke subnet tepercaya.
    memastikan pubkey pada argumen sama dengan pubkey penanda tangan transaksi —
    jadi kamu tidak bisa mendaftarkan kunci BLS milik orang lain
 3. Move mengecek stake ≥ 1000 AIN, panjang kunci, dan kamu belum terdaftar
-4. Setelah masuk, kamu ikut memproduksi vertex dan memberi suara finality
+4. Kuncimu masuk live set; node-mu mengirim bukti boot (lihat **Waktu join
+   itu penting** di atas)
+5. Di blok batas epoch, komite epoch berikutnya diambil dari live set. Sejak
+   aktivasinya kamu ikut memproduksi vertex dan memberi suara finality, kalau
+   node-mu mencatat bukti boot-nya (N) di bawah blok batas itu
 
 ---
 

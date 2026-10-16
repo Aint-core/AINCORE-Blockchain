@@ -372,12 +372,28 @@ mod tests {
         // requesting from height 0 gets an empty batch — the seed must signal the
         // prune horizon so the node bootstraps from a snapshot instead of looping.
         let sync = setup_sync("prune_horizon");
-        for h in 1000..=1005 {
+        // B324 witness too: the horizon is the prune cursor, as pruning (or a
+        // restore) left it, and a block kept for a pin below it (600) is no
+        // horizon: it was found by reading whole blocks, and the requester
+        // got that block and then a gap. The pin lies above the window a
+        // request from 0 covers (1..=500): a held block in a request's window
+        // is served, a pin's too (it is the next block of a requester at
+        // 599), so a pin at 500 made the fresh node's batch non-empty.
+        for h in std::iter::once(600).chain(1000..=1005) {
             let b = Block::new(h, h, "prev".to_string(), vec![], "node_1".to_string());
             sync.storage
                 .save_block_json(h, &serde_json::to_string(&b).unwrap())
                 .unwrap();
         }
+        sync.storage
+            .put(storage::StateDB::BLOCK_PRUNE_CURSOR_KEY, "1000")
+            .unwrap();
+        assert_eq!(
+            sync.handle_sync_request(SyncRequest { from_height: 599 })
+                .prune_horizon,
+            Some(1000),
+            "a block kept for a pin read as the horizon"
+        );
         let req = SyncRequest { from_height: 0 };
         let resp = sync.handle_sync_request(req);
         assert!(
@@ -387,7 +403,7 @@ mod tests {
         assert_eq!(
             resp.prune_horizon,
             Some(1000),
-            "seed should report lowest available block as the horizon"
+            "seed should report its prune cursor as the horizon (B324)"
         );
     }
 
@@ -464,11 +480,13 @@ mod tests {
             reached: 0,
             brought,
             bytes,
+            shards: 0,
             slow,
             ended_well,
             asked: true,
             refused: false,
             unjudged: false,
+            silent: None,
         };
         assert!(turn(1, 100, true, true).struck(), "a slow answer");
         assert!(
@@ -507,9 +525,11 @@ mod tests {
         let now = std::time::Instant::now();
         let ago = |secs: u64| now - std::time::Duration::from_secs(secs);
         let s = |member, strikes, brought, waited: u64| Standing {
+            cannot_serve: false,
             member,
             strikes,
             brought,
+            shards: 0,
             waited_since: ago(waited),
             salted: 0,
         };
@@ -555,6 +575,63 @@ mod tests {
             order(vec![named("a", salted(2)), named("z", salted(1))]),
             ["z", "a"]
         );
+        // B388: a session that showed it pruned below this node's next
+        // block goes after every other, a member included: members went
+        // first whatever they held, so a node behind the members' retention
+        // never asked the archive peer that held its blocks.
+        let pruned = Standing {
+            cannot_serve: true,
+            ..s(true, 0, 9, 500)
+        };
+        assert_eq!(
+            order(vec![
+                named("m1", pruned),
+                named("m2", pruned),
+                named("m3", pruned),
+                named("archive", s(false, 2, 0, 0)),
+            ])[0],
+            "archive"
+        );
+    }
+
+    /// B417 witness: among sessions alike in strikes and blocks brought, one
+    /// whose last turn proved shards of a parted block goes first, however
+    /// long the others have waited: a parted fetch's turns bring no whole
+    /// block, so an honest shard server tied with strangers that name the
+    /// block and answer busy, and waited its turn behind each.
+    #[test]
+    fn a_session_that_proved_shards_goes_before_busy_ones() {
+        use crate::{turn_order, Standing};
+        let now = std::time::Instant::now();
+        let s = |shards, waited: u64| Standing {
+            cannot_serve: false,
+            member: false,
+            strikes: 0,
+            brought: 0,
+            shards,
+            waited_since: now - std::time::Duration::from_secs(waited),
+            salted: 0,
+        };
+        let mut sessions = [
+            ("busy1".to_string(), s(0, 300)),
+            ("server".to_string(), s(2, 0)),
+            ("busy2".to_string(), s(0, 200)),
+        ];
+        sessions.sort_by(turn_order);
+        assert_eq!(sessions[0].0, "server");
+        // Whole blocks brought still go first.
+        let mut sessions = [
+            ("server".to_string(), s(2, 0)),
+            (
+                "blocks".to_string(),
+                Standing {
+                    brought: 1,
+                    ..s(0, 0)
+                },
+            ),
+        ];
+        sessions.sort_by(turn_order);
+        assert_eq!(sessions[0].0, "blocks");
     }
 
     /// B274/B289 witness: a QC-less block ends a turn well only within what
@@ -573,42 +650,351 @@ mod tests {
         assert!(!crate::qcless_tip(100, u64::MAX));
     }
 
-    /// B285 witness: the parted fetches of several sessions share one budget,
-    /// and when one would pass it the smallest gives way: another fetch
-    /// smaller than the one growing is dropped, and a fetch smaller than
-    /// every other stops (so the largest, an honest server's at its full
-    /// rate, completes).
+    /// B319 witness: a shard fetch takes each data shard verified from any
+    /// session (one fetch for the block: each node's stored text differs, so
+    /// a parted fetch was a session's own), and once all are in, the block is
+    /// its body under the header and the proposer's signature named.
     #[test]
-    fn the_smallest_parted_fetch_gives_way() {
-        let sync = setup_sync("b285_room").with_parted_budget(100);
-        let held = |peer: &str, bytes: usize| crate::PartialBlock {
-            peer: peer.to_string(),
-            height: 1,
-            hash: "ab".repeat(32),
-            len: 1_000,
-            bytes: vec![b'x'; bytes],
-            progressed: std::time::Instant::now(),
-            started: std::time::Instant::now(),
+    fn a_shard_fetch_builds_the_block_from_its_data_shards() {
+        let mut block = Block::new(
+            7,
+            7,
+            "prev".into(),
+            vec!["x".repeat(5_000)],
+            "node_1".into(),
+        );
+        block.proposer_signer = "ab".repeat(32);
+        block.proposer_signature = "cd".repeat(64);
+        let body = block.body_bytes();
+        let layout = da::Layout::of(body.len() as u64);
+        assert!(layout.data_shards > 1, "vacuous: one shard");
+        let big = crate::OversizedBlock {
+            height: 7,
+            len: 1,
+            header: block.header.clone(),
+            proposer_signature: block.proposer_signature.clone(),
+            proposer_signer: block.proposer_signer.clone(),
         };
-        {
-            let mut parted = sync.parted.lock().unwrap();
-            parted.insert("a".into(), held("a", 60));
-            parted.insert("b".into(), held("b", 30));
+        let mut fetch = crate::ShardFetch::new(big);
+        assert_eq!(fetch.next_missing(), 0);
+        assert!(fetch.block().is_none());
+        let size = layout.shard_size as usize;
+        let shard = |i: usize| {
+            let mut s = vec![0u8; size];
+            let part = &body[(i * size).min(body.len())..((i + 1) * size).min(body.len())];
+            s[..part.len()].copy_from_slice(part);
+            s
+        };
+        for i in (0..layout.data_shards as usize).rev() {
+            assert!(fetch.block().is_none(), "a block before its last shard");
+            fetch.accept(layout, i as u64, shard(i));
         }
-        let kept = |sync: &crate::ChainSync| {
-            let mut peers: Vec<String> = sync.parted.lock().unwrap().keys().cloned().collect();
-            peers.sort();
-            peers
+        let built = fetch.block().expect("every shard in").expect("a body");
+        assert_eq!(built.header.hash, block.header.hash);
+        assert_eq!(built.transactions, block.transactions);
+        assert_eq!(
+            (built.proposer_signer, built.proposer_signature),
+            (block.proposer_signer, block.proposer_signature)
+        );
+    }
+
+    /// B415 witness: sessions taking turns in rotation, one piece a turn,
+    /// more of them than B387 kept unfinished shards (eight), each take a
+    /// shard no other session's unfinished one covers once a shard proved
+    /// the length, keep it until it proves, and the body completes. Every
+    /// session restarted the first missing shard, and the eight kept went
+    /// oldest first, so a session's was evicted before its next turn and no
+    /// shard of two pieces finished. B423: before that proof, every session
+    /// asks shard 0.
+    #[test]
+    fn sessions_in_rotation_spread_over_shards_and_finish_them() {
+        let mut block = Block::new(
+            7,
+            7,
+            "prev".into(),
+            vec!["x".repeat(20_000)],
+            "node_1".into(),
+        );
+        block.proposer_signer = "ab".repeat(32);
+        block.proposer_signature = "cd".repeat(64);
+        let body = block.body_bytes();
+        let layout = da::Layout::of(body.len() as u64);
+        let sessions: Vec<String> = (0..12).map(|i| format!("s{i}")).collect();
+        assert!(
+            layout.data_shards > sessions.len() as u64,
+            "vacuous: {} shards",
+            layout.data_shards
+        );
+        let size = layout.shard_size as usize;
+        let piece = size.div_ceil(4);
+        let shard = |i: usize| {
+            let mut s = vec![0u8; size];
+            let part = &body[(i * size).min(body.len())..((i + 1) * size).min(body.len())];
+            s[..part.len()].copy_from_slice(part);
+            s
         };
-        // Within the budget: nothing gives way.
-        assert!(sync.make_room("c", 10));
-        assert_eq!(kept(&sync), ["a", "b"]);
-        // c is the smallest: it gives way.
-        assert!(!sync.make_room("c", 20));
-        assert_eq!(kept(&sync), ["a", "b"]);
-        // c outgrows b: b gives way.
-        assert!(sync.make_room("c", 40));
-        assert_eq!(kept(&sync), ["a"]);
+        let big = crate::OversizedBlock {
+            height: 7,
+            len: 1,
+            header: block.header.clone(),
+            proposer_signature: block.proposer_signature.clone(),
+            proposer_signer: block.proposer_signer.clone(),
+        };
+        let mut fetch = crate::ShardFetch::new(big);
+        let mut before_proof = Vec::new();
+        let mut first_round = Vec::new();
+        let mut turns = 0;
+        while fetch.block().is_none() {
+            let peer = &sessions[turns % sessions.len()];
+            turns += 1;
+            assert!(turns < 10_000, "the body never completed");
+            let proved = fetch.body_len.is_some();
+            let (index, mut bytes, _) = fetch.turn_shard(peer);
+            if !proved {
+                before_proof.push(index);
+            } else if first_round.len() < sessions.len() {
+                first_round.push(index);
+            }
+            let whole = shard(index as usize);
+            let end = (bytes.len() + piece).min(size);
+            bytes.extend_from_slice(&whole[bytes.len()..end]);
+            if bytes.len() == size {
+                fetch.accept(layout, index, bytes);
+            } else {
+                fetch.keep_partial(peer, index, bytes, Some(layout.body_len));
+            }
+        }
+        assert!(
+            before_proof.len() > sessions.len(),
+            "vacuous: a shard proved within one round"
+        );
+        assert!(
+            before_proof.iter().all(|index| *index == 0),
+            "B423: a session spread before a shard proved the length: {before_proof:?}"
+        );
+        let built = fetch.block().expect("every shard in").expect("a body");
+        assert_eq!(built.header.hash, block.header.hash);
+        assert_eq!(built.transactions, block.transactions);
+        let distinct: std::collections::HashSet<u64> = first_round.iter().copied().collect();
+        assert_eq!(
+            distinct.len(),
+            sessions.len(),
+            "sessions restarted the same shard: {first_round:?}"
+        );
+    }
+
+    /// B423 witness: before a shard proves the body's length, strangers'
+    /// unfinished shards claiming lengths move no session off shard 0, and
+    /// with `MAX_PARTIALS` of them held, a session's own is still kept (the
+    /// one kept longest ago goes) and resumed at its next turn. B415 spread
+    /// sessions over the fewest shards the claimed lengths gave (the
+    /// strangers' choice when every unfinished shard was theirs), and kept
+    /// none for a session holding none once the store was full: unfinished
+    /// shards never proved and never lied about held it for good.
+    #[test]
+    fn strangers_unfinished_shards_neither_steer_nor_hold_the_fetch() {
+        let block = Block::new(7, 7, "prev".into(), vec!["x".repeat(500)], "node_1".into());
+        let big = crate::OversizedBlock {
+            height: 7,
+            len: 1,
+            header: block.header.clone(),
+            proposer_signature: String::new(),
+            proposer_signer: String::new(),
+        };
+        let mut fetch = crate::ShardFetch::new(big);
+        // Strangers cover shards 0..4, each claiming a body of 100 shards.
+        let claimed = Some(100 * 512);
+        for i in 0..4u64 {
+            fetch.keep_partial(&format!("sybil{i}"), i, vec![1], claimed);
+        }
+        let (index, bytes, length) = fetch.turn_shard("honest");
+        assert_eq!(
+            (index, bytes.len(), length),
+            (0, 0, None),
+            "an unproved claim steered a session"
+        );
+        // The store full of strangers' unfinished shards.
+        for i in 4..crate::MAX_PARTIALS as u64 {
+            fetch.keep_partial(&format!("sybil{i}"), i, vec![1], claimed);
+        }
+        assert_eq!(fetch.partials.len(), crate::MAX_PARTIALS);
+        fetch.keep_partial("honest", 0, vec![7, 7], None);
+        assert_eq!(fetch.partials.len(), crate::MAX_PARTIALS);
+        assert!(
+            !fetch.partials.iter().any(|(p, ..)| p == "sybil0"),
+            "the one kept longest ago was not the one to go"
+        );
+        let (index, bytes, _) = fetch.turn_shard("honest");
+        assert_eq!(
+            (index, bytes),
+            (0, vec![7, 7]),
+            "a session's unfinished shard was not kept with the store full"
+        );
+    }
+
+    /// B424 witness: a silent turn (a parted block named, then no piece and
+    /// no busy answer) is unjudged the first time, struck when the session's
+    /// last silent turn had no piece or block after it, and a turn that
+    /// brought a piece clears the count. B416 left every turn without a
+    /// piece unjudged, so a session naming the real block and never
+    /// answering kept no strike for good.
+    #[test]
+    fn a_session_silent_twice_without_a_piece_is_struck() {
+        let silent = crate::Turn {
+            reached: 0,
+            brought: 0,
+            bytes: 0,
+            shards: 0,
+            slow: false,
+            ended_well: false,
+            asked: true,
+            refused: false,
+            unjudged: true,
+            silent: Some(7),
+        };
+        let piece = crate::Turn {
+            bytes: 100,
+            silent: None,
+            ..silent
+        };
+        let busy = crate::Turn {
+            silent: None,
+            ..silent
+        };
+        type Silences = std::collections::HashMap<String, (u64, std::time::Instant)>;
+        let mut silences = Silences::new();
+        let at = std::time::Instant::now();
+        let verdict = |silences: &mut Silences, turn: &crate::Turn, after: u64| {
+            let when = at + std::time::Duration::from_secs(after);
+            crate::silence_verdict(silences, "s", turn, when)
+        };
+        assert_eq!(verdict(&mut silences, &silent, 0), None, "a build's wait");
+        assert_eq!(verdict(&mut silences, &busy, 1), None);
+        assert_eq!(
+            verdict(&mut silences, &silent, 2),
+            Some(true),
+            "a session silent again before any piece was not struck"
+        );
+        assert_eq!(verdict(&mut silences, &silent, 3), Some(true));
+        assert_eq!(verdict(&mut silences, &piece, 4), None);
+        assert_eq!(
+            verdict(&mut silences, &silent, 5),
+            None,
+            "a piece did not clear the silence"
+        );
+        let later = 6 + crate::STRIKE_TTL.as_secs();
+        assert_eq!(
+            verdict(&mut silences, &silent, later),
+            None,
+            "a silence past STRIKE_TTL still counted"
+        );
+    }
+
+    /// B439 witness: a session silent on one parted block and then on the
+    /// next is not struck (an honest server builds each block's source
+    /// inside its first ask), and silent twice on one block it still is
+    /// (B424). Any earlier silence counted, so an honest server was struck
+    /// at the second oversized block it built for this node.
+    #[test]
+    fn a_session_silent_once_a_block_is_not_struck() {
+        let on = |height: u64| crate::Turn {
+            reached: 0,
+            brought: 0,
+            bytes: 0,
+            shards: 0,
+            slow: false,
+            ended_well: false,
+            asked: true,
+            refused: false,
+            unjudged: true,
+            silent: Some(height),
+        };
+        type Silences = std::collections::HashMap<String, (u64, std::time::Instant)>;
+        let mut silences = Silences::new();
+        let at = std::time::Instant::now();
+        let verdict = |silences: &mut Silences, turn: &crate::Turn, after: u64| {
+            let when = at + std::time::Duration::from_secs(after);
+            crate::silence_verdict(silences, "s", turn, when)
+        };
+        assert_eq!(verdict(&mut silences, &on(7), 0), None, "block 7's build");
+        assert_eq!(
+            verdict(&mut silences, &on(8), 1),
+            None,
+            "an honest server was struck for building the next block's source"
+        );
+        assert_eq!(
+            verdict(&mut silences, &on(8), 2),
+            Some(true),
+            "B424: a session silent twice on one block was not struck"
+        );
+    }
+
+    /// B438 witness: a pass drops a shard fetch of a height this node holds
+    /// even when it ends before asking any session (here it has none), and
+    /// keeps one above it. The fetch was dropped only past the session list
+    /// and the tip gate, so a node that reached the block another way and
+    /// then lost its sessions, halted or met a tip disagreement kept it (up
+    /// to about a body and a half) until the next oversized block or a
+    /// restart.
+    #[tokio::test]
+    async fn a_pass_drops_a_shard_fetch_this_node_has_reached() {
+        let sync = setup_sync(&unique_name("b438_reached_fetch"));
+        sync.storage.put("latest_height", "7").unwrap();
+        let fetch_at = |height: u64| {
+            let block = Block::new(height, height, "prev".into(), vec![], "node_1".into());
+            crate::ShardFetch::new(crate::OversizedBlock {
+                height,
+                len: 1,
+                header: block.header.clone(),
+                proposer_signature: String::new(),
+                proposer_signer: String::new(),
+            })
+        };
+        *sync.sharded.lock().unwrap() = Some(fetch_at(8));
+        assert_eq!(sync.sync_from_peers().await, 7);
+        assert!(
+            sync.sharded.lock().unwrap().is_some(),
+            "vacuous: a fetch above this node's height was dropped"
+        );
+        *sync.sharded.lock().unwrap() = Some(fetch_at(7));
+        assert_eq!(sync.sync_from_peers().await, 7);
+        assert!(
+            sync.sharded.lock().unwrap().is_none(),
+            "a fetch of a height this node holds was kept"
+        );
+    }
+
+    /// B433 witness: an answer is read only if its blocks are above the
+    /// request's height, each above the last, at most a batch of them; a
+    /// pruned server's answer starting past the next block (B388), or
+    /// skipping heights it does not hold, is one an honest server sends.
+    #[test]
+    fn only_an_answer_an_honest_server_could_send_is_read() {
+        let of = |heights: &[u64]| {
+            heights
+                .iter()
+                .map(|h| Block::new(*h, *h, "prev".into(), vec![], "node_1".into()))
+                .collect::<Vec<Block>>()
+        };
+        let shape = |heights: &[u64]| crate::honest_batch_shape(&of(heights), 10);
+        assert!(shape(&[]), "an empty answer");
+        assert!(shape(&[11, 12, 13]), "the next blocks");
+        assert!(
+            shape(&[15, 16]),
+            "B388: an answer starting past the next block"
+        );
+        assert!(shape(&[11, 13, 20]), "an answer with gaps");
+        let full: Vec<u64> = (11..11 + crate::SYNC_TURN_BLOCKS).collect();
+        assert!(shape(&full), "a full batch");
+        assert!(!shape(&[11, 11]), "a duplicate");
+        assert!(!shape(&[10, 10, 10]), "stubs of this node's height");
+        assert!(!shape(&[10, 11]), "a block at this node's height");
+        assert!(!shape(&[3, 11]), "a block below it");
+        assert!(!shape(&[12, 11]), "an answer going back");
+        assert!(!shape(&[11, 12, 5]), "an answer going back below this node");
+        let over: Vec<u64> = (11..12 + crate::SYNC_TURN_BLOCKS).collect();
+        assert_eq!(over.len(), 501);
+        assert!(!shape(&over), "501 blocks");
     }
 
     /// B302 witness: a turn ending at its server's block without a QC ends
@@ -622,11 +1008,13 @@ mod tests {
             reached: 0,
             brought: 0,
             bytes: 0,
+            shards: 0,
             slow: false,
             ended_well: false,
             asked: true,
             refused: false,
             unjudged: false,
+            silent: None,
         };
         let stop = consensus::v4::MAX_UNFINALIZED_BLOCKS;
         let mut near = fresh();
@@ -641,49 +1029,65 @@ mod tests {
         );
     }
 
-    /// B301 witness: a parted fetch fed a byte now and then is still
-    /// dropped at its deadline (it held the bytes every other fetch needed
-    /// for good), and a large one has longer than `STRIKE_TTL`.
+    /// B365 witness: a block's body is within the bound its stored text
+    /// gives. A block of committed vertices has more body than text (144
+    /// bytes to 134 a vertex), so one bound for both refused such blocks of
+    /// 476-512 MiB of text and struck the servers that sent them.
     #[test]
-    fn a_parted_fetch_past_its_deadline_is_dropped() {
-        let start = std::time::Instant::now();
-        let second = std::time::Duration::from_secs(1);
-        let fetch = |len: u64, last_byte: std::time::Instant| crate::PartialBlock {
-            peer: "p".into(),
-            height: 10,
-            hash: "h".into(),
-            len,
-            bytes: Vec::new(),
-            progressed: last_byte,
-            started: start,
+    fn a_blocks_body_is_within_the_bound_its_text_gives() {
+        let n = 10_000u64;
+        let block = blockchain::Block {
+            header: Default::default(),
+            transactions: vec![],
+            committed_vertices: (0..n).map(|i| format!("{i:064x}")).collect(),
+            committed_authors: (0..n).map(|i| format!("{:064x}", i + 1)).collect(),
+            anchor_hash: "ab".repeat(32),
+            proposer_signature: String::new(),
+            proposer_signer: String::new(),
+            slash_evidence: vec![],
         };
-        let small = fetch(1 << 20, start);
-        assert!(crate::parted_kept(&small, 9, start + second));
-        assert!(
-            !crate::parted_kept(&small, 10, start + second),
-            "a fetch of a height held is kept"
+        let text = serde_json::to_string(&block).unwrap().len() as u64;
+        let body = block.body_bytes().len() as u64;
+        assert!(body > text, "vacuous: the body is not past the text");
+        assert!(body <= crate::parted_body_budget(text));
+    }
+
+    /// B323 witness: a slow turn strikes even when it is otherwise unjudged
+    /// (a session answering each request at the turn's edge, behind a
+    /// QC-less block far below its claim, was never struck), and an unjudged
+    /// turn that brought whole blocks clears (an honest server reaching its
+    /// QC-less backlog after a few certified blocks was struck).
+    #[test]
+    fn an_unjudged_turn_is_struck_when_slow_and_clear_when_it_brought() {
+        let turn = |brought: u64, slow: bool| crate::Turn {
+            reached: 0,
+            brought,
+            bytes: 0,
+            shards: 0,
+            slow,
+            ended_well: false,
+            asked: true,
+            refused: false,
+            unjudged: true,
+            silent: None,
+        };
+        assert_eq!(turn(0, false).verdict(), None);
+        assert_eq!(
+            turn(0, true).verdict(),
+            Some(true),
+            "a slow turn was not struck"
         );
-        assert!(
-            !crate::parted_kept(&small, 9, start + crate::STRIKE_TTL),
-            "a fetch without a byte for STRIKE_TTL is kept"
+        assert_eq!(
+            turn(3, false).verdict(),
+            Some(false),
+            "a turn that brought blocks was struck"
         );
-        let deadline = crate::parted_deadline(crate::MAX_PARTED_BLOCK_BYTES);
-        assert!(deadline > crate::STRIKE_TTL);
-        let before = start + deadline - second;
-        assert!(crate::parted_kept(
-            &fetch(crate::MAX_PARTED_BLOCK_BYTES, before - second),
-            9,
-            before
-        ));
-        let after = start + deadline;
-        assert!(
-            !crate::parted_kept(
-                &fetch(crate::MAX_PARTED_BLOCK_BYTES, after - second),
-                9,
-                after
-            ),
-            "a fetch fed a byte now and then outlived its deadline"
-        );
+        assert_eq!(turn(3, true).verdict(), Some(true));
+        let judged = crate::Turn {
+            unjudged: false,
+            ..turn(0, false)
+        };
+        assert_eq!(judged.verdict(), Some(judged.struck()));
     }
 
     /// B291 witness: a server reads a block from storage for its parts at
@@ -704,14 +1108,17 @@ mod tests {
         );
     }
 
-    /// B264 witness: a block over the whole batch budget is named, not sent
-    /// (it went alone, over the frame no client reads past, and no node
-    /// could block-sync beyond it), and its parts are exactly its stored
-    /// bytes, each but the last `BLOCK_PART_BYTES` long.
+    /// B264/B319 witness: a block over the whole batch budget is named, not
+    /// sent (it went alone, over the frame no client reads past), with its
+    /// header and proposer's signature, and served as its DA data shards,
+    /// piece by piece: the pieces rebuild its body, and each shard proves
+    /// under the header's DA root by the proof its last piece carries.
     #[test]
-    fn a_block_too_large_for_a_batch_is_served_in_parts() {
-        let sync = setup_sync("b264_parts");
-        let huge = "x".repeat(crate::SYNC_RESP_BLOCK_BYTES + 1);
+    fn a_block_too_large_for_a_batch_is_served_in_shards() {
+        // A cut of 4 KiB: pieces of 1 KiB, so each of the 128 data shards
+        // of a 300 KB body takes three.
+        let sync = setup_sync("b264_shards").with_batch_bytes(4096);
+        let huge = "x".repeat(300_000);
         let mut stored = Vec::new();
         for (height, payload) in [
             (1, "small".to_string()),
@@ -729,72 +1136,93 @@ mod tests {
             sync.storage.save_block_json(height, &json).unwrap();
             stored.push(json);
         }
-        // B275: no part of a block before a batch answer named it (any
-        // height's block was read whole for a part request).
-        let refused = |sync: &ChainSync, height: u64, offset: u64| {
-            sync.handle_block_part(crate::BlockPartRequest { height, offset })
-                .error
-                .is_some()
+        // B275: no shard of a block before a batch answer named it.
+        let refused = |sync: &ChainSync, height: u64, index: u64, offset: u64| {
+            sync.handle_block_shard(crate::ShardRequest {
+                height,
+                index,
+                offset,
+            })
+            .error
+            .is_some()
         };
-        assert!(refused(&sync, 2, 0), "a part of a block not named");
-        // The batch stops before it.
+        assert!(refused(&sync, 2, 0, 0), "a shard of a block not named");
         let before = sync.handle_sync_request(SyncRequest { from_height: 0 });
         let heights: Vec<u64> = before.blocks.iter().map(|b| b.header.height).collect();
         assert_eq!(heights, vec![1]);
         assert!(before.oversized.is_none());
-        // Asked for it, the answer names it, with its header, and carries
-        // no block.
         let named = sync.handle_sync_request(SyncRequest { from_height: 1 });
         assert!(named.blocks.is_empty(), "an oversized block was sent whole");
-        let len = stored[1].len() as u64;
         let big = named.oversized.expect("the block named");
-        let header = serde_json::from_str::<Block>(&stored[1]).unwrap().header;
-        assert_eq!((big.height, big.len), (2, len));
-        assert_eq!(big.header.hash, header.hash);
-        // Its parts, over the session, rebuild its stored bytes.
-        let mut bytes = Vec::new();
-        let mut parts = 0;
-        while (bytes.len() as u64) < len {
-            let req = crate::BlockPartRequest {
-                height: 2,
-                offset: bytes.len() as u64,
-            };
-            let wire = format!(
-                "{}{}",
-                crate::PART_REQ,
-                serde_json::to_string(&req).unwrap()
-            );
-            let answer = sync.serve_session(&wire, "12D3KooWparts").expect("routed");
-            let part: crate::BlockPartResponse =
-                serde_json::from_str(answer.strip_prefix(crate::PART_RESP).unwrap()).unwrap();
-            assert_eq!((part.error, part.len), (None, len));
-            let data = part.data.as_bytes().to_vec();
-            assert!(
-                data.len() == crate::BLOCK_PART_BYTES || bytes.len() + data.len() == len as usize
-            );
-            bytes.extend_from_slice(&data);
-            parts += 1;
+        let block = serde_json::from_str::<Block>(&stored[1]).unwrap();
+        assert_eq!((big.height, big.len), (2, stored[1].len() as u64));
+        assert_eq!(big.header.hash, block.header.hash);
+        assert_eq!(big.proposer_signer, block.proposer_signer);
+        assert_eq!(big.proposer_signature, block.proposer_signature);
+        // Its shards, over the session, rebuild its body.
+        let body = block.body_bytes();
+        let layout = da::Layout::of(body.len() as u64);
+        let mut rebuilt = Vec::new();
+        let mut pieces = 0;
+        for index in 0..layout.data_shards {
+            let mut shard = Vec::new();
+            loop {
+                let req = crate::ShardRequest {
+                    height: 2,
+                    index,
+                    offset: shard.len() as u64,
+                };
+                let wire = format!(
+                    "{}{}",
+                    crate::SHARD_REQ,
+                    serde_json::to_string(&req).unwrap()
+                );
+                let answer = sync.serve_session(&wire, "12D3KooWshards").expect("routed");
+                let piece: crate::ShardResponse =
+                    serde_json::from_str(answer.strip_prefix(crate::SHARD_RESP).unwrap()).unwrap();
+                assert_eq!(piece.error, None);
+                assert_eq!((piece.body_len, piece.index), (body.len() as u64, index));
+                shard.extend_from_slice(&hex::decode(&piece.data).unwrap());
+                pieces += 1;
+                if shard.len() as u64 == layout.shard_size {
+                    let sample = da::Sample {
+                        body_len: piece.body_len,
+                        index,
+                        shard: hex::encode(&shard),
+                        proof: piece.proof,
+                    };
+                    da::verify_sample(&big.header.da_root, index, &sample)
+                        .expect("each shard proves");
+                    break;
+                }
+                assert!(piece.proof.is_empty(), "a proof before the shard's end");
+            }
+            rebuilt.extend_from_slice(&shard);
         }
-        assert_eq!(parts, 3);
-        assert_eq!(bytes, stored[1].as_bytes());
-        // Past its end, and a block a batch holds, are refused.
-        assert!(refused(&sync, 2, len));
-        assert!(refused(&sync, 1, 0));
-        assert!(refused(&sync, 9, 0));
-        // The batch after it goes on.
+        assert!(
+            pieces > layout.data_shards,
+            "vacuous: no shard took two pieces"
+        );
+        rebuilt.truncate(body.len());
+        assert_eq!(rebuilt, body);
+        // Past the last data shard or a shard's end, and a block a batch
+        // holds, are refused.
+        assert!(refused(&sync, 2, layout.data_shards, 0));
+        assert!(refused(&sync, 2, 0, layout.shard_size));
+        assert!(refused(&sync, 1, 0, 0));
+        assert!(refused(&sync, 9, 0, 0));
         let after = sync.handle_sync_request(SyncRequest { from_height: 2 });
         assert_eq!(after.blocks.len(), 1);
         assert!(after.oversized.is_none());
-        // B275: over the answer budget a part is told busy (it was
-        // dropped, and the client's fetch failed).
-        let wire = format!("{}{{}}", crate::PART_REQ);
-        let busy = crate::state_sync::busy_reply(&wire).expect("a busy part answer");
-        let busy: crate::BlockPartResponse =
-            serde_json::from_str(busy.strip_prefix(crate::PART_RESP).unwrap()).unwrap();
+        // B275: over the answer budget a piece is told busy.
+        let wire = format!("{}{{}}", crate::SHARD_REQ);
+        let busy = crate::state_sync::busy_reply(&wire).expect("a busy shard answer");
+        let busy: crate::ShardResponse =
+            serde_json::from_str(busy.strip_prefix(crate::SHARD_RESP).unwrap()).unwrap();
         assert_eq!(busy.error.as_deref(), Some("busy"));
     }
 
-    /// B275 witness: a part whose block is no longer kept reads it again
+    /// B275 witness: a shard whose block is not the one kept reads it again
     /// only a second after the last such read, and is told busy meanwhile
     /// (clients fetching several large blocks made every part a whole
     /// block's read).
@@ -806,7 +1234,7 @@ mod tests {
             let json = serde_json::to_string(&block).unwrap();
             sync.storage.save_block_json(height, &json).unwrap();
         }
-        // Each block is named in turn (and kept: the last four stay).
+        // Each block is named in turn.
         for from_height in 0..6 {
             let named = sync.handle_sync_request(SyncRequest { from_height });
             assert_eq!(
@@ -817,14 +1245,77 @@ mod tests {
             );
         }
         let part = |height: u64| {
-            sync.handle_block_part(crate::BlockPartRequest { height, offset: 0 })
-                .error
+            sync.handle_block_shard(crate::ShardRequest {
+                height,
+                index: 0,
+                offset: 0,
+            })
+            .error
         };
-        // Kept: no read.
+        // One read now; kept, its next pieces read nothing.
         assert_eq!(part(6), None);
-        // Not kept: one read now, then busy until a second has passed.
-        assert_eq!(part(1), None);
-        assert_eq!(part(2).as_deref(), Some("busy"));
+        assert_eq!(part(6), None);
+        // Another block: busy until a second has passed.
+        assert_eq!(part(1).as_deref(), Some("busy"));
+    }
+
+    /// B470 witness: a block known too large for a batch is named, and its
+    /// shards served, only while this node may still hold it. Pruning never
+    /// touched the index, so a node that pruned such a block went on naming
+    /// it at a requester's next height (with no QC, and a prune horizon
+    /// above it: the requester never noted that it pruned), and a shard
+    /// asked for it began a build that found no block and held the next
+    /// build back.
+    #[test]
+    fn a_pruned_block_is_not_named_from_the_oversized_index() {
+        let sync = setup_sync("b470_stale_index").with_batch_bytes(64);
+        for height in 1..=6 {
+            let block = Block::new(height, height, "prev".into(), vec![], "node_1".into());
+            let json = serde_json::to_string(&block).unwrap();
+            sync.storage.save_block_json(height, &json).unwrap();
+        }
+        for from_height in 0..6 {
+            let named = sync.handle_sync_request(SyncRequest { from_height });
+            assert_eq!(
+                named.oversized.map(|b| b.height),
+                Some(from_height + 1),
+                "vacuous: block {} not parted",
+                from_height + 1
+            );
+        }
+        // Blocks 1..=3 pruned, as `prune_old_blocks` leaves them.
+        for height in 1..=3 {
+            sync.storage.delete(&format!("block_{height}")).unwrap();
+        }
+        sync.storage
+            .put(storage::StateDB::BLOCK_PRUNE_CURSOR_KEY, "4")
+            .unwrap();
+        let answer = sync.handle_sync_request(SyncRequest { from_height: 2 });
+        assert_eq!(
+            answer.oversized.map(|b| b.height),
+            Some(4),
+            "a pruned block named"
+        );
+        assert_eq!(answer.prune_horizon, Some(4));
+        assert!(
+            !sync.oversized_known.lock().unwrap().contains_key(&3),
+            "its index entry stayed"
+        );
+        let part = |height: u64| {
+            sync.handle_block_shard(crate::ShardRequest {
+                height,
+                index: 0,
+                offset: 0,
+            })
+            .error
+        };
+        assert_eq!(
+            part(2).as_deref(),
+            Some("not a block served in shards"),
+            "a pruned block's shard asked for"
+        );
+        // No build was begun for it: a held block's is not held back.
+        assert_eq!(part(5), None);
     }
 
     #[test]
@@ -893,7 +1384,7 @@ mod tests {
             stake: 1000,
             ed25519_public_key: "00".repeat(32),
             bls_public_key: hex::encode(bls.pubkey_raw(&seed)),
-            bls_pop: hex::encode(bls.prove_possession_raw(&seed)),
+            bls_pop: hex::encode(bls.prove_possession_raw(&seed, &[0u8; 32])),
         }];
         sync.storage
             .put(
@@ -1344,6 +1835,44 @@ mod tests {
             .unwrap();
         assert_eq!(sync.process_blocks(vec![block.clone()], 0), 1);
         assert_eq!(sync.process_blocks(vec![block], 1), 1);
+    }
+
+    /// B443 witness: an executed height's stored block is known by its
+    /// header alone (`header_of`). The branch for a height executed already
+    /// parsed the whole stored block (up to 512 MiB parted) for its hash: a
+    /// stored row whose body does not parse, under the block's own header,
+    /// is the block.
+    #[test]
+    fn an_executed_heights_stored_block_is_known_by_its_header() {
+        let sync = setup_sync(&unique_name("executed_header_alone"));
+        let key = crypto::SigningKey::from_bytes(&[77; 32]);
+        let proposer = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
+        set_validators(&sync, vec![(&proposer, 100)]);
+        let mut block = Block::new(1, 1, "genesis".to_string(), vec![], proposer);
+        authenticate_block(&sync, &mut block);
+        sync.validate_block(&block, 1, "genesis").unwrap();
+        // Executed (a producer in flight, or a crash before its block row),
+        // its row's body unreadable.
+        sync.storage.put("sys:last_executed_height", "1").unwrap();
+        let row = serde_json::to_string(&block).unwrap().replacen(
+            "\"transactions\":[]",
+            "\"transactions\":0",
+            1,
+        );
+        assert!(
+            serde_json::from_str::<Block>(&row).is_err(),
+            "vacuous: the stored body still parses"
+        );
+        assert_eq!(
+            blockchain::header_of(&row).map(|header| header.hash),
+            Some(block.header.hash.clone())
+        );
+        sync.storage.put("block_1", &row).unwrap();
+        assert_eq!(
+            sync.process_blocks(vec![block], 0),
+            1,
+            "the executed height's stored block was parsed whole"
+        );
     }
 
     #[test]
@@ -2036,6 +2565,80 @@ mod tests {
             0,
             "one unverified ahead claim waived the agreement of two"
         );
+    }
+
+    /// B446 witness: on V4 the tip-agreement gate does not run (every block
+    /// sync imports needs its own QC, and finality moves only by a verified
+    /// QC). With N = 3 and member sessions that give no verifiable tip
+    /// (silent, or a QC that fails), the pass still asks them for blocks: it
+    /// refused every pass, so a member that fell behind never caught up. The
+    /// same sessions on a chain that runs the gate (V3) are refused: the
+    /// control.
+    #[tokio::test]
+    async fn a_v4_node_syncs_whatever_tip_agreement_n_says() {
+        for v4 in [false, true] {
+            let (asks, mut queued) = tokio::sync::mpsc::channel::<network::SyncAsk>(16);
+            let (dials, _) = tokio::sync::mpsc::channel(1);
+            let block_asks = Arc::new(std::sync::Mutex::new(0usize));
+            let count = Arc::clone(&block_asks);
+            tokio::spawn(async move {
+                while let Some(ask) = queued.recv().await {
+                    let answer = match ask.wire.as_str() {
+                        "GET_HEIGHT" => Ok("HEIGHT:100".to_string()),
+                        // No finality, no blocks.
+                        wire => {
+                            if wire.starts_with("SYNC_REQ:") {
+                                *count.lock().unwrap() += 1;
+                            }
+                            Err("no".to_string())
+                        }
+                    };
+                    let _ = ask.reply.send(answer);
+                }
+            });
+            let member = |peer: &str, member: &str| network::SessionPeer {
+                peer: peer.into(),
+                member: Some(member.into()),
+            };
+            let client = network::SessionClient {
+                asks,
+                dials,
+                table: Arc::new(std::sync::RwLock::new(vec![
+                    member("12D3KooWa", "validator_a"),
+                    member("12D3KooWb", "validator_b"),
+                    member("12D3KooWc", "validator_c"),
+                ])),
+            };
+            let sync = setup_sync(&unique_name("b446_tip_gate")).with_sessions(client);
+            sync.storage.put("latest_height", "5").unwrap();
+            {
+                let _seed = sync.storage.seeding();
+                sync.storage.put("sys:config:tip_agreement_n", "3").unwrap();
+                if v4 {
+                    sync.storage
+                        .put(consensus::v4::VERTEX_FORMAT_KEY, "4")
+                        .unwrap();
+                }
+            }
+            set_validators(
+                &sync,
+                vec![
+                    ("validator_a", 100),
+                    ("validator_b", 100),
+                    ("validator_c", 100),
+                ],
+            );
+            sync.sync_from_peers().await;
+            let asked = *block_asks.lock().unwrap();
+            if v4 {
+                assert!(
+                    asked > 0,
+                    "a V4 node refused to sync for want of tip agreement"
+                );
+            } else {
+                assert_eq!(asked, 0, "control: off V4 the gate runs and refuses");
+            }
+        }
     }
 
     // End-to-end-ish: with N=2 configured and no answering seed sessions,

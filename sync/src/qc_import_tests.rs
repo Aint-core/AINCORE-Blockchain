@@ -20,7 +20,7 @@ fn member(seed: u8) -> ValidatorInfo {
         stake: 100,
         ed25519_public_key: hex::encode(ed),
         bls_public_key: hex::encode(bls.pubkey_raw(&bls_seed)),
-        bls_pop: hex::encode(bls.prove_possession_raw(&bls_seed)),
+        bls_pop: hex::encode(bls.prove_possession_raw(&bls_seed, &ed)),
     }
 }
 
@@ -542,4 +542,94 @@ fn v4_a_forged_qc_carrying_the_conflict_text_raises_no_alarm() {
             alarms(&sync)
         );
     }
+}
+
+/// B444 witness: a block's body roots (the DA root's Reed-Solomon extension
+/// among them) are checked only under a QC that verifies. A member's signed
+/// header whose DA root its body does not match, sent without a QC, made
+/// every node run the whole extension before the QC was looked up, a pass at
+/// a time: B41 moved only the signature ahead of the roots, and a member's
+/// own costs it nothing. The import now stops at it for want of its QC
+/// alone, its body's roots never computed (only `validate_header_in`'s
+/// linear checks read the body); under a QC that verifies, the roots are
+/// checked and the block refused; the real block imports.
+#[test]
+fn v4_a_blocks_body_is_checked_only_under_its_verified_qc() {
+    let (sync, committee) = v4_sync("b444_roots_after_qc");
+    let real = block_at(&sync, 1, "genesis", &"ab".repeat(32));
+    let mut lying = real.clone();
+    lying.header.da_root = "ee".repeat(32);
+    lying.header.hash = blockchain::calculate_header_hash(&lying.header);
+    let key = crypto::SigningKey::from_bytes(&[SEEDS[0]; 32]);
+    lying.sign_proposer(&key, &real.proposer_signer);
+    let err = lying.check_commitments().unwrap_err();
+    assert!(err.contains("DA root mismatch"), "vacuous: {err}");
+    sync.validate_block(&lying, 1, "genesis")
+        .expect_err("vacuous: the whole check passes");
+    let imported = sync.import_blocks(vec![lying.clone()], &[], 0);
+    assert_eq!(
+        (imported.reached, imported.qcless),
+        (0, Some(1)),
+        "a block without its QC had its body checked"
+    );
+    let qc = qc_for(&lying, &committee, &[0, 1, 2]);
+    let imported = sync.import_blocks(vec![lying], std::slice::from_ref(&qc), 0);
+    assert_eq!(
+        (imported.reached, imported.qcless),
+        (0, None),
+        "a certified header over another body was imported"
+    );
+    let qc = qc_for(&real, &committee, &[0, 1, 2]);
+    assert_eq!(
+        sync.process_blocks_with_qcs(vec![real], &[qc], 0),
+        1,
+        "control: the real block imports"
+    );
+}
+
+/// B466 witness: sync's refusals of what a session sent are logged cut and
+/// escaped (`loggable`): a finality QC's (B443's, which echoes its committee
+/// hash), a block's (its parent hash) and a block QC's (its claimed chain
+/// id). Each was printed whole, up to a 10 MiB sync answer a line, line
+/// breaks included (a forged log line).
+#[test]
+fn v4_refusals_of_a_sessions_text_are_logged_cut_and_escaped() {
+    let (sync, committee) = v4_sync("b466_logs");
+    let b1 = block_at(&sync, 1, "genesis", &"a1".repeat(32));
+    let q1 = qc_for(&b1, &committee, &[0, 1, 2]);
+    assert_eq!(sync.process_blocks_with_qcs(vec![b1.clone()], &[q1], 0), 1);
+    let forged = format!("x\n🚨 [DE-6] a forged alarm line {}", "e".repeat(1 << 20));
+    crate::take_logged();
+    let logged_cut = |what: &str| {
+        let lines = crate::take_logged();
+        let line = lines
+            .iter()
+            .find(|l| l.contains(what))
+            .unwrap_or_else(|| panic!("vacuous: no {what} line of {}", lines.len()));
+        assert!(line.chars().count() <= 400, "{what}: {} bytes", line.len());
+        assert!(!line.contains('\n'), "{what}: a line break was logged");
+        // (A QC's error is its Debug text, escaped once already.)
+        assert!(line.contains("x\\"), "{what}: control: the text, escaped: {line}");
+    };
+    // A finality QC bound to another committee: its refusal quotes the hash.
+    let mut qc = qc_for(&b1, &committee, &[0, 1, 2]);
+    qc.validator_set_hash = forged.clone();
+    sync.finality_lied(&FinalityArtifact {
+        finalized_round: qc.finalized_round.to_string(),
+        last_anchor_round: qc.anchor_round.to_string(),
+        last_anchor_hash: qc.anchor_hash.clone(),
+        finality_digest: qc.finality_digest.clone(),
+        qc: Some(qc),
+    });
+    logged_cut("SYNC_FINALITY_REJECT");
+    // A block on another parent: its refusal quotes the parent hash.
+    let orphan = block_at(&sync, 2, &forged, &"a2".repeat(32));
+    assert_eq!(sync.process_blocks_with_qcs(vec![orphan], &[], 1), 1);
+    logged_cut("validation FAILED");
+    // A block QC of another chain: its refusal quotes the chain id.
+    let b2 = block_at(&sync, 2, &b1.header.hash, &"a2".repeat(32));
+    let mut q2 = qc_for(&b2, &committee, &[0, 1, 2]);
+    q2.chain_id = forged;
+    assert_eq!(sync.process_blocks_with_qcs(vec![b2], &[q2], 1), 1);
+    logged_cut("SYNC_QC_REJECT");
 }

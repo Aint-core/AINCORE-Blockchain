@@ -26,6 +26,7 @@ fn pending(db: &StateDB, height: u64) {
         sequence: block.committed_vertices.clone(),
         finality_digest: "34".repeat(32),
         decision_floor: 0,
+        decision_cursor: 0,
     };
     db.transaction(|view| {
         view.save_block_json(height, &serde_json::to_string(&block).unwrap())?;
@@ -147,6 +148,41 @@ fn malformed_or_mismatched_pending_context_never_signs_or_deletes_work() {
     }
 }
 
+/// B469 witness: pending work whose row cannot be read (not UTF-8: a
+/// rotted byte, which `try_get` reports as it does a read error), does not
+/// parse, is over its bound or names another height is an error, never "no
+/// work": read as none, the finality floor released B255's retention and
+/// the B262/B318 brakes. Control: no row is no work, and the staged row
+/// reads.
+#[test]
+fn pending_work_that_cannot_be_read_is_an_error_not_none() {
+    let dir = TestDir::new();
+    dir.seed(false);
+    let db = dir.open();
+    assert_eq!(pending_context(&db, 1), Ok(None), "control: no row");
+    pending(&db, 1);
+    let mut other = pending_context(&db, 1)
+        .unwrap()
+        .expect("control: the staged work does not read");
+    other.block_height = 2;
+    let cases: [Vec<u8>; 4] = [
+        b"{\"block_height\":1".to_vec(),
+        b"{\xff}".to_vec(),
+        "x".repeat(16 * 1024 + 1).into_bytes(),
+        serde_json::to_vec(&other).unwrap(),
+    ];
+    for (case, bad) in cases.into_iter().enumerate() {
+        let mut batch = storage::rocksdb::WriteBatch::default();
+        batch.put(PENDING.as_bytes(), bad);
+        db.write_batch(batch).unwrap();
+        let read = pending_context(&db, 1);
+        assert!(read.is_err(), "case {case} read as {read:?}");
+    }
+}
+
+/// The body itself was checked when the work was staged with it (B358: a
+/// retry reads the header and the anchor, not the whole block): a header
+/// changed without its hash stops the retry.
 #[test]
 fn missing_or_changed_execution_and_body_never_authorize_retry() {
     for case in 0..4 {
@@ -161,7 +197,7 @@ fn missing_or_changed_execution_and_body_never_authorize_retry() {
             _ => {
                 let mut block: blockchain::Block =
                     serde_json::from_str(&db.get("block_1").unwrap().unwrap()).unwrap();
-                block.transactions.push("changed without rehash".into());
+                block.header.timestamp += 1;
                 db.put("block_1", &serde_json::to_string(&block).unwrap())
                     .unwrap();
             }
@@ -173,6 +209,97 @@ fn missing_or_changed_execution_and_body_never_authorize_retry() {
         ));
         assert_eq!(rows(&db), before);
     }
+}
+
+/// B369 witness: a QC stored for pending work retires it without its block
+/// (pruned): the retry read the held block first, so the row never cleared,
+/// and 50 blocks later the member proposed nothing again.
+#[test]
+fn a_stored_qc_retires_pending_work_without_its_block() {
+    let dir = TestDir::new();
+    dir.seed(false);
+    let db = dir.open();
+    pending(&db, 1);
+    assert!(
+        matches!(retry(&db, &mut String::new())[0], QcOutcome::Complete(_)),
+        "vacuous: no QC"
+    );
+    // The work again, as a crash before its retirement leaves it, and the
+    // block gone.
+    pending(&db, 1);
+    db.delete("block_1").unwrap();
+    assert!(matches!(
+        retry(&db, &mut String::new())[0],
+        QcOutcome::Complete(_)
+    ));
+    assert!(db.get(PENDING).unwrap().is_none(), "the work stayed");
+}
+
+/// B420 witness: a stored QC (verified when it was stored) that differs from
+/// this node's pending work raises a durable alarm, which halts ordering and
+/// sync: a committee mismatch when only the next committee differs, else a
+/// decision conflict. The retry returned an error and kept the row: a
+/// silent stall for good (EP-4's check waits behind B317 for this row).
+#[test]
+fn a_stored_qc_conflicting_with_pending_work_raises_an_alarm() {
+    for next_only in [true, false] {
+        let dir = TestDir::new();
+        dir.seed(false);
+        let db = dir.open();
+        pending(&db, 1);
+        let work = db.get(PENDING).unwrap().unwrap();
+        assert!(
+            matches!(retry(&db, &mut String::new())[0], QcOutcome::Complete(_)),
+            "vacuous: no QC"
+        );
+        let mut ctx: CommitContext = serde_json::from_str(&work).unwrap();
+        if next_only {
+            ctx.next_validator_set_hash = "ee".repeat(32);
+        } else {
+            ctx.finality_digest = "99".repeat(32);
+        }
+        db.put(PENDING, &serde_json::to_string(&ctx).unwrap())
+            .unwrap();
+        assert!(matches!(
+            retry(&db, &mut String::new())[0],
+            QcOutcome::Skipped
+        ));
+        let mismatch = db
+            .get(&format!("alarm:committee_mismatch:{:020}", 1))
+            .unwrap();
+        let conflict = db.get("alarm:decision_conflict:1").unwrap();
+        assert_eq!(
+            (mismatch.is_some(), conflict.is_some()),
+            (next_only, !next_only),
+            "next committee alone differs: {next_only}"
+        );
+        assert!(
+            crate::dag::recorded_conflict(&db).is_some(),
+            "sync does not stop on it"
+        );
+        assert!(db.get(PENDING).unwrap().is_some(), "the work was dropped");
+    }
+}
+
+/// B419 witness: pending work that cannot be read is an error, never "no
+/// pending work" (pruning dropped B369's clamp on it, and the epoch step
+/// skipped B317's wait). A row whose key names no height stands in for a
+/// read error, which storage cannot inject; the wrapper for the callers with
+/// no error path reads it as work at height 0.
+#[test]
+fn unreadable_pending_work_is_not_no_pending_work() {
+    let dir = TestDir::new();
+    dir.seed(false);
+    let db = dir.open();
+    assert_eq!(try_lowest_pending_qc_height(&db), Ok(None));
+    pending(&db, 1);
+    assert_eq!(try_lowest_pending_qc_height(&db), Ok(Some(1)));
+    {
+        let _seed = db.seeding();
+        db.put("consensus:qc_pending:-junk", "{}").unwrap();
+    }
+    assert!(try_lowest_pending_qc_height(&db).is_err());
+    assert_eq!(lowest_pending_qc_height(&db), Some(0));
 }
 
 #[test]

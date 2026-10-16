@@ -31,8 +31,12 @@ bad("a shard that is not hex", "BadShard", shard="zz" + good["shard"][2:])
 bad("a body length of 2^64 - 1", "BadShard", body_len=2**64 - 1)
 invalid.append({"name": "another body's root", "da_root": sample(pattern(5001), 0)[0], "sample": good, "error": "RootMismatch"})
 invalid.append({"name": "a root that is not hex", "da_root": "g" * 64, "sample": good, "error": "BadRoot"})
+# B455: shard 0's genuine sample answering a draw of shard 1, as a server
+# holding one shard answers every draw. "index" is the index the client drew.
+root_one, held = sample(pattern(1), 0)
+invalid.append({"name": "a genuine sample of another index than the one drawn", "da_root": root_one, "index": 1, "sample": held, "error": "WrongIndex"})
 
-out = {"description": "B1 DA sample vectors from da/reference/da_vectors.py. Bodies are pattern(len): byte i is (31 i + 7) mod 256.",
+out = {"description": "B1 DA sample vectors from da/reference/da_vectors.py. Bodies are pattern(len): byte i is (31 i + 7) mod 256. A sample answers a draw of its own index, unless the vector gives the drawn index (B455).",
        "valid": valid, "invalid": invalid}
 with open(os.path.join(os.path.dirname(__file__), "..", "vectors", "da_vectors.json"), "w") as f:
     json.dump(out, f, indent=1)

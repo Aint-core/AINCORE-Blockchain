@@ -503,6 +503,16 @@ fn header_preimage(header: &BlockHeader) -> Vec<u8> {
     p.0
 }
 
+/// B275: the header a block's stored text starts with (`{"header":{..}`),
+/// read without the rest of the block.
+pub fn header_of(json: &str) -> Option<BlockHeader> {
+    let rest = json.strip_prefix("{\"header\":")?;
+    serde_json::Deserializer::from_str(rest)
+        .into_iter::<BlockHeader>()
+        .next()?
+        .ok()
+}
+
 /// The block hash: what the proposer signs, the QC certifies and sync checks.
 /// It binds the header fields only. `Block::anchor_hash` is outside it; that
 /// gap is still open (G0 block identity v2, witness in sync's
@@ -527,6 +537,62 @@ pub fn body_bytes(
     p.str(anchor_hash);
     p.list(slash_evidence);
     p.0
+}
+
+/// B319: a block's body fields, read back from its `body_bytes`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BodyParts {
+    pub transactions: Vec<String>,
+    pub committed_vertices: Vec<String>,
+    pub committed_authors: Vec<String>,
+    pub anchor_hash: String,
+    pub slash_evidence: Vec<String>,
+}
+
+/// B319: the inverse of `body_bytes`: the body fields from their bytes, or
+/// why they are not a body. Total: hostile bytes are refused, never a panic
+/// or an allocation past what the bytes themselves hold (a count is bounded
+/// by the bytes left, eight a string at least).
+pub fn body_from_bytes(bytes: &[u8]) -> Result<BodyParts, String> {
+    struct Reader<'a>(&'a [u8]);
+    impl Reader<'_> {
+        fn u64(&mut self) -> Result<u64, String> {
+            let (head, rest) = self.0.split_at_checked(8).ok_or("a body cut short")?;
+            self.0 = rest;
+            Ok(u64::from_le_bytes(head.try_into().expect("eight bytes")))
+        }
+        fn str(&mut self) -> Result<String, String> {
+            let len = usize::try_from(self.u64()?).map_err(|_| "a string past memory")?;
+            let (head, rest) = self
+                .0
+                .split_at_checked(len)
+                .ok_or("a string past the body")?;
+            self.0 = rest;
+            String::from_utf8(head.to_vec()).map_err(|_| "a string not UTF-8".to_string())
+        }
+        fn list(&mut self) -> Result<Vec<String>, String> {
+            let count = self.u64()?;
+            if count > (self.0.len() / 8) as u64 {
+                return Err("a count past the body".into());
+            }
+            (0..count).map(|_| self.str()).collect()
+        }
+    }
+    let rest = bytes
+        .strip_prefix(BODY_DOMAIN)
+        .ok_or("not a block body (its domain)")?;
+    let mut r = Reader(rest);
+    let parts = BodyParts {
+        transactions: r.list()?,
+        committed_vertices: r.list()?,
+        committed_authors: r.list()?,
+        anchor_hash: r.str()?,
+        slash_evidence: r.list()?,
+    };
+    if !r.0.is_empty() {
+        return Err("bytes past the body".into());
+    }
+    Ok(parts)
 }
 
 /// The DA root of a body (B1): what `BlockHeader::da_root` carries.
@@ -1063,6 +1129,40 @@ impl Vertex {
         data.extend_from_slice(&self.timestamp.to_be_bytes());
         put(&mut data, self.payload_root().as_bytes());
         hex::encode(hash(&data))
+    }
+}
+
+#[cfg(test)]
+mod body_bytes_tests {
+    /// B319 witness: a body's bytes read back into the same fields, and
+    /// bytes that are not a body (cut short, padded, a count or a length
+    /// past the bytes, another domain) are refused, never a panic.
+    #[test]
+    fn a_body_reads_back_from_its_bytes() {
+        let parts = super::BodyParts {
+            transactions: vec!["{\"tx\":1}".into(), "é".into()],
+            committed_vertices: vec!["ab".repeat(32)],
+            committed_authors: vec!["cd".repeat(32)],
+            anchor_hash: "ab".repeat(32),
+            slash_evidence: vec![],
+        };
+        let bytes = super::body_bytes(
+            &parts.transactions,
+            &parts.committed_vertices,
+            &parts.committed_authors,
+            &parts.anchor_hash,
+            &parts.slash_evidence,
+        );
+        assert_eq!(super::body_from_bytes(&bytes), Ok(parts));
+        assert!(super::body_from_bytes(&bytes[..bytes.len() - 1]).is_err());
+        let mut padded = bytes.clone();
+        padded.push(0);
+        assert!(super::body_from_bytes(&padded).is_err());
+        let mut huge = super::BODY_DOMAIN.to_vec();
+        huge.extend_from_slice(&u64::MAX.to_le_bytes());
+        assert!(super::body_from_bytes(&huge).is_err());
+        assert!(super::body_from_bytes(b"AINCORE_BLOCK_BODY_V1\0").is_err());
+        assert!(super::body_from_bytes(&[]).is_err());
     }
 }
 

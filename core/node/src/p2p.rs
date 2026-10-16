@@ -87,15 +87,6 @@ fn multiaddr_host(addr: &Multiaddr) -> Option<String> {
 
 // === START P2P ===
 // Returns: (Sender to broadcast, Receiver for incoming messages)
-/// A non-member's sync request being answered: the busy reply its kind has
-/// (B30) and the budget key its answer is charged to (B60).
-struct OpenServe {
-    busy: Option<String>,
-    key: String,
-    /// B75: its requester's network group, for the held-answer share.
-    group: String,
-}
-
 /// How often the network task dials the committee members it is not
 /// connected to.
 const COMMITTEE_DIAL_EVERY: Duration = Duration::from_secs(5);
@@ -281,7 +272,9 @@ pub async fn start_p2p(
         .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
         .unwrap_or(true);
     if p2p_listen {
-        let libp2p_port = port + 100;
+        let libp2p_port = port
+            .checked_add(100)
+            .ok_or("the P2P port + 100 is past 65535 (B349)")?;
         let addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", libp2p_port).parse()?;
         Swarm::listen_on(&mut swarm, addr)?;
     } else {
@@ -308,18 +301,13 @@ pub async fn start_p2p(
             request_response::OutboundRequestId,
             tokio::sync::oneshot::Sender<Result<String, String>>,
         > = std::collections::HashMap::new();
-        // The channel, and for a non-member its busy reply if the request
-        // has one (B30: the held-answer bound refuses with it) and the key
-        // its answer is charged to (B60).
-        let mut pending_serves: std::collections::HashMap<
+        // Each one's channel and the key its answer is charged to (B60;
+        // B88: a member's too), and for a non-member its busy reply if the
+        // request has one (B30: the held-answer bound refuses with it).
+        let mut serving: sessions::Serving<
             request_response::InboundRequestId,
-            (request_response::ResponseChannel<String>, Option<OpenServe>),
-        > = std::collections::HashMap::new();
-        // B88: members' sync requests being answered, by budget key.
-        let mut member_serves: std::collections::HashMap<
-            request_response::InboundRequestId,
-            String,
-        > = std::collections::HashMap::new();
+            request_response::ResponseChannel<String>,
+        > = sessions::Serving::default();
         let mut held_answers: sessions::HeldAnswers<request_response::InboundRequestId> =
             sessions::HeldAnswers::new(held_open_bytes);
         let (served_tx, mut served_rx) =
@@ -358,6 +346,8 @@ pub async fn start_p2p(
         // B34: the host each connected peer reached this node from (or at).
         let mut peer_hosts: std::collections::HashMap<PeerId, String> =
             std::collections::HashMap::new();
+        // B367: members' identify reports handled.
+        let mut identify_gate = sessions::IdentifyGate::default();
         // B40: and outbound to non-members.
         let mut non_member_outbound: std::collections::HashSet<libp2p::swarm::ConnectionId> =
             std::collections::HashSet::new();
@@ -385,10 +375,10 @@ pub async fn start_p2p(
                     // refuse its consensus sessions, and sync never serves
                     // the boundary block's QC again: it waited for good.
                     Outbound::Broadcast(wire) if wire.starts_with(consensus::dag::QC_WANT_PREFIX) => {
-                        let connected: Vec<PeerId> = members(&book)
-                            .into_iter()
-                            .filter(|p| swarm.is_connected(p))
-                            .collect();
+                        let connected = sessions::qc_want_candidates(
+                            members(&book).into_iter().filter(|p| swarm.is_connected(p)),
+                            swarm.connected_peers().copied().collect::<Vec<_>>(),
+                        );
                         let asked = sessions::qc_want_peers(connected, qc_want_turn);
                         qc_want_turn = qc_want_turn.wrapping_add(1);
                         for peer in asked {
@@ -491,45 +481,21 @@ pub async fn start_p2p(
                     }
                 }
                 Some((id, answer)) = served_rx.recv() => {
-                    let member_key = member_serves.remove(&id);
-                    if let Some((channel, open)) = pending_serves.remove(&id) {
-                        match answer {
-                            Some(answer) => {
-                                if let Some(key) = &member_key {
-                                    sync_budget.charge(
-                                        key,
-                                        sessions::answer_tokens(answer.len()),
-                                        std::time::Instant::now(),
-                                    );
-                                }
-                                // B30: when non-members already hold too many
-                                // unread answers, a snapshot part is told busy
-                                // and anything else is refused. B60/B299: the
-                                // answer is charged its bytes either way.
-                                let refused = open.as_ref().is_some_and(|o| {
-                                    !sessions::charge_then_hold(
-                                        &mut sync_budget,
-                                        &mut held_answers,
-                                        id,
-                                        &o.key,
-                                        &o.group,
-                                        answer.len(),
-                                        std::time::Instant::now(),
-                                    )
-                                });
-                                if refused {
-                                    match open.and_then(|o| o.busy) {
-                                        Some(busy) => {
-                                            let _ = swarm.behaviour_mut().sync.send_response(channel, busy);
-                                        }
-                                        None => drop(channel),
-                                    }
-                                } else if swarm.behaviour_mut().sync.send_response(channel, answer).is_err() {
-                                    held_answers.release(&id);
-                                }
+                    // B30: when non-members already hold too many unread
+                    // answers, a snapshot part is told busy and anything
+                    // else is refused. B60/B299/B312: the answer is charged
+                    // its bytes either way, its requester gone or not.
+                    match serving.answered(id, answer, &mut sync_budget, &mut held_answers, std::time::Instant::now()) {
+                        sessions::Answered::Send(channel, answer) => {
+                            if swarm.behaviour_mut().sync.send_response(channel, answer).is_err() {
+                                held_answers.release(&id);
                             }
-                            None => drop(channel),
                         }
+                        sessions::Answered::Refused(channel, Some(busy)) => {
+                            let _ = swarm.behaviour_mut().sync.send_response(channel, busy);
+                        }
+                        sessions::Answered::Refused(channel, None) => drop(channel),
+                        sessions::Answered::Nothing => {}
                     }
                 }
                 _ = committee_dial.tick() => {
@@ -640,10 +606,17 @@ pub async fn start_p2p(
                             _ => peer.to_string(),
                         };
                         // B157: a batch of transactions on a quota of its
-                        // own, a token a transaction.
+                        // own, a token a transaction (B477: the operator's
+                        // reserved peers on theirs).
                         let tx_submit = request.starts_with(crate::forward::TX_SUBMIT);
+                        let reserved_peer = reserved.contains(&peer.to_string());
                         let within = if tx_submit {
-                            submit_budget.admit(&budget_key, &request, std::time::Instant::now())
+                            submit_budget.admit(
+                                &budget_key,
+                                &request,
+                                reserved_peer,
+                                std::time::Instant::now(),
+                            )
                         } else {
                             sync_budget.spend(&budget_key, std::time::Instant::now())
                         };
@@ -664,11 +637,9 @@ pub async fn start_p2p(
                         // transactions' verdicts are not held to the
                         // non-members' answer pool (four non-reading hosts
                         // could fill it); they are still charged by bytes.
-                        let reserved_peer = reserved.contains(&peer.to_string());
                         let saturated = crate::forward::busy_reply(&request);
-                        let open = (member.is_none() && !reserved_peer && !tx_submit).then(|| OpenServe {
+                        let open = (member.is_none() && !reserved_peer && !tx_submit).then(|| sessions::OpenServe {
                             busy: chain_sync::state_sync::busy_reply(&request),
-                            key: budget_key.clone(),
                             group: peer_hosts
                                 .get(&peer)
                                 .map_or_else(|| peer.to_string(), |h| sessions::net_group(h)),
@@ -683,10 +654,7 @@ pub async fn start_p2p(
                         };
                         if sync_serves.try_send(serve).is_ok() {
                             // B88: a member's answers are charged by bytes too.
-                            if open.is_none() {
-                                member_serves.insert(request_id, budget_key.clone());
-                            }
-                            pending_serves.insert(request_id, (channel, open));
+                            serving.begin(request_id, channel, budget_key.clone(), open);
                             let served_tx = served_tx.clone();
                             tokio::spawn(async move {
                                 let answer = answer.await.ok().flatten();
@@ -727,8 +695,9 @@ pub async fn start_p2p(
                     SwarmEvent::Behaviour(P2PBehaviourEvent::Sync(request_response::Event::InboundFailure {
                         request_id, ..
                     })) => {
-                        pending_serves.remove(&request_id);
-                        member_serves.remove(&request_id);
+                        // B312: an answer still being built is charged when
+                        // it comes (closing the connection made it free).
+                        serving.abandon(&request_id);
                         held_answers.release(&request_id);
                     }
                     SwarmEvent::Behaviour(P2PBehaviourEvent::Sync(request_response::Event::ResponseSent {
@@ -774,7 +743,14 @@ pub async fn start_p2p(
                             .or_default()
                             .push((connection_id, std::time::Instant::now()));
 
-                        println!("🤝 Connection established with {:?}", peer_id);
+                        // B327: a stranger's connection is logged only when
+                        // tracing: two lines each, at the two connections a
+                        // second an address may open, without bound.
+                        let logged = trace_connections
+                            || book.read().is_ok_and(|b| b.member_of(&peer_id).is_some());
+                        if logged {
+                            println!("🤝 Connection established with {:?}", peer_id);
+                        }
                         let host = match &endpoint {
                             libp2p::core::ConnectedPoint::Dialer { address, .. } => multiaddr_host(address),
                             libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => multiaddr_host(send_back_addr),
@@ -863,12 +839,16 @@ pub async fn start_p2p(
                                     if !peers.contains_key(&peer_id)
                                         && peers.len() >= MAX_INBOUND_PEERS_PER_HOST
                                     {
-                                        eprintln!(
-                                            "⚠️ Closing inbound libp2p connection from a new identity on {}: identities={} limit={}",
-                                            host,
-                                            peers.len(),
-                                            MAX_INBOUND_PEERS_PER_HOST
-                                        );
+                                        // B342: logged only when tracing (a
+                                        // stranger drives it without bound).
+                                        if trace_connections {
+                                            eprintln!(
+                                                "⚠️ Closing inbound libp2p connection from a new identity on {}: identities={} limit={}",
+                                                host,
+                                                peers.len(),
+                                                MAX_INBOUND_PEERS_PER_HOST
+                                            );
+                                        }
                                         let _ = swarm.close_connection(connection_id);
                                         continue;
                                     }
@@ -900,7 +880,9 @@ pub async fn start_p2p(
                                 // ephemeral source ports, not stable listen addresses. Persisting
                                 // them poisons the next boot's bootnode list and can trigger a
                                 // connection storm against stale ports.
-                                println!("🤝 Inbound libp2p connection from {:?} via {}", peer_id, send_back_addr);
+                                if logged {
+                                    println!("🤝 Inbound libp2p connection from {:?} via {}", peer_id, send_back_addr);
+                                }
                             }
                         }
                     }
@@ -945,6 +927,13 @@ pub async fn start_p2p(
                         if !book.read().is_ok_and(|b| b.member_of(&peer_id).is_some()) {
                             continue;
                         }
+                        // B367: a report unchanged since it was handled, less
+                        // than `KEPT_IP_HOLD` ago, is dropped before any work.
+                        let now = std::time::Instant::now();
+                        let member = |p: &PeerId| book.read().is_ok_and(|b| b.member_of(p).is_some());
+                        if !identify_gate.admit(peer_id, &info.listen_addrs, now, member) {
+                            continue;
+                        }
                         let agent: String = info.agent_version.chars().take(64).collect();
                         println!(
                             "🆔 Identify from member {peer_id}: agent {agent:?}, {} addresses",
@@ -958,35 +947,24 @@ pub async fn start_p2p(
                         // writes: a member reporting a loopback one had its
                         // loopback and bridge addresses dialled by every node.
                         let local_peer = sessions::on_this_host(peer_hosts.get(&peer_id).map(String::as_str));
-                        for addr in info.listen_addrs {
-                            // B146: an IP literal only: a name a peer reports
-                            // is never resolved.
-                            let ip = addr.iter().find_map(|p| match p {
-                                Protocol::Ip4(ip) => Some(std::net::IpAddr::from(ip)),
-                                Protocol::Ip6(ip) => Some(std::net::IpAddr::from(ip)),
-                                _ => None,
-                            });
-                            let usable = if local_peer {
-                                ip.is_some() && sessions::learned_address_ok_on_this_host(&addr)
-                            } else {
-                                sessions::learned_address_ok(&addr)
-                            };
-                            if !usable {
-                                continue;
+                        // B367: at most `ADDRESSES_PER_PEER` of them (the book
+                        // keeps no more), the kept IP recorded once a report.
+                        let usable = sessions::usable_reported(info.listen_addrs, local_peer);
+                        // B132: a member's reported IP gets kept slots (an
+                        // outbound dial names its host, not its IP); its slot
+                        // takes the first one (B152 holds it).
+                        if let (Some(ip), false) = (usable.iter().find_map(sessions::ip_of), local_peer) {
+                            if let (Ok(b), Ok(mut kept)) = (book.read(), member_ips.write()) {
+                                kept.record_member(
+                                    peer_id,
+                                    ip,
+                                    sessions::IpSource::Reported,
+                                    now,
+                                    |p| b.member_of(p).is_some(),
+                                );
                             }
-                            // B132: a member's reported IP gets kept slots
-                            // (an outbound dial names its host, not its IP).
-                            if let (Some(ip), false) = (ip, local_peer) {
-                                if let (Ok(b), Ok(mut kept)) = (book.read(), member_ips.write()) {
-                                    kept.record_member(
-                                        peer_id,
-                                        ip,
-                                        sessions::IpSource::Reported,
-                                        std::time::Instant::now(),
-                                        |p| b.member_of(p).is_some(),
-                                    );
-                                }
-                            }
+                        }
+                        for addr in usable {
                             swarm.behaviour_mut().addresses.add_address(&peer_id, addr);
                         }
                     }

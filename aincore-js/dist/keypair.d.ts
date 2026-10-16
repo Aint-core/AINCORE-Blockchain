@@ -28,9 +28,18 @@ export declare class Keypair {
      */
     get secretKey(): string;
     /**
-     * Get the AINCORE Address (First 16 bytes of SHA256(Public Key))
+     * Get the AINCORE address: the FULL SHA256 of the public key, 32 bytes /
+     * 64 hex chars. It used to be truncated to the first 16 bytes, which does
+     * not match crypto::derive_address on the node -- so the derived address
+     * never equalled the `sender` the node recomputes, and every transaction
+     * was rejected.
      */
     get address(): string;
+    /**
+     * The same address in its human-readable, checksummed form (`A1n…`).
+     * Show this to people; transactions keep using `address` (64-hex).
+     */
+    get addressA1n(): string;
     /**
      * Sign a message (bytes)
      */

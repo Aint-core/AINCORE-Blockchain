@@ -17,11 +17,9 @@ services:
       - "0.0.0.0:9102:9102" # libp2p: consensus + sync sessions (base port + 100)
       - "0.0.0.0:8002:8002" # API
     volumes:
-      - ./aincore_data:/root/.aincore/data
-      - ${AINCORE_GENESIS_FILE:?set AINCORE_GENESIS_FILE to the genesis.json of the chain this node joins}:/root/.aincore/genesis.json:ro
+      - ./aincore_data:/home/aincore/.aincore/data
+      - ${AINCORE_GENESIS_FILE:?set AINCORE_GENESIS_FILE to the genesis.json of the chain this node joins}:/home/aincore/.aincore/genesis.json:ro
     environment:
-      - AINCORE_PORT=9002
-      - AINCORE_API_PORT=8002
       # B269: reachable from the published port and the indexer.
       - AINCORE_RPC_BIND=0.0.0.0
       - RUST_LOG=info
@@ -58,7 +56,7 @@ services:
     container_name: aincore-indexer
     command: [ "indexer" ]
     volumes:
-      - ./aincore_data/indexer:/root/.aincore
+      - ./aincore_data/indexer:/home/aincore/.aincore
     environment:
       - NODE_RPC_URL=http://aincore-node:8002/rpc
       - RUST_LOG=info

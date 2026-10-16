@@ -122,7 +122,7 @@ pub fn check_entry(e: &PublicEntry) -> Result<(), String> {
     let bls_pk = hex::decode(&e.bls_public_key)
         .map_err(|_| format!("{}: bls_public_key is not hex", e.address))?;
     let pop = hex::decode(&e.bls_pop).map_err(|_| format!("{}: bls_pop is not hex", e.address))?;
-    match crypto::bls::BLSEngine::consensus().verify_possession(&bls_pk, &pop) {
+    match crypto::bls::BLSEngine::consensus().verify_possession(&bls_pk, &pop, key.as_bytes()) {
         Ok(true) => Ok(()),
         _ => Err(format!("{}: bls_pop does not verify", e.address)),
     }
@@ -189,6 +189,11 @@ pub struct GenMultiArgs {
     /// and its transactions were valid on mainnet).
     #[arg(long)]
     pub chain_id: String,
+
+    /// B348: this is the mainnet's launch genesis, the only one that may
+    /// take the mainnet chain id (`MAINNET_CHAIN_ID`).
+    #[arg(long)]
+    pub mainnet: bool,
 
     /// The block time measured on the release candidate, in milliseconds
     /// (G5 P-1). The consensus-time cap per block is derived from it. It is
@@ -308,7 +313,7 @@ pub fn derive_validator_fields(
     let bls_seed = consensus::qc::derive_validator_bls_seed(seed);
     let bls = crypto::bls::BLSEngine::consensus();
     let bls_public_key_hex = hex::encode(bls.pubkey_raw(&bls_seed));
-    let bls_pop_hex = hex::encode(bls.prove_possession_raw(&bls_seed));
+    let bls_pop_hex = hex::encode(bls.prove_possession_raw(&bls_seed, &public_key_bytes));
 
     Ok((address, public_key_hex, bls_public_key_hex, bls_pop_hex))
 }
@@ -627,7 +632,32 @@ pub fn run_entry(args: EntryArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// B348: the mainnet's chain id.
+pub const MAINNET_CHAIN_ID: &str = "AINCORE-MAINNET-1";
+
+/// B348: a chain id a genesis may take: the mainnet's only for the mainnet
+/// launch (`--mainnet`), and no other genesis for the launch. A signature
+/// binds its chain id (as Ethereum's EIP-155, Aptos's and Cosmos's do), so
+/// every incarnation of a network (a relaunch, a rehearsal, a reset) must
+/// take a chain id never used before: under a reused one, every
+/// transaction of one is valid on the other once its sequence number comes
+/// round (a rehearsal's `leave_validator_set`, a tester's transfer).
+pub fn check_chain_id(chain_id: &str, mainnet: bool) -> Result<(), String> {
+    match (chain_id == MAINNET_CHAIN_ID, mainnet) {
+        (true, false) => Err(format!(
+            "{MAINNET_CHAIN_ID} is the mainnet launch genesis's alone (pass --mainnet for it): \
+             a rehearsal or relaunch under it makes its transactions valid on mainnet; take a \
+             chain id never used before"
+        )),
+        (false, true) => Err(format!(
+            "--mainnet takes the mainnet chain id {MAINNET_CHAIN_ID}, not {chain_id}"
+        )),
+        _ => Ok(()),
+    }
+}
+
 pub fn run(args: GenMultiArgs) -> Result<(), Box<dyn std::error::Error>> {
+    check_chain_id(&args.chain_id, args.mainnet)?;
     println!("🛠️  AINCORE Multi-Validator Genesis Generator");
 
     let mut raw_specs: Vec<String> = args.validators.clone();
@@ -872,7 +902,8 @@ mod tests {
         let pk_bytes = hex::decode(&bls_pk_hex).unwrap();
         let pop_bytes = hex::decode(&bls_pop_hex).unwrap();
         assert!(
-            bls.verify_possession(&pk_bytes, &pop_bytes).unwrap(),
+            bls.verify_possession(&pk_bytes, &pop_bytes, &vk.to_bytes())
+                .unwrap(),
             "generated bls_pop must verify against generated bls_public_key"
         );
         // Length invariants the loader enforces (pk=48 MinPk, pop=96).
@@ -960,7 +991,7 @@ mod tests {
                 stake_ain: 2_500_000,
             },
         ];
-        let genesis = build_genesis_file(
+        let mut genesis = build_genesis_file(
             &specs,
             "AINCORE-MAINNET-1",
             6_650,
@@ -968,6 +999,9 @@ mod tests {
             &node::genesis::stdlib_hash_of(&stdlib_path()).unwrap(),
         )
         .unwrap();
+        // B383: the node refuses a genesis without a launch time; `run` sets
+        // it, this test sets one long past.
+        genesis.genesis_time = Some(1_700_000_000);
 
         let dir = storage::test_dir::process_dir()
             .join(format!("aincore_genmulti_e2e_{}", std::process::id()));
@@ -1131,6 +1165,8 @@ mod tests {
         }];
         let mut genesis = base.clone();
         apply_bootstrap_and_accounts(&mut genesis, &ops, Some(18_500_000), &public).unwrap();
+        // B383: the node refuses a genesis without a launch time.
+        genesis.genesis_time = Some(1_700_000_000);
 
         let dir = storage::test_dir::process_dir()
             .join(format!("aincore_genmulti_boot_{}", std::process::id()));
@@ -1232,5 +1268,16 @@ mod tests {
         let mut broken = genesis.clone();
         broken.bootstrap.as_mut().unwrap().s_min_ain += 1;
         assert!(check(&broken).is_err());
+    }
+
+    /// B348 witness: only the mainnet launch genesis takes the mainnet chain
+    /// id (a rehearsal or relaunch under it made every transaction of one
+    /// valid on the other), and `--mainnet` takes nothing else.
+    #[test]
+    fn only_the_mainnet_genesis_takes_the_mainnet_chain_id() {
+        assert!(super::check_chain_id(super::MAINNET_CHAIN_ID, false).is_err());
+        assert!(super::check_chain_id(super::MAINNET_CHAIN_ID, true).is_ok());
+        assert!(super::check_chain_id("AINCORE-TESTNET-V5", false).is_ok());
+        assert!(super::check_chain_id("AINCORE-TESTNET-V5", true).is_err());
     }
 }

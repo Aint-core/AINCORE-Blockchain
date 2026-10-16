@@ -164,4 +164,212 @@ mod tests {
         assert_eq!(config.max_binary_format_version, 6);
         assert!(config.enable_invariant_violation_check_in_swap_loc);
     }
+
+    /// B430 witness: every Move session runs on the VM's own threads
+    /// (`move-vm-*`, `VM_STACK_BYTES` of stack each), whatever thread asks:
+    /// here one with 64 KiB, which a session on its caller's stack overflows
+    /// in a debug build. Sessions ran on their caller's thread, a 2 MiB
+    /// tokio or rayon worker, where a value at B343's depth bound did not
+    /// fit.
+    #[test]
+    fn every_session_runs_on_the_vm_stack() {
+        let path =
+            storage::test_dir::process_dir().join(format!("vm_stack_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        let db = std::sync::Arc::new(storage::StateDB::open(path.to_str().unwrap()).unwrap());
+        let vm = crate::AINCOREVM::new(db);
+        let sender = parse_addr("ab");
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(64 << 10)
+                .spawn_scoped(scope, || {
+                    let _ =
+                        vm.publish_modules(vec![vec![0xa1, 0x1c, 0xeb, 0x0b]], sender, 1_000_000);
+                    let call = crate::MoveAction::CallEntryFunction(EntryFunctionCall {
+                        module: ModuleId::new(system_address(), Identifier::new("coin").unwrap()),
+                        function: "no_such_function".to_string(),
+                        ty_args: vec![],
+                        args: vec![],
+                    });
+                    // A user stage alone (no prologue) opens its own session.
+                    let _ = vm.execute_transaction_actions(
+                        vec![(call.clone(), false, sender)],
+                        sender,
+                        1_000_000,
+                    );
+                    let pay = crate::MoveAction::CallEntryFunction(EntryFunctionCall {
+                        module: ModuleId::new(system_address(), Identifier::new("coin").unwrap()),
+                        function: "no_such_function".to_string(),
+                        ty_args: vec![],
+                        args: vec![],
+                    });
+                    let _ = vm.execute_transaction_actions(
+                        vec![(pay, true, sender), (call, false, sender)],
+                        sender,
+                        1_000_000,
+                    );
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+        });
+        let threads = crate::SESSION_THREADS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert!(threads.len() >= 3, "vacuous: sessions opened {threads:?}");
+        assert!(
+            threads.iter().all(|t| t.starts_with("move-vm-")),
+            "a session ran off the VM's stack: {threads:?}"
+        );
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// B434 witness: a worker of another rayon pool (one thread, 256 KiB of
+    /// stack) asking 200 sessions in a parallel loop hands each to a thread
+    /// of its own and nests nothing. On `VM_POOL.install` such a worker ran
+    /// the loop's other items on its own stack while it waited, nesting
+    /// them until it overflowed.
+    #[test]
+    fn a_foreign_pool_worker_hands_its_sessions_off() {
+        use rayon::prelude::*;
+        let path =
+            storage::test_dir::process_dir().join(format!("vm_foreign_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        let db = std::sync::Arc::new(storage::StateDB::open(path.to_str().unwrap()).unwrap());
+        let vm = crate::AINCOREVM::new(db);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .stack_size(256 << 10)
+            .build()
+            .unwrap();
+        let before = crate::FOREIGN_POOL_HANDOFFS.load(std::sync::atomic::Ordering::SeqCst);
+        let sender = parse_addr("ab");
+        let ran = pool.install(|| {
+            (0..200u32)
+                .into_par_iter()
+                .map(|_| {
+                    vm.publish_modules(vec![vec![0xa1, 0x1c, 0xeb, 0x0b]], sender, 1_000_000)
+                        .is_err()
+                })
+                .filter(|refused| *refused)
+                .count()
+        });
+        assert_eq!(ran, 200, "vacuous: a module was published");
+        let handed =
+            crate::FOREIGN_POOL_HANDOFFS.load(std::sync::atomic::Ordering::SeqCst) - before;
+        assert!(handed >= 200, "sessions were not handed off: {handed}");
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// B447 witness: dry runs whose sessions never end hold none of the
+    /// VM's threads: a block's work still runs on them at once. Here as many
+    /// dry runs as the VM has threads each hold a session until released;
+    /// on `VM_POOL` (B430) they took every thread, and a block's batch (its
+    /// `on_vm_threads`) waited behind them.
+    #[test]
+    fn dry_runs_never_hold_the_block_threads() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Condvar, Mutex};
+        use std::time::{Duration, Instant};
+        let vm_threads = crate::on_vm_threads(rayon::current_num_threads);
+        let released = (Mutex::new(false), Condvar::new());
+        let started = AtomicUsize::new(0);
+        let release = || {
+            *released.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            released.1.notify_all();
+        };
+        let (all_started, block) = std::thread::scope(|scope| {
+            for _ in 0..vm_threads {
+                scope.spawn(|| {
+                    crate::on_dry_run_thread(|| {
+                        crate::on_vm_stack(|| {
+                            started.fetch_add(1, Ordering::SeqCst);
+                            let mut done = released.0.lock().unwrap_or_else(|e| e.into_inner());
+                            while !*done {
+                                done = released.1.wait(done).unwrap_or_else(|e| e.into_inner());
+                            }
+                        })
+                    })
+                    .expect("a dry run's thread")
+                });
+            }
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while started.load(Ordering::SeqCst) < vm_threads && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let all_started = started.load(Ordering::SeqCst) == vm_threads;
+            let (sender, receiver) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                let _ = sender.send(crate::on_vm_threads(|| 7));
+            });
+            let block = receiver.recv_timeout(Duration::from_secs(20));
+            // Released before anything is asserted: a failure holds nothing.
+            release();
+            (all_started, block)
+        });
+        assert!(all_started, "vacuous: the dry runs did not all start");
+        assert_eq!(block, Ok(7), "a block's work waited for the dry runs");
+    }
+
+    /// B473 witness: every call a Move session runs goes through
+    /// `run_action`, which binds every signer to the authenticated principal
+    /// (`bind_signer_args`) and admits only primitive argument types. The
+    /// public `execute_script` ran a script in a session of its own, and
+    /// move-vm builds a script's signers from the caller's bytes, so the
+    /// bytes of @0x1 made a signer that mints. The crate's sources are read,
+    /// so a new way to run code in a session is caught without editing this
+    /// test.
+    #[test]
+    fn every_move_call_runs_through_the_signer_binding() {
+        let sources = [
+            include_str!("lib.rs"),
+            include_str!("gas.rs"),
+            include_str!("overlay.rs"),
+            include_str!("state_keys.rs"),
+        ];
+        let calls = |name: &str| {
+            let mut found = 0;
+            for source in sources {
+                found += source.matches(name).count();
+            }
+            found
+        };
+        assert_eq!(
+            calls(".execute_script("),
+            0,
+            "a session runs a script, its signers built from the caller's bytes"
+        );
+        assert_eq!(
+            calls(".execute_function_bypass_visibility("),
+            0,
+            "a session runs a function past the entry checks"
+        );
+        assert_eq!(
+            calls(".execute_entry_function("),
+            1,
+            "an entry function runs outside run_action"
+        );
+        let lib = sources[0];
+        let start = lib.find("fn run_action<").expect("run_action is defined");
+        let end = start
+            + lib[start..]
+                .find("\n    fn ")
+                .expect("a function follows run_action");
+        let body = &lib[start..end];
+        let bind = body
+            .find("Self::bind_signer_args(")
+            .expect("run_action binds the signers");
+        let entry = body
+            .find(".execute_entry_function(")
+            .expect("the entry call is in run_action");
+        assert!(
+            bind < entry,
+            "the entry function runs before its signers are bound"
+        );
+        assert!(
+            body[entry..].contains("bound_args,"),
+            "the entry function runs on the caller's own bytes"
+        );
+    }
 }

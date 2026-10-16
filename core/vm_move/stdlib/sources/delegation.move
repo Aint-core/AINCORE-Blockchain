@@ -91,6 +91,8 @@ module 0x1::delegation {
     const MAX_WEIGHT: u128 = 150000000;
     /// One AIN in coin units (`staking::COIN_SCALE`): weights are whole AIN.
     const COIN_SCALE: u128 = 1000000000000000000;
+    /// G5 PA-2 (B464): participation is in parts per million.
+    const PARTICIPATION_SCALE: u128 = 1000000;
 
     /// SL-1: a slash recorded for the pool's unpaid tickets. It cuts a ticket
     /// created in `infraction_epoch` or later and before the slash
@@ -155,7 +157,9 @@ module 0x1::delegation {
     /// G5 SL-5: an accepted equivocation. `epoch_began` is tau when its
     /// committee epoch began; the weights are whole AIN in C_{epoch}.
     /// `self_weight + delegated_weight <= weight`: the rest is bootstrap
-    /// weight, which nothing can slash.
+    /// weight, which nothing can slash. A certificate conflict that raises it
+    /// may replace the split by a larger one from its own committee
+    /// (`raised_split`, B411); the weight stays.
     struct Offense has store, copy, drop {
         validator: address,
         epoch: u64,
@@ -414,37 +418,48 @@ module 0x1::delegation {
         }
     }
 
-    /// G5 EM-1, EM-2, DL-2: pay the emission for the consensus time since the
-    /// last payout to `members`, the committee of this block's epoch (never
-    /// the live set, jailed members already removed by the executor), with
-    /// each member's frozen split: `self_weights` and `delegated_weights` in
-    /// whole AIN, from the committee record. System-only: the executor binds
-    /// the genuine @0x1 signer and never lets a user forge it (FIX #1).
+    /// G5 EM-1, EM-2, DL-2, PA-2: pay the emission for the consensus time
+    /// since the last payout to `members`, the committee of this block's
+    /// epoch (never the live set, jailed members already removed by the
+    /// executor), with each member's frozen split: `self_weights` and
+    /// `delegated_weights` in whole AIN, from the committee record; and
+    /// `participation`, each member's participation in the reward period
+    /// paid, in parts per million (G5 PA-1: the committed vertices it
+    /// authored over the rounds the period's blocks closed; one million
+    /// when the period counted none). System-only: the executor binds the
+    /// genuine @0x1 signer and never lets a user forge it (FIX #1).
     ///
-    /// A member's share of the pot is r = pot x w / max(W, min_total), its
-    /// weight over the committee's whole weight, or over `min_total` (the
-    /// chain's s_min, G5 A4) when the committee weighs less (G5 A4 BW-7: as
-    /// Cosmos, Ethereum and Solana pay, a seat earns by its weight, never by
-    /// being a seat; below s_min the payout falls with the weight, as
-    /// Polkadot's below its ideal staking rate, so nobody earns more because
-    /// another member's weight was forfeited or capped). r splits
+    /// A member's share of the pot is r = pot x w / max(W, min_total) x p
+    /// (`participation_share`), its weight over the committee's whole
+    /// weight, or over `min_total` (the chain's s_min, G5 A4) when the
+    /// committee weighs less (G5 A4 BW-7: as Cosmos, Ethereum and Solana
+    /// pay, a seat earns by its weight, never by being a seat; below s_min
+    /// the payout falls with the weight, as Polkadot's below its ideal
+    /// staking rate, so nobody earns more because another member's weight
+    /// was forfeited or capped), times its participation p (B464: as Aptos
+    /// pays by successful proposals and Solana by vote credits, an absent
+    /// member earns nothing, and nobody earns more for its absence). r splits
     /// into floor(r x s / (s + d)) for its own stake and floor(r x d / (s + d))
-    /// for its pool; the commission, at the rate in force when the period
-    /// began, is taken from the pool's part. Nothing beyond the drawn
-    /// emission can be paid, and what is not paid (flooring dust, a member
-    /// without a coin store, a pool that cannot take rewards) stays in the
-    /// reserve (`staking::Emission`).
+    /// for its pool. The pool earns its part only on the principal still in
+    /// it, at most that weight (`pool_payout`, B451), and the commission, at
+    /// the rate in force when the period began, is taken from what it earns.
+    /// Nothing beyond the drawn emission can be paid, and what is not paid
+    /// (flooring dust, a member without a coin store, a pool that cannot take
+    /// rewards, the part of a pool's delegators that left, the part a member
+    /// did not take part for) stays in the reserve (`staking::Emission`).
     public entry fun pay_rewards(
         account: &signer,
         members: vector<address>,
         self_weights: vector<u64>,
         delegated_weights: vector<u64>,
+        participation: vector<u64>,
         min_total: u64,
     ) acquires Pool {
         assert!(signer::address_of(account) == @0x1, error::permission_denied(EUNAUTHORIZED));
         let len = vector::length(&members);
         assert!(
-            vector::length(&self_weights) == len && vector::length(&delegated_weights) == len,
+            vector::length(&self_weights) == len && vector::length(&delegated_weights) == len
+                && vector::length(&participation) == len,
             error::invalid_argument(EINVALID_COMMITTEE)
         );
         let (emission, period_start) = staking::draw_emission(account);
@@ -473,7 +488,7 @@ module 0x1::delegation {
         let i = 0;
         while (i < len) {
             let w = member_weight(&self_weights, &delegated_weights, i);
-            let share = math::mul_div_floor(pot, w, total);
+            let share = participation_share(pot, w, total, *vector::borrow(&participation, i));
             pay_member(
                 &mut emission,
                 *vector::borrow(&members, i),
@@ -518,8 +533,9 @@ module 0x1::delegation {
     /// G5 SL-3, SL-4 (review, A3b): a certificate conflict convicts its
     /// member. Two certificates for one slot overlap in more than a third of
     /// the committee, so its fraction is 100 %. A member already recorded for
-    /// a lesser offense is raised to 100 %, with the earlier of the two scopes;
-    /// one already settled at less loses what remains in scope at once. Else
+    /// a lesser offense is raised to 100 %, with the earlier of the two scopes
+    /// and the split `raised_split` gives (B411); one already settled at less
+    /// loses what remains in scope at once. Else
     /// as `report_equivocation`. System-only.
     public entry fun report_certificate_conflict(
         account: &signer,
@@ -565,20 +581,22 @@ module 0x1::delegation {
                     return
                 };
                 entry.full = true;
-                if (epoch < entry.epoch) {
-                    // B161: and that scope's split, what the operator and
-                    // the pool had at stake then (the later offense's was
-                    // kept: a pool that grew between them had its later
-                    // deposits burned). Its weight and its time stay: they
-                    // place it among correlated offenses.
-                    entry.epoch = epoch;
-                    entry.self_weight = self_weight;
-                    entry.delegated_weight = delegated_weight;
-                };
-                let scope = entry.epoch;
-                let at_stake = entry.delegated_weight;
+                // Its weight and its time stay: they place it among
+                // correlated offenses.
+                let (scope, own_at_stake, at_stake) = raised_split(
+                    entry.epoch,
+                    entry.self_weight,
+                    entry.delegated_weight,
+                    epoch,
+                    self_weight,
+                    delegated_weight
+                );
+                entry.epoch = scope;
+                entry.self_weight = own_at_stake;
+                entry.delegated_weight = at_stake;
                 if (entry.settled) {
-                    staking::slash_unbonding(validator_addr, scope, MAX_BPS);
+                    // B392: the own side by what it had at stake too.
+                    staking::slash_unbonding(validator_addr, scope, MAX_BPS, own_at_stake);
                     if (exists<Pool>(validator_addr)) {
                         slash_pool(
                             borrow_global_mut<Pool>(validator_addr),
@@ -615,6 +633,41 @@ module 0x1::delegation {
         if (exists<Pool>(validator_addr)) {
             borrow_global_mut<Pool>(validator_addr).closed = true;
         };
+    }
+
+    /// G5 SL-6 (A3b): the scope and the frozen (own, pool) split a lesser
+    /// offense of epoch `entry_epoch` and split (`entry_self`,
+    /// `entry_delegated`) takes when a certificate conflict of epoch `epoch`
+    /// and split (`self_weight`, `delegated_weight`) raises it to 100 %. The
+    /// scope is the earlier epoch's.
+    /// - A conflict before the offense (B161): its own split, what the
+    ///   operator and the pool had at stake then. The later offense's was
+    ///   kept before, so a pool that grew between them had its later deposits
+    ///   burned at 100 % for the earlier conflict.
+    /// - A conflict at or after it (B411): the larger of the two on each
+    ///   side. The offense's split was kept before, so an offender that
+    ///   recorded a cheap twin and then grew its stake within the evidence
+    ///   age paid 100 % of the twin's stake, not of what the conflicting
+    ///   committee weighed it at. The larger of the two keeps today's cut for
+    ///   a stake that shrank between them.
+    public fun raised_split(
+        entry_epoch: u64,
+        entry_self: u64,
+        entry_delegated: u64,
+        epoch: u64,
+        self_weight: u64,
+        delegated_weight: u64,
+    ): (u64, u64, u64) {
+        if (epoch < entry_epoch) {
+            return (epoch, self_weight, delegated_weight)
+        };
+        let own = if (self_weight > entry_self) { self_weight } else { entry_self };
+        let pool = if (delegated_weight > entry_delegated) {
+            delegated_weight
+        } else {
+            entry_delegated
+        };
+        (entry_epoch, own, pool)
     }
 
     /// Whether `validator` has an unsettled offense, and the first committee
@@ -730,7 +783,16 @@ module 0x1::delegation {
                 if (due && settled_now < MAX_SETTLE_PER_CALL) {
                     let (own, pool_bps) =
                         waterfall(f, offense.self_weight, offense.delegated_weight);
-                    staking::slash_unbonding(offense.validator, offense.epoch, own);
+                    // B392: `own` was sized from the frozen own weight but
+                    // cut all the operator's in-scope stake, stake added
+                    // after the epoch began included. Now it cuts no more
+                    // than that weight, as the pool's cut (B149).
+                    staking::slash_unbonding(
+                        offense.validator,
+                        offense.epoch,
+                        own,
+                        offense.self_weight
+                    );
                     if (pool_bps > 0 && exists<Pool>(offense.validator)) {
                         slash_pool(
                             borrow_global_mut<Pool>(offense.validator),
@@ -866,8 +928,9 @@ module 0x1::delegation {
     }
 
     /// EM-2, DL-2: pay one committee member its `share` of the emission. Its
-    /// own part and the commission go to its coin store; the rest goes to
-    /// its pool's reward counter, with the remainder carried.
+    /// own part and the commission go to its coin store; the rest of what its
+    /// pool earns (`pool_payout`) goes to the pool's reward counter, with the
+    /// remainder carried; anything else stays in the Emission.
     fun pay_member(
         emission: &mut Emission,
         member: address,
@@ -885,10 +948,15 @@ module 0x1::delegation {
         if (delegated > 0 && exists<Pool>(member)) {
             let pool = borrow_global_mut<Pool>(member);
             if (!pool.closed && pool.active_points >= MIN_REWARD_POINTS) {
-                let commission = delegated * (commission_at(pool, period_start) as u128)
-                    / (MAX_BPS as u128);
+                // B451: the part is sized by the frozen weight but earned
+                // only by the principal still in the pool.
+                let (commission, reward) = pool_payout(
+                    delegated,
+                    (delegated_weight as u64),
+                    pool.active_coins,
+                    commission_at(pool, period_start)
+                );
                 to_validator = to_validator + commission;
-                let reward = delegated - commission;
                 let (step, carry) = math::mul_add_div(
                     reward,
                     REWARD_SCALE,
@@ -904,6 +972,48 @@ module 0x1::delegation {
         if (to_validator > 0 && coin::has_store<AincoreCoin>(member)) {
             coin::deposit<AincoreCoin>(member, staking::take_emission(emission, to_validator));
         };
+    }
+
+    /// G5 PA-2 (B464): a member's share of a payout's pot: pot x w / total,
+    /// its weight over the committee's, times its participation in the
+    /// period paid, in parts per million (at most one million), each step
+    /// rounded down. What it did not take part for stays in the reserve:
+    /// nobody earns more because another took no part (BW-7's rule).
+    public fun participation_share(pot: u128, w: u128, total: u128, participation_ppm: u64): u128 {
+        let p = (participation_ppm as u128);
+        if (p > PARTICIPATION_SCALE) {
+            p = PARTICIPATION_SCALE;
+        };
+        math::mul_div_floor(math::mul_div_floor(pot, w, total), p, PARTICIPATION_SCALE)
+    }
+
+    /// G5 DL-2: (the commission, the delegators' reward) from `delegated`, a
+    /// pool's part of a payout, at `commission_bps`. The part is sized by the
+    /// pool's frozen weight `delegated_weight` (whole AIN), but is earned
+    /// only by the principal still in the pool, `active_coins`: all of it
+    /// while the pool holds that weight, else delegated x C / (the weight in
+    /// coins), rounded down. The commission is taken from what is earned; the
+    /// rest stays in the reserve. B451: a delegator stops earning when it
+    /// leaves (EM-3), and its part went to the points that stayed, so a 2 AIN
+    /// position left alone in a pool that weighed 1,000,000 took about 16
+    /// times its stake in one epoch, and its validator the commission on all
+    /// of it. Now no point earns more per AIN than the frozen weight does,
+    /// whoever left: a joiner (its weight counts from the next epoch only)
+    /// gains at most one epoch's yield on its own stake.
+    public fun pool_payout(
+        delegated: u128,
+        delegated_weight: u64,
+        active_coins: u128,
+        commission_bps: u64,
+    ): (u128, u128) {
+        let at_stake = (delegated_weight as u128) * COIN_SCALE;
+        let earned = if (active_coins >= at_stake) {
+            delegated
+        } else {
+            math::mul_div_floor(delegated, active_coins, at_stake)
+        };
+        let commission = earned * (commission_bps as u128) / (MAX_BPS as u128);
+        (commission, earned - commission)
     }
 
     /// A member's committee weight (its own and its pool's stake), bounded

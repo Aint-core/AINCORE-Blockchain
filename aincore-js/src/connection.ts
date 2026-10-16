@@ -144,6 +144,20 @@ function toTokenInfo(result: any, tokenId?: string): TokenInfo {
     };
 }
 
+/**
+ * B479: an amount the node answers as a decimal string (a u128 of quanta),
+ * exactly. `Number` rounded every amount past 2^53 quanta (about 0.009 AIN):
+ * 1 AIN plus one quantum read as 1 AIN. Anything but the 1 to 39 decimal
+ * digits a u128 takes is an error, not a guess (`BigInt` alone takes "0x10",
+ * "" and " 7 ", and parses a million digits).
+ */
+function exactQuanta(text: string, method: string): bigint {
+    if (!/^[0-9]{1,39}$/.test(text)) {
+        throw new Error(`${method} answered an amount that is not a decimal integer`);
+    }
+    return BigInt(text);
+}
+
 /** B260: the node's JSON-RPC code for a call refused for now (busy). */
 const BUSY_CODE = -32005;
 
@@ -213,6 +227,27 @@ export class Connection {
     }
 
     /**
+     * B329: a GET asked again on a rate limit (HTTP 429) or a busy answer
+     * (HTTP 503), as `send` asks a busy JSON-RPC call again; any other
+     * failure throws. The REST reads threw at the first 429, so a wallet took
+     * a busy node for one that runs no chain or holds no validators.
+     */
+    private async getWithRetry(url: string, config: Record<string, unknown> = {}): Promise<any> {
+        for (let attempt = 0; ; attempt++) {
+            try {
+                return await axios.get(url, { timeout: this.timeoutMs, ...config });
+            } catch (error: any) {
+                const status = error?.response?.status;
+                if ((status === 429 || status === 503) && attempt < this.busyRetries) {
+                    await new Promise((resolve) => setTimeout(resolve, this.backoffMs(attempt)));
+                    continue;
+                }
+                throw error;
+            }
+        }
+    }
+
+    /**
      * Generic JSON-RPC call. B267: heavy calls one at a time.
      */
     async request(method: string, params: any[] = []): Promise<any> {
@@ -267,15 +302,19 @@ export class Connection {
     }
 
     /**
-     * Get account data (balance, sequence number)
+     * Get account data (balance, sequence number). B479: `balance` is the
+     * Move CoinStore balance in quanta, exactly, as a bigint (`move_balance`
+     * is the same as a decimal string); it was a `number`, rounded past 2^53
+     * quanta. A balance that is not a decimal integer throws.
      */
-    async getAccount(address: string): Promise<{ balance: number, sequence_number: number, move_balance: string, balance_source: string }> {
+    async getAccount(address: string): Promise<{ balance: bigint, sequence_number: number, move_balance: string, balance_source: string }> {
         const account = await this.request('aincore_getBalance', [address]);
         if (!account) {
-            return { balance: 0, sequence_number: 0, move_balance: '0', balance_source: 'move_coin_store' };
+            return { balance: 0n, sequence_number: 0, move_balance: '0', balance_source: 'move_coin_store' };
         }
 
         const moveBalance = String(account.move_balance ?? '0');
+        const balance = exactQuanta(moveBalance, 'aincore_getBalance');
         const balanceSource = String(account.balance_source ?? 'move_coin_store');
         let sequenceNumber = 0;
 
@@ -293,7 +332,7 @@ export class Connection {
         }
 
         return {
-            balance: Number(moveBalance),
+            balance,
             sequence_number: sequenceNumber,
             move_balance: moveBalance,
             balance_source: balanceSource,
@@ -301,9 +340,14 @@ export class Connection {
     }
 
     /**
-     * Get native AIN balance from Move CoinStore.
+     * The native AIN balance from the Move CoinStore, in quanta (10^18 to
+     * the coin), exactly. B479: a bigint, the type transfer amounts take, so
+     * `balance - fee` is exact. It was a `number`, which rounded every
+     * balance past 2^53 quanta (about 0.009 AIN), and a "send max" built
+     * from it could sign more than the account holds (included, aborted and
+     * charged). For JSON, which carries no bigint, use `getMoveBalance`.
      */
-    async getBalance(address: string): Promise<number> {
+    async getBalance(address: string): Promise<bigint> {
         const account = await this.getAccount(address);
         return account.balance;
     }
@@ -438,13 +482,10 @@ export class Connection {
             console.warn("Indexer URL not configured. Returning empty history.");
             return [];
         }
-        try {
-            const response = await axios.get(`${this.indexerUrl}/history/${address}`, { timeout: this.timeoutMs });
-            return response.data;
-        } catch (e) {
-            console.error("Failed to fetch history from indexer", e);
-            return [];
-        }
+        // B329: retried when busy, and an error is an error: every failure,
+        // the indexer's own busy answer included, read as "no history".
+        const response = await this.getWithRetry(`${this.indexerUrl}/history/${address}`);
+        return response.data;
     }
 
     /**
@@ -575,16 +616,10 @@ export class Connection {
             console.warn("Indexer URL not configured. Returning empty DEX trades.");
             return [];
         }
-        try {
-            const response = await axios.get(`${this.indexerUrl}/api/v1/trades`, {
-                params: { base: tokenIn, quote: tokenOut, limit },
-                timeout: this.timeoutMs,
-            });
-            return response.data || [];
-        } catch (e) {
-            console.error("Failed to fetch DEX trades from indexer", e);
-            return [];
-        }
+        const response = await this.getWithRetry(`${this.indexerUrl}/api/v1/trades`, {
+            params: { base: tokenIn, quote: tokenOut, limit },
+        });
+        return response.data || [];
     }
 
     /**
@@ -600,16 +635,10 @@ export class Connection {
             console.warn("Indexer URL not configured. Returning empty OHLC.");
             return [];
         }
-        try {
-            const response = await axios.get(`${this.indexerUrl}/api/v1/ohlc`, {
-                params: { base: tokenIn, quote: tokenOut, resolution, limit },
-                timeout: this.timeoutMs,
-            });
-            return response.data || [];
-        } catch (e) {
-            console.error("Failed to fetch DEX OHLC from indexer", e);
-            return [];
-        }
+        const response = await this.getWithRetry(`${this.indexerUrl}/api/v1/ohlc`, {
+            params: { base: tokenIn, quote: tokenOut, resolution, limit },
+        });
+        return response.data || [];
     }
 
     /**
@@ -620,16 +649,10 @@ export class Connection {
             console.warn("Indexer URL not configured. Returning null DEX pair summary.");
             return null;
         }
-        try {
-            const response = await axios.get(`${this.indexerUrl}/api/v1/pair_summary`, {
-                params: { base: tokenIn, quote: tokenOut },
-                timeout: this.timeoutMs,
-            });
-            return response.data || null;
-        } catch (e) {
-            console.error("Failed to fetch DEX pair summary from indexer", e);
-            return null;
-        }
+        const response = await this.getWithRetry(`${this.indexerUrl}/api/v1/pair_summary`, {
+            params: { base: tokenIn, quote: tokenOut },
+        });
+        return response.data || null;
     }
 
     /**
@@ -640,16 +663,10 @@ export class Connection {
             console.warn("Indexer URL not configured. Returning empty DEX market list.");
             return [];
         }
-        try {
-            const response = await axios.get(`${this.indexerUrl}/api/v1/markets`, {
-                params: { limit },
-                timeout: this.timeoutMs,
-            });
-            return response.data || [];
-        } catch (e) {
-            console.error("Failed to fetch DEX markets from indexer", e);
-            return [];
-        }
+        const response = await this.getWithRetry(`${this.indexerUrl}/api/v1/markets`, {
+            params: { limit },
+        });
+        return response.data || [];
     }
 
     /**
@@ -719,7 +736,7 @@ export class Connection {
         stake: number;
         status: string;
     }>> {
-        const response = await axios.get(`${this.restBase()}/get_validators`, { timeout: this.timeoutMs });
+        const response = await this.getWithRetry(`${this.restBase()}/get_validators`);
         const validators = response.data?.validators;
         if (!Array.isArray(validators)) {
             throw new Error('get_validators answered no validator list');
@@ -756,7 +773,7 @@ export class Connection {
         tps: number;
         protocol_version: number;
     }> {
-        const response = await axios.get(`${this.restBase()}/get_network_info`, { timeout: this.timeoutMs });
+        const response = await this.getWithRetry(`${this.restBase()}/get_network_info`);
         const info = response.data;
         if (typeof info?.network !== 'string' || info.network === '') {
             throw new Error('get_network_info answered no chain id');
@@ -778,10 +795,11 @@ export class Connection {
      */
     async checkHealth(): Promise<boolean> {
         try {
-            const response = await axios.get(`${this.restBase()}/health`, { timeout: 5000 });
+            const response = await this.getWithRetry(`${this.restBase()}/health`, { timeout: 5000 });
             return response.status === 200;
-        } catch {
-            return false;
+        } catch (error: any) {
+            // B329: a node that answers "too many requests" is up.
+            return error?.response?.status === 429;
         }
     }
 
@@ -858,7 +876,11 @@ export class Connection {
     /**
      * A block's data availability root and shard layout (the tip by default).
      * Check samples against the da_root of a header you hold under a QC, not
-     * against this response.
+     * against this response. B478: the layout is a hint too. Draw the first
+     * index from `total_shards`, every later one from the `totalShards` a
+     * verified sample returns (the count the root commits to), and take a
+     * `total_shards` below that count as a lie: a server holding 2 shards of
+     * 256 answered 2, and every draw from it verified.
      */
     async getDaStatus(height?: number): Promise<{
         height: number;
@@ -874,8 +896,13 @@ export class Connection {
 
     /**
      * Shard `index` of a block's body extension with its inclusion proof.
-     * Pick indices uniformly at random yourself: s samples that all verify
-     * leave a withheld body undetected with probability below 2^-s.
+     * Pick indices uniformly at random yourself and check each answer with
+     * `verifyDaSample(daRoot, index, sample)`, passing the index you drew
+     * (B455: a server may answer with another index's genuine shard). B478:
+     * draw from `[0, totalShards)` of a verified sample (the first index from
+     * `getDaStatus`'s hint), and pass `sample` as it came: it is unchecked
+     * here, and `verifyDaSample` refuses a mis-shaped one. s samples that all
+     * verify leave a withheld body undetected with probability below 2^-s.
      */
     async sampleDA(height: number, index: number): Promise<{
         height: number;
@@ -937,8 +964,14 @@ export class Connection {
         amount: string;
         pendingRewards: string;
     }>> {
+        // B329: the node names the fields in snake_case; they were passed on
+        // as they came, so `pendingRewards` was always undefined.
         const result = await this.request('aincore_getDelegations', [delegatorAddress]);
-        return result || [];
+        return (result || []).map((d: any) => ({
+            validator: d.validator,
+            amount: String(d.amount ?? '0'),
+            pendingRewards: String(d.pending_rewards ?? '0'),
+        }));
     }
 
     /**
@@ -952,7 +985,11 @@ export class Connection {
         unlockTime: number;
     }>> {
         const result = await this.request('aincore_getUnbondingDelegations', [delegatorAddress]);
-        return result || [];
+        return (result || []).map((d: any) => ({
+            validator: d.validator,
+            amount: String(d.amount ?? '0'),
+            unlockTime: Number(d.unlock_time ?? 0),
+        }));
     }
 
     /**
@@ -966,7 +1003,12 @@ export class Connection {
         delegatorCount: number;
     }>> {
         const result = await this.request('aincore_getValidatorsWithDelegation', []);
-        return result || [];
+        return (result || []).map((v: any) => ({
+            address: v.address,
+            totalDelegated: String(v.total_delegated ?? '0'),
+            commissionRate: Number(v.commission_rate ?? 0),
+            delegatorCount: Number(v.delegator_count ?? 0),
+        }));
     }
 
     // =====================

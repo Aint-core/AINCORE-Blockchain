@@ -75,7 +75,7 @@ fn committee_of(seed: [u8; 32], address: u64) -> Vec<ValidatorInfo> {
         stake: 100,
         ed25519_public_key: "00".repeat(32),
         bls_public_key: hex::encode(bls.pubkey_raw(&seed)),
-        bls_pop: hex::encode(bls.prove_possession_raw(&seed)),
+        bls_pop: hex::encode(bls.prove_possession_raw(&seed, &[0u8; 32])),
     }]
 }
 
@@ -119,13 +119,16 @@ struct Spec {
     extra: Vec<(String, Vec<u8>)>,
     /// A second epoch from height 5, whose committee is this seed's.
     epoch_one: Option<[u8; 32]>,
-    /// The active set (`sys:validators`) besides the proposer.
+    /// The active set (`sys:validators`; on V4 `sys:validator_set:v1`)
+    /// besides the proposer.
     validators: Vec<String>,
     /// The checkpoint block's BFT timestamp, in seconds.
     timestamp: u64,
     /// A V4 chain: `genesis:vertex_format` 4, the executor's record of the
     /// next epoch's committee, and a QC at H (an epoch boundary) that binds it.
     v4: bool,
+    /// B401: the checkpoint block's transactions (a body of several shards).
+    transactions: Vec<String>,
 }
 
 impl Default for Spec {
@@ -138,6 +141,7 @@ impl Default for Spec {
             validators: Vec::new(),
             timestamp: 1_000,
             v4: false,
+            transactions: Vec::new(),
         }
     }
 }
@@ -167,20 +171,38 @@ fn chain_as(name: &str, signer: [u8; 32], state_chain: &'static str) -> Chain {
 fn chain_with(name: &str, spec: Spec) -> Chain {
     let db = temp_db(name);
     let members = committee();
-    let (epoch, signing) = match spec.epoch_one {
+    let (epoch, mut signing) = match spec.epoch_one {
         Some(seed) => (1, committee_of(seed, 2)),
         None => (0, members.clone()),
     };
+    // B472: on V4 a block's signer is a member of its epoch's committee
+    // (C_E(h), as sync checks it), so the epoch's member is the anchor's
+    // proposer. Epoch 0's committee is the genesis set every client pins:
+    // a V4 fixture runs in epoch one.
+    if spec.v4 {
+        assert!(spec.epoch_one.is_some(), "a V4 fixture runs in epoch one");
+        signing[0].address = proposer().1;
+    }
     // The live set at H (the anchor block's proposer is in it, as on a real
     // chain), and E+1's committee by the rule every node runs at H.
     let mut live = signing.clone();
-    live.push(ValidatorInfo {
-        address: proposer().1,
+    if !live.iter().any(|v| v.address == proposer().1) {
+        live.push(ValidatorInfo {
+            address: proposer().1,
+            stake: 100,
+            ed25519_public_key: hex::encode(proposer().0.verifying_key().to_bytes()),
+            bls_public_key: String::new(),
+            bls_pop: String::new(),
+        });
+    }
+    // B472: and the active set's other validators, outside the committee.
+    live.extend(spec.validators.iter().map(|address| ValidatorInfo {
+        address: address.clone(),
         stake: 100,
-        ed25519_public_key: hex::encode(proposer().0.verifying_key().to_bytes()),
+        ed25519_public_key: String::new(),
         bls_public_key: String::new(),
         bls_pop: String::new(),
-    });
+    }));
     let next = blockchain::committee::next_committee(&signing, &live).0;
     let mut state: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     let mut at_h = BTreeMap::new();
@@ -253,17 +275,19 @@ fn chain_with(name: &str, spec: Spec) -> Chain {
     }
     let root = root_h.unwrap();
     let (proposer_key, proposer_address) = proposer();
+    // B398: the anchor is the committed sequence's last vertex (G0), as
+    // every block a node builds has it.
     let mut block = Block::new_with_roots_at(
         H,
         2 * H,
         "00".repeat(32),
-        vec![],
+        spec.transactions.clone(),
         proposer_address.clone(),
         root.clone(),
         "dd".repeat(32),
         spec.timestamp,
-        vec![],
-        vec![],
+        vec!["aa".repeat(32)],
+        vec![proposer_address.clone()],
         "aa".repeat(32),
         vec![],
     );
@@ -286,8 +310,8 @@ fn chain_with(name: &str, spec: Spec) -> Chain {
             String::new()
         },
     };
-    let signature =
-        crypto::bls::BLSEngine::consensus().sign_raw(&vote.to_signing_bytes(), &spec.signer);
+    let signature = crypto::bls::BLSEngine::consensus()
+        .sign_raw(&vote.signing_bytes_under(IDENTITY), &spec.signer);
     let qc = build_qc(&vote, &signing, &[0], &[signature]).unwrap();
     db.put(
         &format!("block_{H}"),
@@ -587,6 +611,16 @@ fn stored_block(chain: &Chain) -> Block {
     serde_json::from_str(&chain.db.get(&format!("block_{H}")).unwrap().unwrap()).unwrap()
 }
 
+/// A block's own pair with `qc`.
+fn pair_of(block: Block, qc: QuorumCertificate) -> Pair {
+    Pair {
+        proposer_signature: block.proposer_signature.clone(),
+        proposer_signer: block.proposer_signer.clone(),
+        body: Arc::new(block),
+        qc,
+    }
+}
+
 /// G4 S6: a node restores over the network task's sessions: each peer is
 /// dialled once by address, every request runs on that session, and each
 /// is charged to the key the server's session layer names.
@@ -667,8 +701,77 @@ fn only_snapshot_parts_have_a_busy_answer() {
     let value: ValueResponse =
         serde_json::from_str(value.strip_prefix(VALUE_RESP).unwrap()).unwrap();
     assert_eq!(value.error.as_deref(), Some("busy"));
+    // B418: a checkpoint's anchor too (it was dropped unanswered).
+    let anchor = busy_reply(&format!("{ANCHOR_REQ}{{}}")).unwrap();
+    let anchor: AnchorResponse =
+        serde_json::from_str(anchor.strip_prefix(ANCHOR_RESP).unwrap()).unwrap();
+    assert_eq!(anchor.error.as_deref(), Some("busy"));
     assert_eq!(busy_reply("SYNC_REQ:{}"), None);
     assert_eq!(busy_reply("GET_HEIGHT"), None);
+}
+
+/// B418 witness: an anchor request the snapshot budget cannot take now is
+/// answered busy, and served once a slot is free. It was answered with an
+/// empty anchor, which a client counts as no answer.
+#[test]
+fn an_anchor_the_budget_cannot_take_is_answered_busy() {
+    let a = chain("anchor_shed_a", MEMBER);
+    let sync = peer(&a, Behaviour::Honest).sync;
+    let ask = || sync.handle_state_anchor(AnchorRequest { height: H });
+    let held: Vec<_> = (0..STATE_SERVE_IN_FLIGHT)
+        .map(|_| sync.state_budget.admit(None, 1, true).expect("a slot"))
+        .collect();
+    let refused = ask();
+    assert_eq!(refused.error.as_deref(), Some("busy"), "no free slot");
+    assert!(refused.block.is_none());
+    drop(held);
+    let served = ask();
+    assert!(served.error.is_none());
+    assert!(served.block.is_some(), "positive control: served once free");
+}
+
+/// B418 witness: a server answering the checkpoint's anchor busy for more
+/// rounds than `max_failures` is waited out within the deadline, and its
+/// anchor taken once it answers. A busy anchor was no answer, so a server's
+/// spent quota (or slots held by others) ended the restore after
+/// `max_failures` rounds.
+#[tokio::test]
+async fn an_anchor_answered_busy_is_waited_out() {
+    let a = chain("anchor_busy_a", MEMBER);
+    let server = peer(&a, Behaviour::Honest).sync;
+    let patience = fast();
+    let busy_rounds = patience.max_failures + 2;
+    let busy = format!(
+        "{ANCHOR_RESP}{}",
+        serde_json::to_string(&AnchorResponse {
+            error: Some(BUSY.into()),
+            ..Default::default()
+        })
+        .unwrap()
+    );
+    let busy_answers = std::cell::Cell::new(0usize);
+    let mut ask = |_: usize, msg: String| {
+        let reply = if msg.starts_with(ANCHOR_REQ) && busy_answers.get() < busy_rounds {
+            busy_answers.set(busy_answers.get() + 1);
+            Ok(busy.clone())
+        } else {
+            server
+                .handle_message(&msg)
+                .ok_or_else(|| "no answer".to_string())
+        };
+        async move { reply }
+    };
+    let mut anchor = AnchorBody::default();
+    let pairs = fetch_anchor(&a.cp, 1, &mut ask, &patience, &mut anchor, Instant::now())
+        .await
+        .expect("the anchor, once the server answers");
+    assert_eq!(
+        busy_answers.get(),
+        busy_rounds,
+        "positive control: busy for more than max_failures rounds"
+    );
+    assert_eq!(pairs.len(), 1);
+    assert_eq!(pairs[0].qc, stored_qc(&a));
 }
 
 #[tokio::test]
@@ -697,26 +800,32 @@ async fn a_node_restores_from_honest_peers() {
     let block = stored_block(&a);
     let mut vote = good.finality_vote();
     vote.epoch = 1;
-    let signature = crypto::bls::BLSEngine::consensus().sign_raw(&vote.to_signing_bytes(), &MEMBER);
+    let signature =
+        crypto::bls::BLSEngine::consensus().sign_raw(&vote.signing_bytes_under(IDENTITY), &MEMBER);
     let other_epoch = build_qc(&vote, &committee(), &[0], &[signature]).unwrap();
     let err = verified_pair(
         &client,
         CHAIN,
+        IDENTITY,
         0,
         &committee(),
-        &[(block.clone(), other_epoch.clone())],
+        &[pair_of(block.clone(), other_epoch.clone())],
     )
     .unwrap_err();
     assert!(err.contains("epoch"), "{err}");
-    let (_, verified) = verified_pair(
+    let verified = verified_pair(
         &client,
         CHAIN,
+        IDENTITY,
         0,
         &committee(),
-        &[(block.clone(), other_epoch), (block, good.clone())],
+        &[
+            pair_of(block.clone(), other_epoch),
+            pair_of(block, good.clone()),
+        ],
     )
     .unwrap();
-    assert_eq!(verified, good);
+    assert_eq!(verified.qc, good);
 }
 
 /// A checkpoint in a later epoch is checked against that epoch's committee,
@@ -880,7 +989,9 @@ async fn the_block_is_stored_with_its_own_verified_qc() {
         "{ANCHOR_RESP}{}",
         serde_json::to_string(&AnchorResponse {
             block: Some(block),
-            quorum_certificate: Some(qc)
+            quorum_certificate: Some(qc),
+            oversized: None,
+            error: None,
         })
         .unwrap()
     );
@@ -921,7 +1032,9 @@ async fn the_anchor_is_asked_for_until_a_pair_verifies() {
         "{ANCHOR_RESP}{}",
         serde_json::to_string(&AnchorResponse {
             block: Some(stored_block(&a)),
-            quorum_certificate: Some(qc)
+            quorum_certificate: Some(qc),
+            oversized: None,
+            error: None,
         })
         .unwrap()
     );
@@ -937,11 +1050,7 @@ async fn the_anchor_is_asked_for_until_a_pair_verifies() {
                 // liar's pair alone, so only asking again finds this one.
                 return Ok(format!(
                     "{ANCHOR_RESP}{}",
-                    serde_json::to_string(&AnchorResponse {
-                        block: None,
-                        quorum_certificate: None
-                    })
-                    .unwrap()
+                    serde_json::to_string(&AnchorResponse::default()).unwrap()
                 ));
             }
             return serve(&mut honest, msg);
@@ -980,7 +1089,9 @@ async fn anchor_rounds_without_a_pair_do_not_end_the_restore() {
             "{ANCHOR_RESP}{}",
             serde_json::to_string(&AnchorResponse {
                 block,
-                quorum_certificate: qc
+                quorum_certificate: qc,
+                oversized: None,
+                error: None,
             })
             .unwrap()
         ))
@@ -2052,10 +2163,20 @@ impl Producer {
 
 /// G3 GC-1: a node that only imports blocks prunes blocks and state like one
 /// that builds them (it used to prune neither), keeping the pinned blocks
-/// until their pins expire.
+/// until their pins expire. B371: it prunes only below what it has adopted.
 #[test]
 fn a_node_that_only_follows_prunes() {
     let producer = Producer::new("follow_prunes", Some((10, 250)));
+    // B371: pruning keeps every block above the adoption cursor, which only
+    // the DAG's adoption loop moves (after each sync pass). This node runs
+    // none, so its cursor is put at the tip, where a follower's adoption that
+    // keeps pace leaves it: the window is then the retention alone. Left at
+    // 0, the clamp held the window at height 11 and the state floor at 1.
+    producer
+        .sync
+        .storage
+        .put("consensus:last_adopted_height", "100")
+        .unwrap();
     producer.import(100);
     let db = &producer.sync.storage;
     assert_eq!(state_commit::floor(db).unwrap(), 90);
@@ -2103,7 +2224,8 @@ fn a_restored_node_follows_the_chain() {
         validator_set_hash: validator_set_hash(&committee()),
         next_validator_set_hash: String::new(),
     };
-    let signature = crypto::bls::BLSEngine::consensus().sign_raw(&vote.to_signing_bytes(), &MEMBER);
+    let signature =
+        crypto::bls::BLSEngine::consensus().sign_raw(&vote.signing_bytes_under(IDENTITY), &MEMBER);
     let qc = build_qc(&vote, &committee(), &[0], &[signature]).unwrap();
     producer
         .storage
@@ -2460,6 +2582,8 @@ async fn a_block_with_a_forged_proposer_signature_is_not_stored() {
         serde_json::to_string(&AnchorResponse {
             block: Some(block),
             quorum_certificate: Some(stored_qc(&a)),
+            oversized: None,
+            error: None,
         })
         .unwrap()
     );
@@ -2946,7 +3070,7 @@ fn a_turn_is_judged_by_its_rate_past_the_slow_turn() {
 /// the closest is asked and its sit-out ends.
 #[test]
 fn a_struck_peer_sits_out_twice_as_long_up_to_a_cap() {
-    let mut set = PeerSet::new(3);
+    let mut set = PeerSet::new(3, Duration::from_secs(2));
     let mut expected = 1;
     for _ in 0..12 {
         set.strike(0);
@@ -3045,11 +3169,24 @@ fn a_node_serves_snapshots_only_when_asked_to() {
         .handle_state_anchor(AnchorRequest { height: H })
         .block
         .is_none());
-    // B299: and only for a version it retains (any height was answered).
-    state_commit::prune(&a.db, TIP, &Default::default(), usize::MAX).unwrap();
-    let all = small.with_batch_bytes(usize::MAX);
+    // B324: and, known too large from then on, it is not read again.
     assert!(
-        all.handle_state_anchor(AnchorRequest { height: H })
+        small.oversized_known.lock().unwrap().contains_key(&H),
+        "the block too large for a batch was not remembered"
+    );
+    // B299: and only for a version it retains (any height was answered).
+    let fresh = ChainSync::new(Arc::clone(&a.db)).with_snapshot_serving(true);
+    assert!(
+        fresh
+            .handle_state_anchor(AnchorRequest { height: H })
+            .block
+            .is_some(),
+        "vacuous: the anchor is not served while retained"
+    );
+    state_commit::prune(&a.db, TIP, &Default::default(), usize::MAX).unwrap();
+    assert!(
+        fresh
+            .handle_state_anchor(AnchorRequest { height: H })
             .block
             .is_none(),
         "an anchor answered for a version not retained"
@@ -3086,7 +3223,8 @@ fn serve_session_budgets_by_the_sessions_key() {
 
 /// SN-6 on what the restored state records: a key in any retained epoch's
 /// committee, or in the active set, is a validator. The block's signer may
-/// be in the checkpoint epoch's committee or in the active set.
+/// be in the checkpoint epoch's committee or in the active set (on V3; B472:
+/// on V4 in the committee only, `a_v4_anchor_signer_is_a_member_of_its_committee`).
 #[test]
 fn validators_are_what_the_restored_state_records() {
     let a = chain_with(
@@ -3217,6 +3355,8 @@ async fn a_block_signed_by_a_non_validator_is_not_stored() {
         serde_json::to_string(&AnchorResponse {
             block: Some(block.clone()),
             quorum_certificate: Some(stored_qc(&a)),
+            oversized: None,
+            error: None,
         })
         .unwrap()
     );
@@ -3254,7 +3394,16 @@ async fn the_same_anchor_from_many_peers_is_one_candidate() {
         let r = serve(&mut peers[i], &msg);
         async move { r }
     };
-    let pairs = fetch_anchor(&a.cp, 3, &mut ask, &fast()).await.unwrap();
+    let pairs = fetch_anchor(
+        &a.cp,
+        3,
+        &mut ask,
+        &fast(),
+        &mut AnchorBody::default(),
+        Instant::now(),
+    )
+    .await
+    .unwrap();
     assert_eq!(pairs.len(), 1);
 }
 
@@ -3624,4 +3773,949 @@ fn a_snapshot_slot_is_kept_for_members() {
         "a member was kept out"
     );
     drop(held);
+}
+
+/// B395 witness: a restore that replaced a chain resumes only under the key
+/// it began under. Its first attempt, under a new key, cleared the chain
+/// that recorded this node's validator key; a resume under that key then
+/// found nothing to refuse it by, and restored it. Under the first key the
+/// resume completes.
+#[tokio::test]
+async fn a_replace_restore_resumes_only_under_its_first_key() {
+    let g = genesis();
+    let a = chain("resume_key_a", MEMBER);
+    let client = temp_db("resume_key_client");
+    let validator = "cc".repeat(32);
+    let fresh = "ff".repeat(32);
+    {
+        let _seed = client.seeding();
+        client.put("genesis_initialized", "true").unwrap();
+        client.put("latest_height", "3").unwrap();
+        client
+            .put(
+                "sys:validators",
+                &serde_json::to_string(&vec![(validator.clone(), 100u64)]).unwrap(),
+            )
+            .unwrap();
+        client.put(&obj(999), "old").unwrap();
+    }
+    let as_validator = RestorePlan {
+        local_signer: Some(&validator),
+        ..plan(&a.cp, &g, true)
+    };
+    let as_fresh = RestorePlan {
+        local_signer: Some(&fresh),
+        ..plan(&a.cp, &g, true)
+    };
+
+    // Positive control: the old chain records the validator key.
+    let mut peers = [peer(&a, Behaviour::Honest)];
+    let err = run(&client, &as_validator, &mut peers).await.unwrap_err();
+    assert!(err.contains("SN-6"), "{err}");
+    assert_eq!(client.get(RESTORE_MARKER).unwrap(), None);
+
+    // A first attempt under a new key clears the old chain, then fails.
+    let mut dying = [peer(&a, Behaviour::DiesAfterFirst)];
+    let err = run(&client, &as_fresh, &mut dying).await.unwrap_err();
+    assert!(err.contains("no peer serves"), "{err}");
+    assert!(client.get(RESTORE_MARKER).unwrap().is_some());
+    assert_eq!(
+        client.get(&obj(999)).unwrap(),
+        None,
+        "the old chain cleared"
+    );
+    assert!(
+        !recorded_validator(&client, &validator),
+        "nothing left records the validator key"
+    );
+
+    // Resumed under the validator key: refused, before anything is asked.
+    let mut honest = peer(&a, Behaviour::Honest);
+    let mut asks = 0usize;
+    let err = run_with(&client, &as_validator, 1, |_, msg| {
+        asks += 1;
+        serve(&mut honest, msg)
+    })
+    .await
+    .unwrap_err();
+    assert!(
+        err.contains("began under key") && err.contains("SN-6"),
+        "{err}"
+    );
+    assert_eq!(asks, 0, "nothing asked");
+    assert!(
+        client.get(RESTORE_MARKER).unwrap().is_some(),
+        "still marked"
+    );
+
+    // Resumed under the first key: it completes.
+    let mut peers = [peer(&a, Behaviour::Honest)];
+    run(&client, &as_fresh, &mut peers).await.unwrap();
+    assert_restored(&client, &a);
+    assert_eq!(client.get(RESTORED_BY).unwrap(), Some(fresh.clone()));
+}
+
+/// B395 witness: a replace restore is a guard loss for G1 RC-3. The guard
+/// origin and the resume point go, so the next boot abstains afresh; the
+/// V4 producer guards (B282) stay, like the attestation guards. The origin
+/// stayed while the producer guards went.
+#[tokio::test]
+async fn a_restore_drops_the_guard_origin_and_keeps_the_producer_guards() {
+    const H64: &str = "dd48891f6d6799d5aa71e17b150ba3a8c30cbfbfb02544f546801f057aa65d42";
+    let proposed = format!("consensus:vproposed:v1:{H64}:{H64}:3:00000000000000153030");
+    let proposed_high = format!("consensus:vproposed_high:v1:{H64}:{H64}:3");
+    let attest = format!(
+        "consensus:vattest:v1:{}:{}:3:author:{:020}",
+        "ab".repeat(32),
+        "cd".repeat(48),
+        7
+    );
+    let resume = consensus::v4::epoch::GUARD_RESUME_KEY;
+    for key in [&proposed, &proposed_high, &attest] {
+        assert_eq!(
+            classify(key.as_bytes()),
+            Some(KeyClass::Local),
+            "vacuous: {key}"
+        );
+    }
+    let g = genesis();
+    let a = chain("guards_a", MEMBER);
+    let client = temp_db("guards_client");
+    {
+        let _seed = client.seeding();
+        client.put("genesis_initialized", "true").unwrap();
+        client.put("latest_height", "3").unwrap();
+        client
+            .put("consensus:guard_origin", "{\"cg\":\"old\"}")
+            .unwrap();
+        client.put(resume, "5").unwrap();
+        client.put(&proposed, "{}").unwrap();
+        client.put(&proposed_high, "153030").unwrap();
+        client.put(&attest, "attested").unwrap();
+    }
+    let mut peers = [peer(&a, Behaviour::Honest)];
+    run(&client, &plan(&a.cp, &g, true), &mut peers)
+        .await
+        .unwrap();
+    assert_restored(&client, &a);
+    assert_eq!(
+        client.get("consensus:guard_origin").unwrap(),
+        None,
+        "continuity is lost"
+    );
+    assert_eq!(client.get(resume).unwrap(), None, "the old resume point");
+    for key in [&proposed, &proposed_high, &attest] {
+        assert!(client.get(key).unwrap().is_some(), "{key} kept");
+    }
+    // RC-3 starts abstaining afresh at the next boot (B405: the level height
+    // is observed again in that run), not from the old point.
+    consensus::v4::epoch::begin_abstaining(&client).unwrap();
+    assert_eq!(consensus::v4::epoch::level_height(&client).unwrap(), None);
+}
+
+/// B395 witness: on V4 a key in the executor's record of a later epoch's
+/// committee (`sys:validator_set:epoch:{E}`, state) is a validator. E's own
+/// record is no state, so a restored state holds none, and a key in no
+/// active set was not seen.
+#[test]
+fn a_v4_validator_is_what_the_restored_state_records() {
+    let client = temp_db("v4_recorded_client");
+    let later = committee_of([9; 32], 3);
+    {
+        let _seed = client.seeding();
+        client.put(consensus::v4::VERTEX_FORMAT_KEY, "4").unwrap();
+        client.put("sys:config:epoch_block_interval", "5").unwrap();
+        client.put("consensus:epoch", "2").unwrap();
+        client
+            .put(
+                "genesis:validator_set:v1",
+                &serde_json::to_string(&committee()).unwrap(),
+            )
+            .unwrap();
+        client
+            .put(
+                "sys:validator_set:epoch:2",
+                &serde_json::to_string(&later).unwrap(),
+            )
+            .unwrap();
+        client
+            .put(
+                "sys:validators",
+                &serde_json::to_string(&vec![(proposer().1, 100u64)]).unwrap(),
+            )
+            .unwrap();
+    }
+    assert!(consensus::v4::is_v4_chain(&client));
+    assert!(
+        consensus::v4::epoch::committee_of(&client, 2).is_none(),
+        "vacuous: epoch 2's own record is held"
+    );
+    assert!(recorded_validator(&client, &later[0].address), "epoch 2");
+    assert!(
+        recorded_validator(&client, &committee()[0].address),
+        "genesis"
+    );
+    assert!(recorded_validator(&client, &proposer().1), "the active set");
+    assert!(!recorded_validator(&client, &outsider().1));
+}
+
+/// B396 witness: a V4 checkpoint past epoch 0 that is no epoch boundary is
+/// refused from this node's own genesis, before any request, marker or
+/// clear. It was refused after the whole download, with a replaced chain
+/// already cleared.
+#[tokio::test]
+async fn an_inner_v4_checkpoint_is_refused_before_anything_is_asked() {
+    let plain = genesis();
+    let mut v4 = genesis();
+    v4.insert(
+        consensus::v4::VERTEX_FORMAT_KEY.to_string(),
+        "4".to_string(),
+    );
+    let client = temp_db("inner_v4_client");
+    {
+        let _seed = client.seeding();
+        client.put("genesis_initialized", "true").unwrap();
+        client.put("latest_height", "3").unwrap();
+        client.put(&obj(999), "old").unwrap();
+    }
+    let at = |height| Checkpoint {
+        height,
+        block_hash: "11".repeat(32),
+        state_root: "22".repeat(32),
+    };
+    // Height 7 is in epoch 1 at an interval of 5.
+    let inner = at(7);
+    let mut asks = 0usize;
+    let err = run_with(&client, &plan(&inner, &v4, true), 1, |_, _| {
+        asks += 1;
+        Err("down".into())
+    })
+    .await
+    .unwrap_err();
+    assert!(err.contains("epoch boundary"), "{err}");
+    assert_eq!(asks, 0, "nothing asked");
+    assert_eq!(client.get(RESTORE_MARKER).unwrap(), None, "no marker");
+    assert_eq!(
+        client.get(&obj(999)).unwrap().as_deref(),
+        Some("old"),
+        "nothing cleared"
+    );
+    // Positive controls: a boundary, a height in epoch 0, and the inner
+    // height on a chain whose genesis is not V4 go on to ask.
+    for (cp, genesis) in [(at(10), &v4), (at(3), &v4), (at(7), &plain)] {
+        let mut asks = 0usize;
+        let err = run_with(&client, &plan(&cp, genesis, true), 1, |_, _| {
+            asks += 1;
+            Err("down".into())
+        })
+        .await
+        .unwrap_err();
+        assert!(err.contains("no peer holds"), "{}: {err}", cp.height);
+        assert!(asks > 0, "{}", cp.height);
+    }
+}
+
+/// B398 witness: a block whose anchor is junk (padded, with its QC padded
+/// to match) is refused by the anchor binding before its body is checked
+/// against its header (the DA root's Reed-Solomon extension), and so is one
+/// whose QC names another anchor round. The extension ran first.
+#[test]
+fn a_junk_anchor_is_refused_before_the_bodys_roots() {
+    let a = chain("junk_anchor_a", MEMBER);
+    let checks = || COMMITMENT_CHECKS.with(|n| n.get());
+    let mut block = stored_block(&a);
+    block.anchor_hash = "ab".repeat(1 << 16);
+    let mut qc = stored_qc(&a);
+    qc.anchor_hash = block.anchor_hash.clone();
+    let before = checks();
+    let err = check_anchor(&a.cp, &block, &qc).unwrap_err();
+    assert!(err.contains("not its last committed vertex"), "{err}");
+    let mut other_round = stored_qc(&a);
+    other_round.anchor_round += 1;
+    let err = check_anchor(&a.cp, &stored_block(&a), &other_round).unwrap_err();
+    assert!(err.contains("QC is not for"), "{err}");
+    assert_eq!(checks(), before, "no body was checked against its header");
+    assert_eq!(
+        check_anchor(&a.cp, &stored_block(&a), &stored_qc(&a)),
+        Ok(())
+    );
+    assert_eq!(checks(), before + 1, "positive control: the real one is");
+}
+
+/// The byte cut at which these tests' anchor block is too large for a batch.
+const PARTED_BATCH: usize = 256;
+
+/// B397 witness: a server whose block at the checkpoint is too large for an
+/// answer names it with its header, proposer's signature and QC, from what
+/// it knows after one read (B324), and serves its body in shards. It
+/// answered nothing.
+#[test]
+fn an_anchor_over_a_batch_is_named_with_its_qc() {
+    let a = chain("named_anchor_a", MEMBER);
+    let server = ChainSync::new(Arc::clone(&a.db))
+        .with_snapshot_serving(true)
+        .with_batch_bytes(PARTED_BATCH);
+    let block = stored_block(&a);
+    assert!(
+        serde_json::to_string(&block).unwrap().len() > PARTED_BATCH,
+        "vacuous: the block fits a batch"
+    );
+    for ask in 0..2 {
+        let answer = server.handle_state_anchor(AnchorRequest { height: H });
+        assert!(answer.block.is_none(), "ask {ask}");
+        let big = answer.oversized.expect("named");
+        assert_eq!(big.height, H);
+        assert_eq!(big.header.hash, block.header.hash);
+        assert_eq!(big.proposer_signature, block.proposer_signature);
+        assert_eq!(big.proposer_signer, block.proposer_signer);
+        assert_eq!(answer.quorum_certificate, Some(stored_qc(&a)), "ask {ask}");
+    }
+    let piece = server.handle_block_shard(crate::ShardRequest {
+        height: H,
+        index: 0,
+        offset: 0,
+    });
+    assert_eq!(piece.error, None, "its body is served in shards");
+}
+
+/// B397 witness: a checkpoint whose block is larger than a sync batch
+/// restores: its body comes in shards, each proved under the DA root the
+/// checkpoint's hash pins (a peer whose shard does not prove is passed
+/// over), and the block stored is the whole one. No node could restore it.
+#[tokio::test]
+async fn a_checkpoint_block_over_a_batch_restores_through_its_shards() {
+    let g = genesis();
+    let a = chain("parted_anchor_a", MEMBER);
+    let b = chain("parted_anchor_b", MEMBER);
+    let client = temp_db("parted_anchor_client");
+    let parted = |chain: &Chain| {
+        let mut server = peer(chain, Behaviour::Honest);
+        server.sync = ChainSync::new(Arc::clone(&chain.db))
+            .with_snapshot_serving(true)
+            .with_batch_bytes(PARTED_BATCH);
+        server
+    };
+    let (mut liar, mut honest) = (parted(&a), parted(&b));
+    let (mut lied, mut pieces) = (0usize, 0usize);
+    run_with(&client, &plan(&a.cp, &g, false), 2, |i, msg| {
+        if !msg.starts_with(crate::SHARD_REQ) {
+            return serve(if i == 0 { &mut liar } else { &mut honest }, msg);
+        }
+        if i == 1 {
+            pieces += 1;
+            return serve(&mut honest, msg);
+        }
+        // Every piece the liar serves has a byte flipped.
+        lied += 1;
+        let reply = serve(&mut liar, msg)?;
+        let mut piece: crate::ShardResponse =
+            serde_json::from_str(reply.strip_prefix(crate::SHARD_RESP).unwrap()).unwrap();
+        let mut data = hex::decode(&piece.data).unwrap();
+        if let Some(byte) = data.first_mut() {
+            *byte ^= 1;
+        }
+        piece.data = hex::encode(data);
+        Ok(format!(
+            "{}{}",
+            crate::SHARD_RESP,
+            serde_json::to_string(&piece).unwrap()
+        ))
+    })
+    .await
+    .expect("the restore completes");
+    assert_restored(&client, &a);
+    assert!(lied > 0, "positive control: the liar was asked");
+    assert!(pieces > 1, "the body came in pieces: {pieces}");
+    let stored = client.get(&format!("block_{H}")).unwrap().unwrap();
+    assert_eq!(
+        stored,
+        serde_json::to_string(&stored_block(&b)).unwrap(),
+        "the whole block, with the honest peer's signature"
+    );
+}
+
+/// B401: a checkpoint block whose body is several data shards.
+fn parted_spec() -> Spec {
+    Spec {
+        transactions: vec!["ab".repeat(400); 3],
+        ..Spec::default()
+    }
+}
+
+/// A server whose checkpoint block is too large for its batch.
+fn parted_peer(chain: &Chain) -> Peer {
+    let mut server = peer(chain, Behaviour::Honest);
+    server.sync = ChainSync::new(Arc::clone(&chain.db))
+        .with_snapshot_serving(true)
+        .with_batch_bytes(PARTED_BATCH);
+    server
+}
+
+/// B401 witness: the anchor block's shards one peer proved survive its
+/// error: the next peer completes the body without being asked for them,
+/// and the restore completes. The fetch was one call's own, so the error
+/// threw the proved shards away and the next peer was asked for every one.
+#[tokio::test]
+async fn proved_anchor_shards_survive_a_peer_error() {
+    let g = genesis();
+    let a = chain_with("survive_a", parted_spec());
+    let b = chain_with("survive_b", parted_spec());
+    let client = temp_db("survive_client");
+    let shards = da::Layout::of(stored_block(&a).body_bytes().len() as u64).data_shards;
+    assert!(shards >= 3, "vacuous: a body of {shards} shards");
+    let (mut first, mut second) = (parted_peer(&a), parted_peer(&b));
+    let mut proved_by_first: Vec<u64> = Vec::new();
+    let mut asked_of_second: Vec<u64> = Vec::new();
+    let mut dropped = 0usize;
+    run_with(&client, &plan(&a.cp, &g, false), 2, |i, msg| {
+        let Some(json) = msg.strip_prefix(crate::SHARD_REQ) else {
+            return serve(if i == 0 { &mut first } else { &mut second }, msg);
+        };
+        let req: crate::ShardRequest = serde_json::from_str(json).unwrap();
+        if i == 1 {
+            asked_of_second.push(req.index);
+            return serve(&mut second, msg);
+        }
+        // The first peer's connection drops once it has proved two shards.
+        if proved_by_first.len() >= 2 {
+            dropped += 1;
+            return Err("connection reset".into());
+        }
+        let reply = serve(&mut first, msg)?;
+        let piece: crate::ShardResponse =
+            serde_json::from_str(reply.strip_prefix(crate::SHARD_RESP).unwrap()).unwrap();
+        if !piece.proof.is_empty() {
+            proved_by_first.push(piece.index);
+        }
+        Ok(reply)
+    })
+    .await
+    .expect("the restore completes");
+    assert_restored(&client, &a);
+    assert_eq!(
+        dropped, 1,
+        "positive control: the first peer's turn ended in an error"
+    );
+    assert_eq!(proved_by_first, [0, 1]);
+    assert!(
+        asked_of_second.contains(&2),
+        "the second peer completed the body: {asked_of_second:?}"
+    );
+    assert!(
+        asked_of_second.iter().all(|i| !proved_by_first.contains(i)),
+        "a proved shard was asked for again: {asked_of_second:?}"
+    );
+}
+
+/// B401 witness: a server busy past a request timeout ends its turn, not
+/// the fetch: the restore waits it out, within its deadline, and no piece is
+/// fetched twice. The turn failed after one request timeout and the shards
+/// it had proved went with it, to be fetched again.
+#[tokio::test]
+async fn a_busy_shard_server_is_waited_out_without_losing_shards() {
+    let g = genesis();
+    let a = chain_with("busy_shards_a", parted_spec());
+    let client = temp_db("busy_shards_client");
+    let mut server = parted_peer(&a);
+    let patience = Patience {
+        backoff_start: Duration::from_millis(10),
+        backoff_max: Duration::from_millis(10),
+        request_timeout: Duration::from_millis(100),
+        ..fast()
+    };
+    let patient = RestorePlan {
+        patience: patience.clone(),
+        ..plan(&a.cp, &g, false)
+    };
+    let mut busy_from: Option<Instant> = None;
+    let mut busy = 0usize;
+    let mut served: std::collections::HashMap<(u64, u64), usize> = Default::default();
+    run_with(&client, &patient, 1, |_, msg| {
+        let Some(json) = msg.strip_prefix(crate::SHARD_REQ) else {
+            return serve(&mut server, msg);
+        };
+        let req: crate::ShardRequest = serde_json::from_str(json).unwrap();
+        // Shard 1 is busy for three request timeouts.
+        let window = patience.request_timeout * 3;
+        if req.index == 1 && busy_from.get_or_insert_with(Instant::now).elapsed() < window {
+            busy += 1;
+            return Ok(busy_reply(msg).unwrap());
+        }
+        *served.entry((req.index, req.offset)).or_default() += 1;
+        serve(&mut server, msg)
+    })
+    .await
+    .expect("the restore completes");
+    assert_restored(&client, &a);
+    assert!(busy > 1, "positive control: busy past a request timeout");
+    assert!(
+        served.keys().any(|(index, _)| *index == 0),
+        "positive control: shard 0 came before the busy one"
+    );
+    assert!(
+        served.values().all(|n| *n == 1),
+        "no piece was fetched twice: {served:?}"
+    );
+}
+
+/// B401 witness: two peers that name the parted block under two signatures
+/// give two pairs that share one body, checked against its header once and
+/// held for later rounds; the whole block is built for a pair on demand.
+/// Each pair held its own copy (up to 512 MiB of text each), and each copy's
+/// commitments were run.
+#[tokio::test]
+async fn parted_anchor_pairs_share_one_body() {
+    let a = chain_with("shared_body_a", parted_spec());
+    let server = parted_peer(&a).sync;
+    let mut resigned = server.handle_state_anchor(AnchorRequest { height: H });
+    let (key, address) = outsider();
+    let mut block = stored_block(&a);
+    block.sign_proposer(&key, &address);
+    let big = resigned.oversized.as_mut().expect("named");
+    big.proposer_signature = block.proposer_signature;
+    big.proposer_signer = block.proposer_signer;
+    let resigned = format!("{ANCHOR_RESP}{}", serde_json::to_string(&resigned).unwrap());
+    let checks = || COMMITMENT_CHECKS.with(|n| n.get());
+    let before = checks();
+    let shard_asks = std::cell::Cell::new(0usize);
+    let mut ask = |i: usize, msg: String| {
+        shard_asks.set(shard_asks.get() + usize::from(msg.starts_with(crate::SHARD_REQ)));
+        let reply = if i == 1 && msg.starts_with(ANCHOR_REQ) {
+            Ok(resigned.clone())
+        } else {
+            server
+                .handle_message(&msg)
+                .ok_or_else(|| "no answer".to_string())
+        };
+        async move { reply }
+    };
+    let mut anchor = AnchorBody::default();
+    let pairs = fetch_anchor(&a.cp, 2, &mut ask, &fast(), &mut anchor, Instant::now())
+        .await
+        .unwrap();
+    assert_eq!(pairs.len(), 2, "two signatures, two pairs");
+    assert!(
+        Arc::ptr_eq(&pairs[0].body, &pairs[1].body),
+        "one body for both"
+    );
+    assert!(
+        anchor
+            .body
+            .as_ref()
+            .is_some_and(|held| Arc::ptr_eq(held, &pairs[0].body)),
+        "the one held for later rounds"
+    );
+    assert_eq!(checks(), before + 1, "the body's commitments ran once");
+    // A later round shares it again: no shard is asked for, no check run.
+    let fetched = shard_asks.get();
+    assert!(fetched > 0, "positive control: the body came in shards");
+    let again = fetch_anchor(&a.cp, 2, &mut ask, &fast(), &mut anchor, Instant::now())
+        .await
+        .unwrap();
+    assert!(again.iter().all(|p| Arc::ptr_eq(&p.body, &pairs[0].body)));
+    assert_eq!(shard_asks.get(), fetched, "no shard asked for again");
+    assert_eq!(checks(), before + 1);
+    let honest = pairs
+        .iter()
+        .find(|p| p.proposer_signer == proposer().1)
+        .expect("the proposer's pair")
+        .clone();
+    let (whole, qc) = honest.into_block();
+    assert_eq!(
+        serde_json::to_string(&whole).unwrap(),
+        serde_json::to_string(&stored_block(&a)).unwrap(),
+        "the whole block under the pair's own signature"
+    );
+    assert_eq!(qc, stored_qc(&a));
+}
+
+// ===================== Round 30 witnesses =====================
+
+/// B463 witness support: the part of a `len`-byte value from `offset`, all
+/// zeros, as a peer that holds no such value answers.
+fn junk_part(len: u64, offset: u64) -> Result<String, String> {
+    let part = (len - offset).min(VALUE_PART_BYTES as u64) as usize;
+    Ok(format!(
+        "{VALUE_RESP}{}",
+        serde_json::to_string(&ValueResponse {
+            data: hex::encode(vec![0u8; part]),
+            len,
+            error: None,
+        })
+        .unwrap()
+    ))
+}
+
+/// B463 witness: a chunk turn's value parts are paced by the bytes they
+/// brought, over the whole turn, never by the length a value claims. Each
+/// part here comes 200 ms after its ask (5 MiB/s for whole parts), under a
+/// floor of 16 MiB/s past a 150 ms request timeout: the turn ends within two
+/// asks. A value claimed 32 MiB long was given 150 ms and 2 s, so eleven
+/// parts were asked; ten values claimed one part long were given 150 ms
+/// each, from their own start, so all ten were fetched (2 s).
+#[tokio::test]
+async fn a_chunk_turn_is_paced_by_the_bytes_it_brought() {
+    let patience = Patience {
+        request_timeout: Duration::from_millis(150),
+        min_bytes_per_sec: 16 << 20,
+        ..fast()
+    };
+    let parted = |key: u64, len: u64| WireEntry {
+        key: obj(key),
+        value: String::new(),
+        len,
+    };
+    let one_part = INLINE_VALUE_BYTES as u64 + 1;
+    let cases = [
+        ("a value claimed long", vec![parted(1, 32 << 20)]),
+        (
+            "values claimed one part long",
+            (1..=10).map(|k| parted(k, one_part)).collect::<Vec<_>>(),
+        ),
+    ];
+    for (case, entries) in cases {
+        let lens: std::collections::HashMap<String, u64> =
+            entries.iter().map(|e| (e.key.clone(), e.len)).collect();
+        let reply = chunk_reply(&ChunkResponse {
+            entries,
+            ..Default::default()
+        });
+        let value_asks = std::cell::Cell::new(0usize);
+        let mut ask = |_: usize, msg: String| {
+            let r = match msg.strip_prefix(VALUE_REQ) {
+                Some(json) => {
+                    value_asks.set(value_asks.get() + 1);
+                    let req: ValueRequest = serde_json::from_str(json).unwrap();
+                    std::thread::sleep(Duration::from_millis(200));
+                    junk_part(lens[&req.key], req.offset)
+                }
+                None => reply.clone(),
+            };
+            async move { r }
+        };
+        let got = ask_chunk(&mut ask, 0, H, None, &patience).await;
+        assert!(
+            matches!(got, Reply::Unanswered(_)),
+            "{case}: the turn ran as long as its claims"
+        );
+        assert!(
+            (1..=2).contains(&value_asks.get()),
+            "{case}: {} parts asked",
+            value_asks.get()
+        );
+    }
+}
+
+/// B463 witness: a peer owes the time a turn held the restore past what it
+/// delivered, and sits out a turn for each `slow_turn` of that debt; a
+/// delivery forgives it only once its deliveries paid the debt (at
+/// `MIN_TURN_UNITS_PER_SEC`). Any delivery forgave it, a quick one-leaf
+/// chunk included, so a peer alternating that with a long failed turn sat
+/// out one turn a cycle.
+#[test]
+fn a_failed_turns_time_is_owed_until_deliveries_pay_it() {
+    let secs = Duration::from_secs;
+    let mut set = PeerSet::new(2, secs(2));
+    // 30 s held, nothing brought: 30 s owed, a turn for each 2 s of it.
+    set.charge(1, secs(30), 0.0);
+    set.strike(1);
+    assert_eq!((set.penalty[1], set.sit_out[1]), (1, 15));
+    // A quick one-leaf chunk (its leaf pays 4 ms of its 10) pays none of
+    // it: no forgiveness.
+    set.charge(1, Duration::from_millis(10), 1.0);
+    set.delivered(1);
+    assert_eq!(
+        (set.penalty[1], set.sit_out[1]),
+        (1, 15),
+        "a small delivery forgave a failed turn"
+    );
+    // Another failed turn doubles the penalty and adds its time.
+    set.charge(1, secs(30), 0.0);
+    set.strike(1);
+    assert_eq!((set.penalty[1], set.sit_out[1]), (2, 30));
+    // 2,000 units in a second pay 8 s, less the second: 7 s each, so the
+    // ninth such delivery pays the 60 s owed.
+    let mut deliveries = 0;
+    while set.penalty[1] > 0 {
+        set.charge(1, secs(1), 2_000.0);
+        set.delivered(1);
+        deliveries += 1;
+        assert!(deliveries <= 9, "never forgiven");
+    }
+    assert_eq!((deliveries, set.sit_out[1]), (9, 0));
+    // Control: a peer that owes nothing is forgiven at its first delivery,
+    // and a quick turn that brought nothing (a busy answer) adds no debt.
+    set.strike(0);
+    set.charge(0, Duration::from_millis(10), 0.0);
+    set.delivered(0);
+    assert_eq!((set.penalty[0], set.sit_out[0]), (0, 0));
+}
+
+/// B463 witness: a peer that alternates a turn it holds and brings nothing
+/// with (a value claimed long, junk parts at the floor's pace) and a quick
+/// one-leaf chunk owes the first turn's time: the one-leaf chunk no longer
+/// forgives it, and its stalls come further and further apart while the
+/// honest peer carries the restore. Any delivery forgave it, so it stalled
+/// once in every three of the honest peer's turns, to the restore's end (up
+/// to about 360 times slower at the defaults: past the 24 h deadline for a
+/// state over about 475,000 leaves).
+#[tokio::test]
+async fn a_peer_alternating_stalls_and_single_leaves_loses_its_turns() {
+    let g = genesis();
+    let a = chain("b463_alternate_a", MEMBER);
+    let client = temp_db("b463_alternate_client");
+    let honest = peer(&a, Behaviour::Honest).sync;
+    let hostile = peer(&a, Behaviour::Honest).sync;
+    let judged = RestorePlan {
+        patience: Patience {
+            request_timeout: Duration::from_millis(600),
+            min_bytes_per_sec: 32 << 20,
+            slow_turn: Duration::from_millis(200),
+            ..fast()
+        },
+        ..plan(&a.cp, &g, false)
+    };
+    let claimed = 32u64 << 20;
+    let (mut hostile_turns, mut stalls, mut honest_turns) = (0usize, 0usize, 0usize);
+    run_with(&client, &judged, 2, |i, msg| {
+        let server = if i == 0 { &honest } else { &hostile };
+        if let (1, Some(json)) = (i, msg.strip_prefix(VALUE_REQ)) {
+            let offset = serde_json::from_str::<ValueRequest>(json).unwrap().offset;
+            std::thread::sleep(Duration::from_millis(300));
+            return junk_part(claimed, offset);
+        }
+        let Some(json) = msg.strip_prefix(CHUNK_REQ) else {
+            return server.handle_message(msg).ok_or("no answer".into());
+        };
+        let mut request: ChunkRequest = serde_json::from_str(json).unwrap();
+        request.max = 1;
+        if i == 0 {
+            honest_turns += 1;
+        } else {
+            hostile_turns += 1;
+            if !hostile_turns.is_multiple_of(2) {
+                stalls += 1;
+                return chunk_reply(&ChunkResponse {
+                    entries: vec![WireEntry {
+                        key: obj(0),
+                        value: String::new(),
+                        len: claimed,
+                    }],
+                    ..Default::default()
+                });
+            }
+        }
+        chunk_reply(&server.handle_state_chunk(request))
+    })
+    .await
+    .unwrap();
+    assert!(
+        stalls <= 6,
+        "{stalls} stalls, the honest peer's turns {honest_turns}"
+    );
+    assert!(
+        honest_turns >= 20,
+        "positive control: the honest peer carried it ({honest_turns} turns)"
+    );
+    assert_restored(&client, &a);
+}
+
+/// B471 witness: a chunk reads no more bytes than its grant pays for (a
+/// unit a `UNIT_BYTES`), but the leaf that ends it: it ends before a leaf
+/// whose value takes the read past the grant, parted values included, and
+/// is charged what it read. Each value was read whole and a chunk ended only
+/// at the protocol's limits (512 MiB parted), charged one client-second.
+#[test]
+fn a_chunk_reads_no_more_than_its_grant_pays_for() {
+    let big = INLINE_VALUE_BYTES + 1;
+    let extra = (100..120).map(|i| (obj(i), vec![b'g'; big])).collect();
+    let a = chain_with(
+        "b471_reads_a",
+        Spec {
+            extra,
+            ..Spec::default()
+        },
+    );
+    let sync = peer(&a, Behaviour::Honest).sync;
+    let reader = Some("10.0.0.71");
+    let max = 300;
+    let chunk = sync.serve_state_chunk(
+        ChunkRequest {
+            version: H,
+            after: None,
+            max,
+        },
+        reader,
+    );
+    assert!(chunk.error.is_none(), "{:?}", chunk.error);
+    let served = chunk.entries.len();
+    // What it read: the leaves served and the one that ended the chunk.
+    let (visited, _) = state_commit::chunk(&a.db, H, None, served + 1)
+        .unwrap()
+        .unwrap();
+    let read: u64 = visited.iter().map(|(_, v)| v.len() as u64).sum();
+    let readable = max as u64 * UNIT_BYTES;
+    assert!(
+        read <= readable + big as u64,
+        "{read} bytes read for a grant of {max} units ({served} leaves of {})",
+        a.state.len()
+    );
+    assert!(
+        read > readable && served < a.state.len(),
+        "vacuous: the grant did not end the chunk ({read} bytes)"
+    );
+    assert_eq!(
+        sync.state_budget.balance(reader),
+        STATE_SERVE_UNITS_PER_SEC_PER_CLIENT - served as f64 - read.div_ceil(UNIT_BYTES) as f64,
+        "charged a unit a leaf served and a unit a `UNIT_BYTES` read"
+    );
+}
+
+/// B472 witness: on V4 the checkpoint block's signer is a member of its
+/// epoch's committee, by the rule sync checks a block's signer by
+/// (`eligible_proposers`: C_E(h)). The restored active set was accepted
+/// too, so a block signed by an active validator outside C_E was stored,
+/// and no block-syncing client could take it from the restored node.
+#[test]
+fn a_v4_anchor_signer_is_a_member_of_its_committee() {
+    let client = temp_db("b472_signer_client");
+    let members = committee_of([9; 32], 3);
+    {
+        let _seed = client.seeding();
+        client.put(consensus::v4::VERTEX_FORMAT_KEY, "4").unwrap();
+        client
+            .put(
+                "sys:validators",
+                &serde_json::to_string(&vec![(proposer().1, 100u64)]).unwrap(),
+            )
+            .unwrap();
+    }
+    assert!(consensus::v4::is_v4_chain(&client));
+    assert!(
+        client
+            .get_active_validators()
+            .iter()
+            .any(|(address, _)| *address == proposer().1),
+        "vacuous: the signer is no active validator"
+    );
+    assert!(
+        signed_by_a_validator(&client, &members, &members[0].address),
+        "a member of C_E"
+    );
+    assert!(
+        !signed_by_a_validator(&client, &members, &proposer().1),
+        "an active validator outside C_E"
+    );
+}
+
+/// B472 witness, end to end: on V4 the anchor pair an active validator
+/// outside C_E re-signed is not the one stored, though it is offered first;
+/// the pair C_E's member signed is.
+#[tokio::test]
+async fn a_v4_anchor_signed_outside_its_committee_is_not_stored() {
+    let g = genesis();
+    let later = [8u8; 32];
+    let a = chain_with(
+        "b472_resign_a",
+        Spec {
+            signer: later,
+            epoch_one: Some(later),
+            v4: true,
+            validators: vec![outsider().1],
+            ..Spec::default()
+        },
+    );
+    let client = temp_db("b472_resign_client");
+    let mut byz = peer(&a, Behaviour::Honest);
+    let mut honest = peer(&a, Behaviour::Honest);
+    let (key, address) = outsider();
+    let mut block = stored_block(&a);
+    block.sign_proposer(&key, &address);
+    let byz_anchor = format!(
+        "{ANCHOR_RESP}{}",
+        serde_json::to_string(&AnchorResponse {
+            block: Some(block.clone()),
+            quorum_certificate: Some(stored_qc(&a)),
+            oversized: None,
+            error: None,
+        })
+        .unwrap()
+    );
+    run_with(&client, &plan(&a.cp, &g, false), 2, |i, msg| {
+        if i == 0 && msg.starts_with(ANCHOR_REQ) {
+            Ok(byz_anchor.clone())
+        } else if i == 0 {
+            serve(&mut byz, msg)
+        } else {
+            serve(&mut honest, msg)
+        }
+    })
+    .await
+    .unwrap();
+    let stored: Block =
+        serde_json::from_str(&client.get(&format!("block_{H}")).unwrap().unwrap()).unwrap();
+    assert_eq!(stored.proposer_signer, proposer().1, "the member's pair");
+    assert!(
+        client
+            .get_active_validators()
+            .iter()
+            .any(|(v, _)| *v == address),
+        "vacuous: the re-signer is no active validator"
+    );
+    assert!(
+        ChainSync::verify_proposer_signature_in(&client, &block).is_ok(),
+        "positive control: the re-signed block's signature verifies"
+    );
+    assert_restored(&client, &a);
+}
+
+/// B466 witness: a restore's refusals of a peer's text are logged cut and
+/// escaped (`loggable`), and the error boot prints carries it cut: a chunk
+/// whose key is past the protocol's limits (its refusal names the key), and
+/// a peer that refuses every chunk with its own text (logged at each
+/// strike, and returned once the restore gives up). Each was printed whole,
+/// megabytes a line, line breaks included (a forged log line).
+#[tokio::test]
+async fn a_peers_text_is_logged_and_returned_cut() {
+    let g = genesis();
+    let a = chain("b466_cut_a", MEMBER);
+    let client = temp_db("b466_cut_client");
+    let mut honest = peer(&a, Behaviour::Honest);
+    let forged = format!("x\n🚨 [DE-6] a forged alarm line {}", "e".repeat(5 << 20));
+    let long_key = WireEntry {
+        key: forged.clone(),
+        value: hex::encode(b"v"),
+        len: 1,
+    };
+    crate::take_logged();
+    let err = run_with(&client, &plan(&a.cp, &g, false), 2, |i, msg| {
+        if !msg.starts_with(CHUNK_REQ) {
+            return serve(&mut honest, msg);
+        }
+        if i == 0 {
+            return chunk_reply(&ChunkResponse {
+                entries: vec![long_key.clone()],
+                ..Default::default()
+            });
+        }
+        chunk_reply(&ChunkResponse {
+            error: Some(forged.clone()),
+            ..Default::default()
+        })
+    })
+    .await
+    .unwrap_err();
+    let cut = |text: &str| text.chars().count() <= 400 && !text.contains('\n');
+    assert!(cut(err.as_str()), "returned whole: {}", err.len());
+    assert!(err.contains("x\\n"), "control: the peer's text, escaped: {err}");
+    let logged = crate::take_logged();
+    for line in &logged {
+        assert!(cut(line.as_str()), "logged whole: {} bytes", line.len());
+    }
+    for what in ["broke the protocol", "gave no answer"] {
+        assert!(
+            logged.iter().any(|l| l.contains(what) && l.contains("x\\n")),
+            "vacuous: no {what} line"
+        );
+    }
 }

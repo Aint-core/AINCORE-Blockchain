@@ -49,8 +49,9 @@ use consensus::DagConsensus;
 use storage::StateDB;
 
 fn permissive_cors_enabled() -> bool {
+    // B370: the values `env_check` takes, in any case.
     std::env::var("AINCORE_PERMISSIVE_CORS")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(false)
 }
 
@@ -745,6 +746,8 @@ pub struct AppState {
     pub reads: Arc<AtomicUsize>,
     /// B220: the heavy calls waiting for a slot, in arrival order.
     queues: HeavyQueues,
+    /// B475: the transaction bytes each network group may send.
+    sends: SendBudget,
     /// B241: the recent TPS and the height it was computed at.
     tps: Arc<Mutex<Option<(u64, f64)>>>,
 }
@@ -796,6 +799,46 @@ fn heavy_group(client: std::net::IpAddr) -> std::net::IpAddr {
     }
 }
 
+/// B475: what `aincore_sendTransaction` costs its client's network group
+/// (`heavy_group`): the transaction's bytes at `TX_SUBMIT`'s price and
+/// burst (`sessions::TX_SUBMIT_BYTES_PER_SEC`, at least 324 bytes a
+/// signature check), spent before anything of it is parsed or checked. A
+/// send ran the whole stateless admission (four parses, a signature or two
+/// over up to 100 KiB) on an RPC worker, priced only by the request count
+/// of an address or a /64, so one host with a /48 kept every worker
+/// verifying junk for free, where a forwarding host pays `TX_SUBMIT` by
+/// its bytes.
+struct SendBudget(Mutex<node::sessions::Budget<std::net::IpAddr>>);
+
+impl Default for SendBudget {
+    fn default() -> Self {
+        Self(Mutex::new(node::sessions::Budget::new(
+            node::sessions::TX_SUBMIT_BYTES_PER_SEC,
+            node::sessions::TX_SUBMIT_BYTE_BURST,
+        )))
+    }
+}
+
+impl SendBudget {
+    /// Spend `len` bytes of `client`'s network group's quota at `now`;
+    /// false (nothing spent) when it holds fewer. A call with no client (in
+    /// process) is not charged.
+    fn admit(
+        &self,
+        client: Option<std::net::IpAddr>,
+        len: usize,
+        now: std::time::Instant,
+    ) -> bool {
+        let Some(client) = client else {
+            return true;
+        };
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .spend_amount(&heavy_group(client), len as f64, now)
+    }
+}
+
 /// B220/B253: a heavy call's turn: its group's gate and a pool's slot.
 struct HeavyTurn {
     _gate: Option<tokio::sync::OwnedSemaphorePermit>,
@@ -841,7 +884,9 @@ impl HeavyQueues {
 /// Move up to MAX_GAS_LIMIT; two at most leave the node's other cores to
 /// consensus whatever the request rate (geth bounds `eth_estimateGas` by a
 /// gas cap and a timeout for the same reason). B175: and the QC
-/// verifications not remembered.
+/// verifications not remembered. B447: an estimate runs on a thread of its
+/// own (`vm_move::on_dry_run_thread`), never on the VM threads a block's
+/// sessions wait for.
 const DRY_RUNS_AT_ONCE: usize = 2;
 
 /// B197/B220: the reads whose work one request does not bound
@@ -1026,41 +1071,89 @@ fn held_block(storage: &StateDB, height: u64) -> Result<blockchain::Block, JsonR
     })
 }
 
-/// The body extension of a held block. A client samples a few indices of one
-/// block in a row, so the last few extensions are kept: an extension costs a
-/// Reed-Solomon encode of the whole body.
-fn extended_body(block: &blockchain::Block) -> Result<Arc<da::Extended>, JsonRpcError> {
-    const KEEP: usize = 4;
-    type Recent = Mutex<std::collections::VecDeque<(String, Arc<da::Extended>)>>;
-    static RECENT: std::sync::OnceLock<Recent> = std::sync::OnceLock::new();
-    let recent = RECENT.get_or_init(Default::default);
-    let hash = &block.header.hash;
-    if let Some((_, ext)) = recent
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .iter()
-        .find(|(h, _)| h == hash)
-    {
-        return Ok(Arc::clone(ext));
+/// B347: the bytes of body extensions kept for sampling (a choice: a few
+/// blocks of the default size; four whole extensions were kept, up to 4 GiB).
+const DA_KEEP_BYTES: usize = 256 << 20;
+
+/// The body extension of held block `height` (B1), with the block's hash and
+/// DA root. A client samples a few indices of one block in a row, so recent
+/// extensions are kept: an extension costs a Reed-Solomon encode of the whole
+/// body. B347: kept by height and found before the block is read (a hit read
+/// and parsed the whole block first), within `DA_KEEP_BYTES`, and built one
+/// at a time, the next build waiting three times the last one's cost: a
+/// client alternating heights rebuilt a whole extension (up to 1.5 GiB held,
+/// ~70 s of a Pi's cores at 512 MiB) every call.
+fn extended_body(
+    storage: &StateDB,
+    height: u64,
+) -> Result<(String, String, Arc<da::Extended>), JsonRpcError> {
+    type Entry = (u64, String, String, Arc<da::Extended>, usize);
+    #[derive(Default)]
+    struct Kept {
+        entries: std::collections::VecDeque<Entry>,
+        bytes: usize,
+        due: Option<std::time::Instant>,
     }
-    let ext = Arc::new(da::Extended::new(&block.body_bytes()));
+    static KEPT: std::sync::OnceLock<Mutex<Kept>> = std::sync::OnceLock::new();
+    static BUILDING: Mutex<()> = Mutex::new(());
+    let kept = KEPT.get_or_init(Default::default);
+    let hit = |kept: &Mutex<Kept>| {
+        kept.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entries
+            .iter()
+            .find(|e| e.0 == height)
+            .map(|e| (e.1.clone(), e.2.clone(), Arc::clone(&e.3)))
+    };
+    if let Some(found) = hit(kept) {
+        return Ok(found);
+    }
+    let busy = || JsonRpcError {
+        code: -32005,
+        message: "busy: another block's DA extension is being built; ask again".into(),
+    };
+    let Ok(_building) = BUILDING.try_lock() else {
+        return Err(busy());
+    };
+    if let Some(found) = hit(kept) {
+        return Ok(found);
+    }
+    let due = kept.lock().unwrap_or_else(|p| p.into_inner()).due;
+    if due.is_some_and(|at| std::time::Instant::now() < at) {
+        return Err(busy());
+    }
+    let started = std::time::Instant::now();
+    let block = held_block(storage, height)?;
+    let body = block.body_bytes();
+    let ext = Arc::new(da::Extended::new(&body));
     // A held block passed check_commitments; a mismatch is local corruption,
     // and samples from it would not verify. Refuse rather than serve them.
     if ext.root() != block.header.da_root {
         return Err(JsonRpcError {
             code: -32000,
-            message: format!(
-                "held block {} does not match its DA root",
-                block.header.height
-            ),
+            message: format!("held block {height} does not match its DA root"),
         });
     }
-    let mut recent = recent.lock().unwrap_or_else(|p| p.into_inner());
-    if recent.len() == KEEP {
-        recent.pop_front();
+    let size = body.len().saturating_mul(2);
+    let mut kept = kept.lock().unwrap_or_else(|p| p.into_inner());
+    kept.due = Some(std::time::Instant::now() + started.elapsed() * 3);
+    if size <= DA_KEEP_BYTES {
+        kept.entries.push_back((
+            height,
+            block.header.hash.clone(),
+            block.header.da_root.clone(),
+            Arc::clone(&ext),
+            size,
+        ));
+        kept.bytes = kept.bytes.saturating_add(size);
+        while kept.bytes > DA_KEEP_BYTES {
+            let Some(oldest) = kept.entries.pop_front() else {
+                break;
+            };
+            kept.bytes = kept.bytes.saturating_sub(oldest.4);
+        }
     }
-    recent.push_back((hash.clone(), Arc::clone(&ext)));
-    Ok(ext)
+    Ok((block.header.hash, block.header.da_root, ext))
 }
 
 fn try_consensus(
@@ -1171,67 +1264,9 @@ fn handle_rpc_method(
                  Err(JsonRpcError { code: -32602, message: "Invalid params".into() })
              }
         },
-        "aincore_sendTransaction" => {
-            // params: [signed_tx_json_string OR signed_tx_object]
-            //
-            // Phase 5B.11 / PWN-007: canonicalization moved to the mempool
-            // layer (Mempool::canonical_tx_hash) so dedup is consistent
-            // across ALL entry points (this RPC, api.rs, P2P TX inbound).
-            // The API layer just forwards a serialised string; correctness
-            // does not depend on whether the encoding was already canonical.
-            let tx_str_opt = if let Some(val) = params.get(0) {
-                if val.is_string() {
-                    val.as_str().map(|s| s.to_string())
-                } else if val.is_object() {
-                    serde_json::to_string(val).ok()
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            if let Some(tx_str) = tx_str_opt {
-                // B54: the signature and proof checks run before the mempool
-                // lock (the consensus tick needs it); under it, only the
-                // stateful gates. B173: a copy of one the mempool has seen
-                // is refused before its signature is checked.
-                let (tx_str, checked) = node::forward::check_from_outside(&data.mempool, vec![tx_str])
-                    .pop()
-                    .unwrap_or_else(|| Err("nothing to check".to_string()))
-                    .map_err(|reason| JsonRpcError {
-                        code: -32010,
-                        message: format!("Transaction rejected by mempool: {}", reason),
-                    })?;
-                // B259: a waiting consensus thread goes first.
-                mempool::yield_to_consensus();
-                let mut mempool = data.mempool.lock()
-                    .map_err(|e| JsonRpcError { code: -32000, message: format!("Mempool lock error: {}", e) })?;
-                // `tx_hash` is the key this transaction can be LOOKED UP by: blocks
-                // index a transaction under `StateDB::raw_tx_hash` of the exact
-                // string submitted. The mempool's own hash covers the signed
-                // fields -- right for deduplication, but nothing is stored under
-                // it, so returning it meant a client's receipt lookup said
-                // "pending" forever. It is still returned, as `canonical_hash`.
-                // B73: of the canonical encoding, the one the mempool keeps and
-                // blocks carry.
-                let lookup_hash =
-                    StateDB::raw_tx_hash(&executor::admission::canonical_json(&checked.tx));
-                match mempool.add_checked(tx_str, checked) {
-                    Ok(canonical_hash) => Ok(serde_json::json!({
-                        "status": "sent",
-                        "tx_hash": lookup_hash,
-                        "canonical_hash": canonical_hash,
-                    })),
-                    Err(reason) => Err(JsonRpcError {
-                        code: -32010,
-                        message: format!("Transaction rejected by mempool: {}", reason),
-                    }),
-                }
-            } else {
-                Err(JsonRpcError { code: -32602, message: "Invalid params: Expected JSON string or object".into() })
-            }
-        },
+        // B475: through `json_rpc_handler`, `send_charged` (its bytes charged
+        // to its client's network group first).
+        "aincore_sendTransaction" => send_param(&params).and_then(|tx| send_transaction(data, tx)),
         "submit_transaction_with_key" => {
             Err(JsonRpcError {
                 code: -32040,
@@ -1547,10 +1582,7 @@ fn handle_rpc_method(
                     println!("❌ [RPC] Failed to parse latest_height '{}': {}", h, e);
                     0
                 }),
-                Ok(None) => {
-                    println!("⚠️ [RPC] latest_height key not found in storage");
-                    0
-                }
+                Ok(None) => 0,
                 Err(e) => {
                     println!("❌ [RPC] Storage error reading latest_height: {}", e);
                     0
@@ -1564,27 +1596,20 @@ fn handle_rpc_method(
             let mut blocks = Vec::new();
             match start_height_param {
                 Some(start_height) => {
+                    // B327: a request is logged only with AINCORE_LOG_RPC=1
+                    // (the request line, `request_log_line`).
                     if start_height == 0 || start_height > latest_height {
-                        println!(
-                            "🔍 [RPC] getBlocks range: start={} out of range (latest={})",
-                            start_height, latest_height
-                        );
                         return Ok(serde_json::json!(blocks));
                     }
                     let end_height = std::cmp::min(
                         start_height.saturating_add(limit).saturating_sub(1),
                         latest_height,
                     );
-                    println!(
-                        "🔍 [RPC] getBlocks range: {}..={} (latest={})",
-                        start_height, end_height, latest_height
-                    );
                     // B54: the answer stops at MAX_BLOCKS_BYTES; the caller
                     // asks again from the next height.
                     blocks = blocks_within_budget(&data.storage, start_height..=end_height);
                 }
                 None => {
-                    println!("🔍 [RPC] getBlocks latest: head={} limit={}", latest_height, limit);
                     let start_index = latest_height.saturating_sub(limit);
                     blocks = blocks_within_budget(
                         &data.storage,
@@ -2029,60 +2054,8 @@ fn handle_rpc_method(
             }))
         },
 
-        "aincore_getTransactionReceipt" => {
-            // params: [tx_hash]
-            if let Some(tx_hash) = params.get(0).and_then(|v| v.as_str()) {
-                let execution_receipt = stored_tx_receipt(&data.storage, tx_hash);
-                // Use indexed lookup (O(1))
-                if let Some(block_height) = data.storage.get_tx_block_height(tx_hash) {
-                    let block_hash = block_hash_at(&data.storage, block_height, &data.reads)?;
-                    let latest_height = data.storage.get_chain_height();
-                    let confirmations = latest_height.saturating_sub(block_height);
-                    let status = execution_receipt
-                        .as_ref()
-                        .and_then(|receipt| receipt.get("status"))
-                        .and_then(|status| status.as_str())
-                        .unwrap_or("confirmed");
-
-                    Ok(serde_json::json!({
-                        "tx_hash": tx_hash,
-                        "block_height": block_height,
-                        "confirmations": confirmations,
-                        "status": status,
-                        "execution_receipt": execution_receipt,
-                        "block_hash": block_hash.unwrap_or_default()
-                    }))
-                } else if let Some(receipt) = execution_receipt {
-                    let status = receipt
-                        .get("status")
-                        .and_then(|status| status.as_str())
-                        .unwrap_or("executed");
-                    Ok(serde_json::json!({
-                        "tx_hash": tx_hash,
-                        "status": status,
-                        "confirmations": 0,
-                        "execution_receipt": receipt
-                    }))
-                } else {
-                    // Pending only if THIS transaction is still waiting. The old
-                    // check was "is the mempool non-empty", which reported every
-                    // unknown hash as pending whenever anyone had a tx queued.
-                    let in_mempool = data
-                        .mempool
-                        .lock()
-                        .map(|mp| mp.pending_with_raw_hash(tx_hash).is_some())
-                        .unwrap_or(false);
-
-                    Ok(serde_json::json!({
-                        "tx_hash": tx_hash,
-                        "status": if in_mempool { "pending" } else { "not_found" },
-                        "confirmations": 0
-                    }))
-                }
-            } else {
-                Err(JsonRpcError { code: -32602, message: "Invalid params: [tx_hash]".into() })
-            }
-        },
+        // B427: run off the worker, with its client, by `json_rpc_handler`.
+        RECEIPT_METHOD => transaction_receipt(data, &params, None),
 
         "aincore_estimateGas" => {
             // params: [tx_object] or [payload_string].
@@ -2273,8 +2246,7 @@ fn handle_rpc_method(
                 return Err(JsonRpcError { code: -32602, message: "Invalid params: [height, index]".into() });
             };
             let _slot = read_slot(data, "aincore_sampleDA")?;
-            let block = held_block(&data.storage, height)?;
-            let extended = extended_body(&block)?;
+            let (block_hash, da_root, extended) = extended_body(&data.storage, height)?;
             let sample = extended.sample(index).ok_or_else(|| JsonRpcError {
                 code: -32602,
                 message: format!(
@@ -2284,15 +2256,10 @@ fn handle_rpc_method(
             })?;
             Ok(serde_json::json!({
                 "height": height,
-                "block_hash": block.header.hash,
-                "da_root": block.header.da_root,
+                "block_hash": block_hash,
+                "da_root": da_root,
                 "sample": sample,
             }))
-        },
-
-        "aincore_getFederationKey" => {
-            let key = data.storage.get_federation_key();
-            Ok(serde_json::json!({ "federation_key": key }))
         },
 
         "aincore_getTransactionsByAddress" => {
@@ -2357,92 +2324,19 @@ fn handle_rpc_method(
             }
         },
 
-        // ============ ADVANCED CRYPTO ENDPOINTS ============
-
-        "aincore_verifyMultiSig" => {
-            // params: [scheme (0=Ed25519, 1=Dilithium5, 2=Secp256k1), public_key_hex, message_hex, signature_hex]
-            if let (Some(scheme_id), Some(pubkey_hex), Some(msg_hex), Some(sig_hex)) = (
-                params.get(0).and_then(|v| v.as_u64()),
-                params.get(1).and_then(|v| v.as_str()),
-                params.get(2).and_then(|v| v.as_str()),
-                params.get(3).and_then(|v| v.as_str())
-            ) {
-                let pubkey = hex::decode(pubkey_hex).unwrap_or_default();
-                let message = hex::decode(msg_hex).unwrap_or_default();
-                let signature = hex::decode(sig_hex).unwrap_or_default();
-
-                use crypto::multi_sig::{MultiSigVerifier, SignatureScheme};
-                let verifier = MultiSigVerifier::new();
-
-                let scheme = match scheme_id {
-                    0 => Some(SignatureScheme::Ed25519),
-                    1 => Some(SignatureScheme::MlDsa65),
-                    2 => Some(SignatureScheme::Secp256k1),
-                    _ => None,
-                };
-
-                if let Some(s) = scheme {
-                    match verifier.verify(s, &pubkey, &message, &signature) {
-                        Ok(valid) => Ok(serde_json::json!({
-                            "valid": valid,
-                            "scheme": format!("{:?}", s)
-                        })),
-                        Err(e) => Ok(serde_json::json!({
-                            "valid": false,
-                            "error": format!("{}", e)
-                        }))
-                    }
-                } else {
-                    Err(JsonRpcError { code: -32602, message: "Invalid scheme: 0=Ed25519, 1=ML-DSA-65, 2=Secp256k1".into() })
-                }
-            } else {
-                Err(JsonRpcError { code: -32602, message: "Invalid params: [scheme, pubkey_hex, message_hex, signature_hex]".into() })
-            }
-        },
-
         // B47: `aincore_verifyVDF` (client-sized work: 2^64 - 1 iterations
         // aborted the node), `aincore_verifyProof` (answered "proof_accepted"
         // for any bytes) and `aincore_aggregateBLS` (a placeholder) are gone:
-        // nothing on chain uses them.
-        "aincore_ecdsaVerify" => {
-            // params: [public_key_hex, message_hex, signature_hex]
-            if let (Some(pubkey_hex), Some(msg_hex), Some(sig_hex)) = (
-                params.get(0).and_then(|v| v.as_str()),
-                params.get(1).and_then(|v| v.as_str()),
-                params.get(2).and_then(|v| v.as_str())
-            ) {
-                let pubkey_bytes = hex::decode(pubkey_hex).unwrap_or_default();
-                let message = hex::decode(msg_hex).unwrap_or_default();
-                let signature = hex::decode(sig_hex).unwrap_or_default();
-
-                use crypto::ECDSACrypto;
-                let crypto = ECDSACrypto::new();
-
-                if let Ok(pubkey) = crypto.public_key_from_bytes(&pubkey_bytes) {
-                    match crypto.verify(&pubkey, &message, &signature) {
-                        Ok(valid) => Ok(serde_json::json!({
-                            "valid": valid,
-                            "scheme": "secp256k1"
-                        })),
-                        Err(e) => Ok(serde_json::json!({
-                            "valid": false,
-                            "error": format!("{}", e)
-                        }))
-                    }
-                } else {
-                    Ok(serde_json::json!({
-                        "valid": false,
-                        "error": "Invalid public key format"
-                    }))
-                }
-            } else {
-                Err(JsonRpcError { code: -32602, message: "Invalid params: [pubkey_hex, message_hex, signature_hex]".into() })
-            }
-        },
-
+        // nothing on chain uses them. B336: nor `aincore_verifyMultiSig` and
+        // `aincore_ecdsaVerify`, which hashed up to a request's megabyte of a
+        // client's bytes per light call.
         "aincore_deriveAddress" => {
-            // params: [public_key_hex]
-            if let Some(pubkey_hex) = params.get(0).and_then(|v| v.as_str()) {
+            // params: [public_key_hex]. B336: only a key of a transaction
+            // scheme's size is hashed (any length was, up to the request's
+            // megabyte, on a light call).
+            if let Some(pubkey_hex) = params.get(0).and_then(|v| v.as_str()).filter(|hex| {
+                [32, crypto::tx_sig::ML_DSA_65_PUBLIC_KEY_BYTES].contains(&(hex.len() / 2))
+            }) {
                 let pubkey_bytes = hex::decode(pubkey_hex).unwrap_or_default();
                 match crypto::derive_address(&pubkey_bytes) {
                     Ok(address) => Ok(serde_json::json!({
@@ -2494,9 +2388,98 @@ fn handle_rpc_method(
     }
 }
 
+/// B475: `aincore_sendTransaction`'s name, sent through `send_charged`.
+const SEND_METHOD: &str = "aincore_sendTransaction";
+
+/// `aincore_sendTransaction`'s transaction: params `[signed_tx_json_string
+/// OR signed_tx_object]` (an object serialized).
+///
+/// Phase 5B.11 / PWN-007: canonicalization moved to the mempool layer
+/// (Mempool::canonical_tx_hash) so dedup is consistent across ALL entry
+/// points (this RPC, api.rs, P2P TX inbound). The API layer just forwards
+/// a serialised string; correctness does not depend on whether the
+/// encoding was already canonical.
+fn send_param(params: &serde_json::Value) -> Result<String, JsonRpcError> {
+    let tx = match params.get(0) {
+        Some(serde_json::Value::String(tx)) => Some(tx.clone()),
+        Some(val) if val.is_object() => serde_json::to_string(val).ok(),
+        _ => None,
+    };
+    tx.ok_or_else(|| JsonRpcError {
+        code: -32602,
+        message: "Invalid params: Expected JSON string or object".into(),
+    })
+}
+
+/// `aincore_sendTransaction` of `tx_str`.
+fn send_transaction(
+    data: &AppState,
+    tx_str: String,
+) -> Result<serde_json::Value, JsonRpcError> {
+    // B54: the signature and proof checks run before the mempool lock (the
+    // consensus tick needs it); under it, only the stateful gates. B173: a
+    // copy of one the mempool has seen is refused before its signature is
+    // checked.
+    let (tx_str, checked) = node::forward::check_from_outside(&data.mempool, vec![tx_str])
+        .pop()
+        .unwrap_or_else(|| Err("nothing to check".to_string()))
+        .map_err(|reason| JsonRpcError {
+            code: -32010,
+            message: format!("Transaction rejected by mempool: {}", reason),
+        })?;
+    // B259: a waiting consensus thread goes first.
+    mempool::yield_to_consensus();
+    let mut mempool = data.mempool.lock().map_err(|e| JsonRpcError {
+        code: -32000,
+        message: format!("Mempool lock error: {}", e),
+    })?;
+    // `tx_hash` is the key this transaction can be LOOKED UP by: blocks
+    // index a transaction under `StateDB::raw_tx_hash` of the exact string
+    // submitted. The mempool's own hash covers the signed fields -- right
+    // for deduplication, but nothing is stored under it, so returning it
+    // meant a client's receipt lookup said "pending" forever. It is still
+    // returned, as `canonical_hash`. B73: of the canonical encoding, the one
+    // the mempool keeps and blocks carry.
+    let lookup_hash = StateDB::raw_tx_hash(&executor::admission::canonical_json(&checked.tx));
+    match mempool.add_checked(tx_str, checked) {
+        Ok(canonical_hash) => Ok(serde_json::json!({
+            "status": "sent",
+            "tx_hash": lookup_hash,
+            "canonical_hash": canonical_hash,
+        })),
+        Err(reason) => Err(JsonRpcError {
+            code: -32010,
+            message: format!("Transaction rejected by mempool: {}", reason),
+        }),
+    }
+}
+
+/// B475: `aincore_sendTransaction` for `client`: its transaction's bytes
+/// are spent from the client's network group's quota (`SendBudget`) at
+/// `now` before anything of it is parsed or checked (an object param is
+/// serialized to be measured, as the send would), and the send is busy
+/// (-32005) when the quota holds fewer.
+fn send_charged(
+    data: &AppState,
+    params: &serde_json::Value,
+    client: Option<std::net::IpAddr>,
+    now: std::time::Instant,
+) -> Result<serde_json::Value, JsonRpcError> {
+    let tx_str = send_param(params)?;
+    if !data.sends.admit(client, tx_str.len(), now) {
+        return Err(JsonRpcError {
+            code: -32005,
+            message: format!(
+                "{SEND_METHOD}: this network group's transaction bytes are spent for now; retry"
+            ),
+        });
+    }
+    send_transaction(data, tx_str)
+}
+
 /// B59/B176: what a request logs: bounded prefixes of its method and its
-/// params (a request may carry 2 MiB of either; the method was logged
-/// whole).
+/// params (a request may carry `RPC_BODY_LIMIT` of either; the method was
+/// logged whole).
 fn request_log_line(method: &str, params: &serde_json::Value) -> String {
     let method: String = method.chars().take(64).collect();
     let shown: String = params.to_string().chars().take(256).collect();
@@ -2509,13 +2492,35 @@ fn log_rpc_requests() -> bool {
     *ON.get_or_init(|| std::env::var("AINCORE_LOG_RPC").as_deref() == Ok("1"))
 }
 
+/// B428: the largest `/rpc` body: the largest request is one transaction
+/// (`aincore_sendTransaction`, `aincore_estimateGas`; a module published is
+/// in its transaction's bytes), at most `MAX_TX_BYTES` (100 KiB) of JSON
+/// text. Sent as a JSON string, each of its bytes is escaped to at most two
+/// (`"`, `\`, and the whitespace `\t`, `\n`, `\r`, the only control bytes
+/// JSON text holds): 200 KiB, plus an envelope of well under 1 KiB; 256 KiB
+/// leaves 55 KiB over. It was 2 MiB, parsed into a value tree on the worker
+/// whatever the method, and the rate limit counts requests, not bytes.
+const RPC_BODY_LIMIT: usize = 256 * 1024;
+
+const _: () = assert!(RPC_BODY_LIMIT >= 2 * executor::admission::MAX_TX_BYTES + 1024);
+
+/// B428: the `/rpc` body's bound (`RPC_BODY_LIMIT`), checked before the body
+/// is parsed.
+fn rpc_json_config() -> web::JsonConfig {
+    web::JsonConfig::default().limit(RPC_BODY_LIMIT)
+}
+
 async fn json_rpc_handler(
     http: actix_web::HttpRequest,
     req: web::Json<JsonRpcRequest>,
     data: web::Data<AppState>,
 ) -> impl Responder {
-    let method = req.method.as_str();
-    let params = req.params.clone().unwrap_or(serde_json::Value::Null);
+    // B428: taken by value: the whole params tree was copied on the worker.
+    let JsonRpcRequest {
+        method, params, id, ..
+    } = req.into_inner();
+    let method = method.as_str();
+    let params = params.unwrap_or(serde_json::Value::Null);
 
     // B306: a line a request (~350 B) at 100 requests a second per client
     // filled a disk; logged only with `AINCORE_LOG_RPC=1`.
@@ -2532,6 +2537,19 @@ async fn json_rpc_handler(
         let client = data.client_ip.as_ref().and_then(|c| c.address_of(&http));
         let state = data.clone();
         web::block(move || stored_certificate(&state, &params, client))
+            .await
+            .unwrap_or_else(|_| {
+                Err(JsonRpcError {
+                    code: -32603,
+                    message: format!("{method} failed"),
+                })
+            })
+    } else if method == RECEIPT_METHOD {
+        // B427: off the worker, its block's header read on its client's
+        // turn (`receipt_header_turn`).
+        let client = data.client_ip.as_ref().and_then(|c| c.address_of(&http));
+        let state = data.clone();
+        web::block(move || transaction_receipt(&state, &params, client))
             .await
             .unwrap_or_else(|_| {
                 Err(JsonRpcError {
@@ -2568,6 +2586,10 @@ async fn json_rpc_handler(
                 }),
             },
         }
+    } else if method == SEND_METHOD {
+        // B475: its bytes charged to its client's network group first.
+        let client = data.client_ip.as_ref().and_then(|c| c.address_of(&http));
+        send_charged(&data, &params, client, std::time::Instant::now())
     } else {
         handle_rpc_method(method, params, &data)
     };
@@ -2577,13 +2599,13 @@ async fn json_rpc_handler(
             jsonrpc: "2.0".to_string(),
             result: Some(res),
             error: None,
-            id: req.id.clone(),
+            id,
         },
         Err(err) => JsonRpcResponse {
             jsonrpc: "2.0".to_string(),
             result: None,
             error: Some(err),
-            id: req.id.clone(),
+            id,
         },
     };
 
@@ -2683,20 +2705,12 @@ async fn get_latest_blocks_handler(
     let limit = query.limit.unwrap_or(10).min(50);
 
     // Explicitly fetch latest_height as string then parse, to match other handlers
+    // B327: no line per request (two a call, the first before admission,
+    // so refused calls logged too).
     let latest_height: u64 = match data.storage.get("latest_height") {
         Ok(Some(h)) => h.parse::<u64>().unwrap_or(0),
-        _ => {
-            println!(
-                "⚠️ [API] get_latest_blocks: 'latest_height' key not found or error. Returning empty."
-            );
-            return HttpResponse::Ok().json(serde_json::json!([]));
-        }
+        _ => return HttpResponse::Ok().json(serde_json::json!([])),
     };
-
-    println!(
-        "🔍 [API] get_latest_blocks: Head={}, Limit={}",
-        latest_height, limit
-    );
 
     let start_index = latest_height.saturating_sub(limit);
     // B197/B217/B220: one at a time a client, on a read's slot, off this
@@ -2710,7 +2724,6 @@ async fn get_latest_blocks_handler(
         Err(answer) => return answer,
     };
 
-    println!("✅ [API] Returning {} blocks", blocks.len());
     HttpResponse::Ok().json(blocks)
 }
 
@@ -2844,27 +2857,118 @@ fn recent_tps(storage: &StateDB, height: u64) -> f64 {
     }
 }
 
+/// B427: the receipt method, run off the worker with its client
+/// (`json_rpc_handler`): the client's network group is what its block's
+/// header read is admitted by (`receipt_header_turn`).
+const RECEIPT_METHOD: &str = "aincore_getTransactionReceipt";
+
+/// A transaction's receipt (`params`: [tx_hash]). B427: its block's header,
+/// read when the block has no certificate yet, is read on `client`'s turn
+/// (`receipt_header_turn`); `None` in process.
+fn transaction_receipt(
+    data: &AppState,
+    params: &serde_json::Value,
+    client: Option<std::net::IpAddr>,
+) -> Result<serde_json::Value, JsonRpcError> {
+    let Some(tx_hash) = params.get(0).and_then(|v| v.as_str()) else {
+        return Err(JsonRpcError {
+            code: -32602,
+            message: "Invalid params: [tx_hash]".into(),
+        });
+    };
+    let execution_receipt = stored_tx_receipt(&data.storage, tx_hash);
+    // Use indexed lookup (O(1))
+    if let Some(block_height) = data.storage.get_tx_block_height(tx_hash) {
+        let block_hash = block_hash_at(&data.storage, block_height, || {
+            receipt_header_turn(data, client)
+        })?;
+        let latest_height = data.storage.get_chain_height();
+        let confirmations = latest_height.saturating_sub(block_height);
+        let status = execution_receipt
+            .as_ref()
+            .and_then(|receipt| receipt.get("status"))
+            .and_then(|status| status.as_str())
+            .unwrap_or("confirmed");
+
+        Ok(serde_json::json!({
+            "tx_hash": tx_hash,
+            "block_height": block_height,
+            "confirmations": confirmations,
+            "status": status,
+            "execution_receipt": execution_receipt,
+            "block_hash": block_hash.unwrap_or_default()
+        }))
+    } else if let Some(receipt) = execution_receipt {
+        let status = receipt
+            .get("status")
+            .and_then(|status| status.as_str())
+            .unwrap_or("executed");
+        Ok(serde_json::json!({
+            "tx_hash": tx_hash,
+            "status": status,
+            "confirmations": 0,
+            "execution_receipt": receipt
+        }))
+    } else {
+        // Pending only if THIS transaction is still waiting. The old
+        // check was "is the mempool non-empty", which reported every
+        // unknown hash as pending whenever anyone had a tx queued.
+        let in_mempool = data
+            .mempool
+            .lock()
+            .map(|mp| mp.pending_with_raw_hash(tx_hash).is_some())
+            .unwrap_or(false);
+
+        Ok(serde_json::json!({
+            "tx_hash": tx_hash,
+            "status": if in_mempool { "pending" } else { "not_found" },
+            "confirmations": 0
+        }))
+    }
+}
+
+/// B427: the turn a receipt's block header is read on: `client`'s network
+/// group's reads gate, a reads permit and a read's slot, each free now (it
+/// never waits, as `stored_certificate`'s verification). The header took a
+/// read's slot alone, outside the gate and the queue, so receipts from a
+/// few addresses kept the slots taken and every heavy read that had waited
+/// its turn answered busy (B234's pattern).
+fn receipt_header_turn(data: &AppState, client: Option<std::net::IpAddr>) -> Option<ReadTurn> {
+    let gate = match client {
+        Some(ip) => Some(
+            data.queues
+                .gate(heavy_group(ip), false)
+                .try_acquire_owned()
+                .ok()?,
+        ),
+        None => None,
+    };
+    let permit = Arc::clone(&data.queues.reads).try_acquire_owned().ok()?;
+    ReadSlot::begin(&data.reads).map(|slot| (gate, permit, slot))
+}
+
+/// B427: a header read's group gate, reads permit and read slot.
+type ReadTurn = (
+    Option<tokio::sync::OwnedSemaphorePermit>,
+    tokio::sync::OwnedSemaphorePermit,
+    ReadSlot,
+);
+
 /// B253: block `height`'s hash for a receipt: from its certificate's row
 /// (about 2 KB) when this node holds it, else from the block's header (the
 /// whole block was parsed into a value for that one field, on every receipt).
-/// B267: the header is read on one of `reads`' slots, or the call is busy.
-fn block_hash_at(
+/// B267: the header is read on a `turn`, or the call is busy. B427: only the
+/// header, the stored text's prefix (`blockchain::header_of`), is parsed: the
+/// whole block was, up to the oversized blocks sync admits.
+fn block_hash_at<T>(
     storage: &StateDB,
     height: u64,
-    reads: &Arc<AtomicUsize>,
+    turn: impl FnOnce() -> Option<T>,
 ) -> Result<Option<String>, JsonRpcError> {
     #[derive(Deserialize)]
     struct Certified {
         block_height: u64,
         block_hash: String,
-    }
-    #[derive(Deserialize)]
-    struct Headed {
-        header: Head,
-    }
-    #[derive(Deserialize)]
-    struct Head {
-        hash: String,
     }
     let certified = storage
         .get(&format!("consensus:qc:{height}"))
@@ -2875,16 +2979,16 @@ fn block_hash_at(
     if let Some(c) = certified {
         return Ok(Some(c.block_hash));
     }
-    let _slot = ReadSlot::begin(reads).ok_or_else(|| JsonRpcError {
+    let _turn = turn().ok_or_else(|| JsonRpcError {
         code: -32005,
         message: "aincore_getTransactionReceipt is busy; retry".into(),
     })?;
     let Some(raw) = storage.get(&format!("block_{height}")).ok().flatten() else {
         return Ok(None);
     };
-    Ok(serde_json::from_str::<Headed>(&raw)
-        .ok()
-        .map(|b| b.header.hash))
+    Ok(blockchain::header_of(&raw)
+        .filter(|header| header.height == height)
+        .map(|header| header.hash))
 }
 
 /// B240/B254: the stored-certificate calls, answered at once with the
@@ -3232,6 +3336,7 @@ pub async fn start_api_server(
         client_ip: Some(client_ip.clone()),
         reads: Arc::default(),
         queues: HeavyQueues::default(),
+        sends: SendBudget::default(),
         tps: Arc::default(),
     });
 
@@ -3282,7 +3387,7 @@ pub async fn start_api_server(
                     .route("/metrics", web::get().to(metrics_handler))
                     .service(
                         web::resource("/rpc")
-                            .app_data(web::JsonConfig::default().limit(2 * 1024 * 1024))
+                            .app_data(rpc_json_config())
                             .route(web::post().to(json_rpc_handler)),
                     )
                     .route("/get_chain_height", web::get().to(get_chain_height_handler))
@@ -3390,6 +3495,7 @@ mod tests {
             client_ip: None,
             reads: Arc::default(),
             queues: HeavyQueues::default(),
+            sends: SendBudget::default(),
             tps: Arc::default(),
         }
     }
@@ -3878,11 +3984,12 @@ mod tests {
         let db = temp_db("b253_block_hash");
         db.put(
             "block_7",
-            r#"{"header":{"hash":"from-header","height":7},"transactions":["x"]}"#,
+            &stored_block(7, "from-header", r#""transactions":["x"]"#),
         )
         .unwrap();
         let reads = Arc::new(AtomicUsize::new(0));
-        let hash = |height| block_hash_at(&db, height, &reads).unwrap();
+        let turn = || ReadSlot::begin(&reads);
+        let hash = |height| block_hash_at(&db, height, turn).unwrap();
         assert_eq!(hash(7).as_deref(), Some("from-header"));
         db.put(
             "consensus:qc:7",
@@ -3898,6 +4005,239 @@ mod tests {
         assert_eq!(hash(8), None);
     }
 
+    /// A block's stored text: its header (all of `BlockHeader`'s fields, as
+    /// `blockchain::header_of` reads them) first, then `rest`.
+    fn stored_block(height: u64, hash: &str, rest: &str) -> String {
+        let header = blockchain::BlockHeader {
+            height,
+            hash: hash.into(),
+            ..Default::default()
+        };
+        format!(
+            r#"{{"header":{},{rest}}}"#,
+            serde_json::to_string(&header).unwrap()
+        )
+    }
+
+    /// B427 witness: a receipt's block hash is read from the header alone,
+    /// the stored text's prefix: a body that does not parse still answers
+    /// (the whole block was parsed for that one field), and a header of
+    /// another height answers nothing.
+    #[test]
+    fn a_receipt_reads_only_its_blocks_header() {
+        let db = temp_db("b427_header_only");
+        db.put(
+            "block_7",
+            &stored_block(7, "from-header", r#""transactions":["x", not json"#),
+        )
+        .unwrap();
+        db.put(
+            "block_8",
+            &stored_block(9, "misfiled", r#""transactions":[]"#),
+        )
+        .unwrap();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let turn = || ReadSlot::begin(&reads);
+        let hash = |height| block_hash_at(&db, height, turn).unwrap();
+        assert_eq!(
+            hash(7).as_deref(),
+            Some("from-header"),
+            "the whole block was parsed"
+        );
+        assert_eq!(hash(8), None, "a header of another height answered");
+        assert_eq!(reads.load(Ordering::SeqCst), 0, "a slot was kept");
+    }
+
+    /// B427 witness: a receipt's header read takes its client's network
+    /// group's reads gate and a reads permit, then a read's slot, never
+    /// waiting: a group's second receipt is busy while a read's slot is
+    /// still free and another group's is answered, and with both permits
+    /// taken a heavy read waits for its turn instead of being given one
+    /// with no slot (receipts took the slots outside the gate and the
+    /// queue, so every heavy read that had waited its turn answered busy).
+    #[actix_web::test]
+    async fn a_receipts_header_read_takes_its_groups_gate_and_a_read_permit() {
+        let db = temp_db("b427_receipt_turn");
+        let hash = "ef".repeat(32);
+        db.index_transaction(&hash, 7).unwrap();
+        db.put(
+            "block_7",
+            &stored_block(7, "from-header", r#""transactions":[]"#),
+        )
+        .unwrap();
+        let state = test_state(Arc::clone(&db));
+        let ip = |s: &str| Some(s.parse::<std::net::IpAddr>().unwrap());
+        let params = serde_json::json!([hash]);
+        let a = ip("198.51.100.1");
+        let a2 = ip("198.51.100.2");
+        let b = ip("203.0.113.1");
+        let first = receipt_header_turn(&state, a).expect("a turn");
+        assert_eq!(
+            state.queues.reads.available_permits(),
+            READS_AT_ONCE - 1,
+            "the header read took no reads permit"
+        );
+        assert_eq!(state.reads.load(Ordering::SeqCst), 1);
+        let err = transaction_receipt(&state, &params, a2).unwrap_err();
+        assert_eq!(err.code, -32005, "a group's second receipt took a slot");
+        let answered =
+            transaction_receipt(&state, &params, b).expect("another group's receipt was busy");
+        assert_eq!(answered["block_hash"], "from-header");
+        let theirs = receipt_header_turn(&state, b).expect("a turn");
+        let mut heavy = Box::pin(state.queues.turn(false, ip("192.0.2.1")));
+        assert!(
+            futures::poll!(&mut heavy).is_pending(),
+            "a heavy read got a turn while receipts held every slot"
+        );
+        drop((first, theirs));
+        assert!(heavy.await.is_some(), "the heavy read never ran");
+        assert_eq!(state.reads.load(Ordering::SeqCst), 0, "a slot was kept");
+        assert_eq!(state.queues.reads.available_permits(), READS_AT_ONCE);
+    }
+
+    /// B428 witness: an `/rpc` body over `RPC_BODY_LIMIT` is refused before
+    /// it is parsed (413, not a parse error's 400: the limit was 2 MiB),
+    /// while the largest transaction, sent as a JSON string of the bytes
+    /// escaping costs most, reaches its method.
+    #[actix_web::test]
+    async fn rpc_bodies_are_bounded_by_the_largest_transaction() {
+        let state = web::Data::new(test_state(temp_db("b428_rpc_body")));
+        let app = actix_web::test::init_service(
+            App::new().app_data(state).service(
+                web::resource("/rpc")
+                    .app_data(rpc_json_config())
+                    .route(web::post().to(json_rpc_handler)),
+            ),
+        )
+        .await;
+        let post = |body: String| {
+            actix_web::test::TestRequest::post()
+                .uri("/rpc")
+                .insert_header(("content-type", "application/json"))
+                .set_payload(body)
+                .to_request()
+        };
+        let over = "x".repeat(RPC_BODY_LIMIT + 1);
+        let answer = actix_web::test::call_service(&app, post(over)).await;
+        assert_eq!(
+            answer.status(),
+            actix_web::http::StatusCode::PAYLOAD_TOO_LARGE,
+            "a body over the limit was read"
+        );
+        let largest = "\"".repeat(executor::admission::MAX_TX_BYTES);
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "aincore_sendTransaction",
+            "params": [largest],
+        })
+        .to_string();
+        assert!(
+            body.len() > 2 * executor::admission::MAX_TX_BYTES,
+            "vacuous"
+        );
+        let answer = actix_web::test::call_service(&app, post(body)).await;
+        assert!(
+            answer.status().is_success(),
+            "the largest transaction was refused: {}",
+            answer.status()
+        );
+        let answer: serde_json::Value = actix_web::test::read_body_json(answer).await;
+        assert_eq!(answer["error"]["code"], -32010, "{answer}");
+    }
+
+    /// B475 witness: `aincore_sendTransaction` spends its transaction's
+    /// bytes from its client's network group's quota, at `TX_SUBMIT`'s
+    /// price, before anything of it is parsed or checked: past a burst's
+    /// worth at one instant the group's sends are busy (-32005), whichever
+    /// of its clients sends, while another group's, and one in process, are
+    /// checked (here refused as junk, -32010). Every send ran the whole
+    /// stateless admission on the worker, priced by its request count alone.
+    #[test]
+    fn a_send_is_charged_its_bytes_to_its_network_group() {
+        let state = test_state(temp_db("b475_send_bytes"));
+        let now = std::time::Instant::now();
+        let junk = serde_json::json!(["x".repeat(executor::admission::MAX_TX_BYTES)]);
+        let ip = |s: &str| Some(s.parse::<std::net::IpAddr>().unwrap());
+        let code = |client| {
+            send_charged(&state, &junk, client, now)
+                .expect_err("junk")
+                .code
+        };
+        let fits = (node::sessions::TX_SUBMIT_BYTE_BURST
+            / executor::admission::MAX_TX_BYTES as f64) as usize;
+        assert!(fits >= 1, "vacuous: no send fits a burst");
+        for _ in 0..fits {
+            assert_eq!(code(ip("198.51.100.1")), -32010, "a send within the burst");
+        }
+        assert_eq!(
+            code(ip("198.51.100.1")),
+            -32005,
+            "a send past its group's bytes was checked"
+        );
+        assert_eq!(
+            code(ip("198.51.100.2")),
+            -32005,
+            "another client of the group had a quota of its own"
+        );
+        assert_eq!(
+            code(ip("203.0.113.1")),
+            -32010,
+            "another group's quota was spent"
+        );
+        assert_eq!(code(None), -32010, "a send in process was charged");
+    }
+
+    /// B475 witness: an `/rpc` send is charged to its client's network
+    /// group (`json_rpc_handler` sends it through `send_charged`): one
+    /// client's maximal sends, twice a burst's worth, are busy past it.
+    #[actix_web::test]
+    async fn rpc_sends_are_charged_their_bytes() {
+        let mut state = test_state(temp_db("b475_rpc_send"));
+        state.client_ip = Some(ClientIp {
+            header: None,
+            trusted: Vec::new(),
+            proxy_port: None,
+            buckets: Default::default(),
+        });
+        let app = actix_web::test::init_service(
+            App::new().app_data(web::Data::new(state)).service(
+                web::resource("/rpc")
+                    .app_data(rpc_json_config())
+                    .route(web::post().to(json_rpc_handler)),
+            ),
+        )
+        .await;
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": SEND_METHOD,
+            "params": ["x".repeat(executor::admission::MAX_TX_BYTES)],
+        })
+        .to_string();
+        let sends = 2 * (node::sessions::TX_SUBMIT_BYTE_BURST
+            / executor::admission::MAX_TX_BYTES as f64) as usize;
+        let mut codes = Vec::new();
+        for _ in 0..sends {
+            let request = actix_web::test::TestRequest::post()
+                .uri("/rpc")
+                .peer_addr("198.51.100.1:4000".parse().unwrap())
+                .insert_header(("content-type", "application/json"))
+                .set_payload(body.clone())
+                .to_request();
+            let answer: serde_json::Value = actix_web::test::read_body_json(
+                actix_web::test::call_service(&app, request).await,
+            )
+            .await;
+            codes.push(answer["error"]["code"].as_i64());
+        }
+        assert_eq!(codes[0], Some(-32010), "vacuous: {codes:?}");
+        assert!(
+            codes.contains(&Some(-32005)),
+            "twice a burst's bytes were all checked: {codes:?}"
+        );
+    }
+
     /// B267 witness: a receipt waits in no read pool and takes no client's
     /// lease: with every read slot held it is answered from its block's
     /// certificate row; only its block's header, read when the block has no
@@ -3910,7 +4250,7 @@ mod tests {
         db.index_transaction(&hash, 7).unwrap();
         db.put(
             "block_7",
-            r#"{"header":{"hash":"from-header","height":7},"transactions":[]}"#,
+            &stored_block(7, "from-header", r#""transactions":[]"#),
         )
         .unwrap();
         let state = test_state(Arc::clone(&db));
@@ -4736,6 +5076,27 @@ mod tests {
         }
     }
 
+    /// B336 witness: the demo crypto calls are gone, and an address is
+    /// derived only from a key of a transaction scheme's size: each hashed
+    /// up to a request's megabyte of a client's bytes on a light call.
+    #[test]
+    fn no_light_call_hashes_a_clients_megabyte() {
+        let state = test_state(temp_db("b336_crypto"));
+        for method in ["aincore_verifyMultiSig", "aincore_ecdsaVerify"] {
+            let err = handle_rpc_method(method, serde_json::json!([0, "00", "00", "00"]), &state)
+                .expect_err(method);
+            assert_eq!(err.code, -32601, "{method}: {}", err.message);
+        }
+        let big = "ab".repeat(1 << 16);
+        assert!(
+            handle_rpc_method("aincore_deriveAddress", serde_json::json!([big]), &state).is_err()
+        );
+        let key = "ab".repeat(32);
+        assert!(
+            handle_rpc_method("aincore_deriveAddress", serde_json::json!([key]), &state).is_ok()
+        );
+    }
+
     /// Every address form reads the same account; a mistyped `A1n` is refused
     /// instead of silently reading an empty one.
     #[test]
@@ -5076,6 +5437,7 @@ mod tests {
             client_ip: None,
             reads: Arc::default(),
             queues: HeavyQueues::default(),
+            sends: SendBudget::default(),
             tps: Arc::default(),
         };
 
@@ -5249,6 +5611,7 @@ mod tests {
             client_ip: None,
             reads: Arc::default(),
             queues: HeavyQueues::default(),
+            sends: SendBudget::default(),
             tps: Arc::default(),
         };
 

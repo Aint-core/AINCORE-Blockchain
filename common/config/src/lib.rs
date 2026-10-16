@@ -47,86 +47,102 @@ impl Default for NodeConfig {
     }
 }
 
+/// B331: the flags a node takes. Anything else is refused: an unknown flag
+/// was skipped and a value that did not parse fell back to a default, so a
+/// mistyped flag (`--api-port`, as the operator guide gave it) or port ran
+/// the node on defaults without a word.
+pub const USAGE: &str = "usage: node [--port P2P_PORT] [--rpc-port RPC_PORT] [--datadir DIR] \
+                         [--bootnodes ADDR,...] [--enable-nat] [--enable-mdns]";
+
 impl NodeConfig {
+    /// The node's flags; on one it does not take, or a value it cannot read,
+    /// the usage on stderr and exit 2. `--help`: the usage, and exit 0
+    /// before anything starts (it started a node on defaults).
     pub fn parse() -> Self {
-        let args: Vec<String> = env::args().collect();
-        let mut config = Self::default();
-
-        // Flags to track if user explicitly set ports
-        let mut port_set = false;
-        let mut api_port_set = false;
-
-        let mut i = 1;
-        while i < args.len() {
-            match args[i].as_str() {
-                "--port" => {
-                    if i + 1 < args.len() {
-                        config.port = args[i + 1].parse().unwrap_or(DEFAULT_PORT);
-                        port_set = true;
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
-                }
-                "--datadir" => {
-                    if i + 1 < args.len() {
-                        config.datadir = args[i + 1].clone();
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
-                }
-                "--peers" => {
-                    if i + 1 < args.len() {
-                        config.initial_peers = args[i + 1]
-                            .split(',')
-                            .filter_map(|s| s.trim().parse::<u16>().ok())
-                            .collect();
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
-                }
-                "--bootnodes" => {
-                    if i + 1 < args.len() {
-                        config.bootnodes = args[i + 1]
-                            .split(',')
-                            .map(|s| s.trim().to_string())
-                            .collect();
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
-                }
-                "--enable-mdns" => {
-                    config.enable_mdns = true;
-                    i += 1;
-                }
-                "--enable-nat" => {
-                    config.enable_nat = true;
-                    i += 1;
-                }
-                "--rpc-port" => {
-                    if i + 1 < args.len() {
-                        config.api_port = args[i + 1].parse().unwrap_or(8002);
-                        api_port_set = true;
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
-                }
-                _ => i += 1,
+        let args: Vec<String> = env::args().skip(1).collect();
+        match Self::parse_from(&args) {
+            Ok(Some(config)) => config,
+            Ok(None) => {
+                println!("{USAGE}");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("{e}\n{USAGE}");
+                std::process::exit(2);
             }
         }
+    }
 
-        // Auto-configure API port if not set but Node port is set (B296:
-        // `api_port_for`, the rule every tool reads).
+    /// `parse` over `args` (the program's name left out): `Ok(None)` for
+    /// `--help`.
+    pub fn parse_from(args: &[String]) -> Result<Option<Self>, String> {
+        let mut config = Self::default();
+        let (mut port_set, mut api_port_set) = (false, false);
+        let mut i = 0;
+        while i < args.len() {
+            let flag = args[i].as_str();
+            let value = || {
+                args.get(i + 1)
+                    .map(String::as_str)
+                    .ok_or_else(|| format!("{flag} needs a value"))
+            };
+            match flag {
+                "--help" | "-h" => return Ok(None),
+                "--enable-mdns" => config.enable_mdns = true,
+                "--enable-nat" => config.enable_nat = true,
+                "--port" => {
+                    // B349: libp2p listens at the port + 100.
+                    config.port = parse_port(flag, value()?)?;
+                    if config.port > MAX_P2P_PORT {
+                        return Err(format!(
+                            "--port {} is past {MAX_P2P_PORT} (libp2p listens at the port + 100)",
+                            config.port
+                        ));
+                    }
+                    port_set = true;
+                }
+                "--rpc-port" => {
+                    config.api_port = parse_port(flag, value()?)?;
+                    api_port_set = true;
+                }
+                "--datadir" => config.datadir = value()?.to_string(),
+                "--peers" => {
+                    config.initial_peers = value()?
+                        .split(',')
+                        .map(|p| parse_port(flag, p))
+                        .collect::<Result<_, _>>()?;
+                }
+                "--bootnodes" => {
+                    config.bootnodes = value()?.split(',').map(|s| s.trim().to_string()).collect();
+                }
+                _ => return Err(format!("unknown flag {flag:?}")),
+            }
+            i += if matches!(flag, "--enable-mdns" | "--enable-nat") {
+                1
+            } else {
+                2
+            };
+        }
+        // B296: the RPC port follows the P2P port by `api_port_for`, the rule
+        // every tool reads, unless it is named.
         if port_set && !api_port_set {
             config.api_port = api_port_for(config.port);
         }
-
-        config
+        Ok(Some(config))
     }
+}
+
+/// B349: the highest `--port` (libp2p listens at the port + 100: past this,
+/// a release build listened at a port that wrapped to 0, a random one).
+pub const MAX_P2P_PORT: u16 = u16::MAX - 100;
+
+/// A port `flag` names: a number from 1 to 65535.
+fn parse_port(flag: &str, raw: &str) -> Result<u16, String> {
+    raw.trim()
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port > 0)
+        .ok_or_else(|| format!("{flag} {raw:?} is not a port"))
 }
 
 #[cfg(test)]
@@ -148,5 +164,41 @@ mod tests {
             super::NodeConfig::default().api_port,
             super::DEFAULT_API_PORT
         );
+    }
+
+    /// B331 witness: a flag the node does not take, or a port it cannot
+    /// read, is refused (an unknown flag was skipped and a bad port fell
+    /// back to a default, so `--api-port 8001` ran the RPC on 8000 without a
+    /// word); `--help` is answered, never a node started.
+    #[test]
+    fn a_flag_the_node_does_not_take_is_refused() {
+        let parse = |args: &[&str]| {
+            super::NodeConfig::parse_from(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>())
+        };
+        let config = parse(&["--port", "9001", "--datadir", "d", "--enable-nat"])
+            .unwrap()
+            .unwrap();
+        assert_eq!((config.port, config.api_port), (9001, 8001));
+        assert_eq!(config.datadir, "d");
+        assert!(config.enable_nat);
+        assert_eq!(
+            parse(&["--port", "9001", "--rpc-port", "7000"])
+                .unwrap()
+                .unwrap()
+                .api_port,
+            7000
+        );
+        for bad in [
+            &["--api-port", "8001"][..],
+            &["--port", "90o1"],
+            &["--port", "0"],
+            &["--port"],
+            &["--rpc-port", "70000"],
+            &["9001"],
+            &["--port", "65436"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?} was taken");
+        }
+        assert!(parse(&["--help"]).unwrap().is_none());
     }
 }

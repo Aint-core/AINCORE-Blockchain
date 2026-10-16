@@ -13,9 +13,29 @@ use tokio::time::{sleep, Duration};
 
 const CONFIRMATIONS: u64 = 6;
 
+/// B333: the bridge cannot credit a deposit (`mint_wbtc` has no path to the
+/// chain, and genesis gives wBTC's mint to no key, B314), so a deposit it
+/// watched was marked in progress and never credited: BTC sent to custody
+/// stranded. It runs only when its operator says it is an experiment.
+fn refuse_unless_experimental(flag: Option<String>) -> Result<(), String> {
+    if flag.as_deref() == Some("1") {
+        Ok(())
+    } else {
+        Err(
+            "the BTC bridge cannot credit deposits yet (wBTC's mint has no key at genesis, \
+             B314): set AINCORE_BRIDGE_EXPERIMENTAL=1 to run it against a test chain"
+                .to_string(),
+        )
+    }
+}
+
 #[tokio::main]
 async fn main() {
     env_logger::init();
+    if let Err(why) = refuse_unless_experimental(env::var("AINCORE_BRIDGE_EXPERIMENTAL").ok()) {
+        error!("❌ {why}");
+        std::process::exit(1);
+    }
 
     // SECURITY: Load all sensitive config from environment variables
     let multisig_address =
@@ -193,5 +213,17 @@ async fn main() {
 
         // Wait 60 seconds before next check
         sleep(Duration::from_secs(60)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// B333 witness: the bridge does not run unless its operator says it is
+    /// an experiment (every deposit it watched stranded).
+    #[test]
+    fn the_bridge_runs_only_as_an_experiment() {
+        assert!(super::refuse_unless_experimental(None).is_err());
+        assert!(super::refuse_unless_experimental(Some("0".into())).is_err());
+        assert!(super::refuse_unless_experimental(Some("1".into())).is_ok());
     }
 }

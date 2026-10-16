@@ -149,11 +149,38 @@ fn ok(cond: bool, what: &str) -> bool {
     cond
 }
 
+/// B366: the chain named (`AINCORE_CHAIN_ID`), and only if the node runs it:
+/// the default signed with a validator's key for whatever chain the node ran.
+fn node_chain(url: &str) -> Result<String> {
+    let named = std::env::var("AINCORE_CHAIN_ID")
+        .map_err(|_| anyhow!("name the chain to sign for: AINCORE_CHAIN_ID"))?;
+    let root = url.strip_suffix('/').unwrap_or(url);
+    let root = root.strip_suffix("/rpc").unwrap_or(root);
+    let info: serde_json::Value = reqwest::blocking::get(format!("{root}/get_network_info"))?
+        .error_for_status()?
+        .json()?;
+    let node = info
+        .get("network")
+        .and_then(|n| n.as_str())
+        .ok_or_else(|| anyhow!("get_network_info named no chain"))?;
+    if node != named {
+        return Err(anyhow!(
+            "the node runs {node}, not {named}: refusing to sign"
+        ));
+    }
+    Ok(named)
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let key_path = args.get(1).ok_or_else(|| anyhow!("arg 1: path ke node.key"))?;
-    let url = args.get(2).map(String::as_str).unwrap_or("http://127.0.0.1:8201/rpc");
-    let chain_id = std::env::var("AINCORE_CHAIN_ID").unwrap_or_else(|_| "AINCORE-LOCALTEST-3V".into());
+    let key_path = args
+        .get(1)
+        .ok_or_else(|| anyhow!("arg 1: path ke node.key"))?;
+    let url = args
+        .get(2)
+        .map(String::as_str)
+        .unwrap_or("http://127.0.0.1:8201/rpc");
+    let chain_id = node_chain(url)?;
 
     let raw = std::fs::read(key_path)?;
     let seed: [u8; 32] = if raw.len() == 32 { raw[..].try_into()? } else {

@@ -19,16 +19,37 @@
 //!
 //! ML-DSA-65 is a choice: FIPS 204's category 3 set, between ML-DSA-44
 //! (category 2, 2420-byte signatures) and ML-DSA-87 (category 5, 4627 bytes).
-//! It is verified with aws-lc-rs, pinned to one version: its ML-DSA is the
-//! C-only mldsa-native code on every CPU, so x86 without AVX2 (the NAS) and
-//! aarch64 (the Pi) run the same path. A version bump of aws-lc-rs is a
-//! consensus change; the cross-implementation tests below must pass on both
-//! architectures before one ships.
+//! B321: it is verified with RustCrypto `ml-dsa` (pinned; pure Rust, no
+//! assembly and no CPU-specific code), so every node runs one code path.
+//! aws-lc-rs verified it before: aws-lc-sys 0.45 builds mldsa-native's AVX2
+//! and NEON assembly, which replaces the steps that decode and bound a
+//! signature, so the NAS (no AVX2: C), an AVX2 host and the Pi (NEON) ran
+//! three paths over attacker-chosen signatures. aws-lc-rs still makes keys
+//! and signs (signing is not consensus). Either crate's bump is a consensus
+//! change; the cross-implementation tests below must pass first.
+//!
+//! B454: one code path holds for ML-DSA only. Ed25519 and BLS checks of
+//! attacker-chosen bytes still run CPU-specific arithmetic: curve25519-dalek
+//! multiplies with AVX2 code where the CPU has it and serial code elsewhere
+//! (its decoding, canonical-s and small-order checks and the final
+//! comparison are one serial path), and blst's field arithmetic is mulx or
+//! mulq assembly on x86 (chosen when the node starts: blst is built
+//! `portable`) and armv8 assembly on the Pi. Unlike B321's case, no path
+//! decodes or bounds by its own rules: each computes a group element or a
+//! field value that has one correct value, so two nodes disagree only
+//! through an arithmetic bug in one path (none is known; Ethereum's
+//! consensus clients run blst on all three). Accepted, with a gate:
+//! `ed25519_verdicts_on_edge_inputs_are_pinned_for_every_cpu` (below) and
+//! `bls::tests::bls_verdicts_on_edge_inputs_are_pinned_for_every_cpu` pin the
+//! verdicts on honest, flipped, unreduced, small-order, mixed-order and
+//! infinity inputs, and a release runs them on each CPU class of the fleet.
+//! curve25519-dalek's serial backend is not forced: only rustflags select it
+//! (a RUSTFLAGS variable silently replaces a config file's), so no setting
+//! here could hold it, and it would change which path computes a verdict,
+//! not the verdict.
 
 use crate::CryptoError;
-use aws_lc_rs::signature::{
-    KeyPair, PqdsaKeyPair, UnparsedPublicKey, ML_DSA_65, ML_DSA_65_SIGNING,
-};
+use aws_lc_rs::signature::{KeyPair, PqdsaKeyPair, ML_DSA_65_SIGNING};
 use ed25519_dalek::{Signature, VerifyingKey};
 
 /// ML-DSA-65 public key bytes (FIPS 204, Table 2).
@@ -87,9 +108,24 @@ pub fn verify_tx_signature(
                 .map_err(|_| CryptoError::InvalidSignature("Ed25519 does not verify".into()))?;
         }
         TxScheme::MlDsa65 => {
-            UnparsedPublicKey::new(&ML_DSA_65, public_key)
-                .verify(message, signature)
-                .map_err(|_| CryptoError::InvalidSignature("ML-DSA-65 does not verify".into()))?;
+            use ml_dsa::{EncodedVerifyingKey, MlDsa65};
+            let key: &EncodedVerifyingKey<MlDsa65> = public_key
+                .try_into()
+                .map_err(|_| CryptoError::InvalidPublicKey("not an ML-DSA-65 key".into()))?;
+            // sigDecode refuses a hint out of order or past ω, and z at or
+            // past γ1 − β (FIPS 204, Algorithms 21 and 27, and 3's step 13).
+            let signature = ml_dsa::Signature::<MlDsa65>::try_from(signature).map_err(|_| {
+                CryptoError::InvalidSignature("ML-DSA-65 signature does not decode".into())
+            })?;
+            if !ml_dsa::VerifyingKey::<MlDsa65>::decode(key).verify_with_context(
+                message,
+                &[],
+                &signature,
+            ) {
+                return Err(CryptoError::InvalidSignature(
+                    "ML-DSA-65 does not verify".into(),
+                ));
+            }
         }
     }
     Ok(scheme)
@@ -127,9 +163,148 @@ impl MlDsa65Key {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
-    use sha2::{Digest, Sha256};
+    use sha2::{Digest, Sha256, Sha512};
 
     const MSG: &[u8] = b"AINCORE-TESTNET-V5:sender:payload:0:100000:1:";
+
+    /// A scalar of the type `like` has: curve25519-dalek's `Scalar`, which
+    /// this crate does not depend on by name.
+    fn scalar_like<S: From<u128>>(_like: &S, value: u128) -> S {
+        S::from(value)
+    }
+
+    /// B454 gate: one verdict on every CPU. curve25519-dalek's double-scalar
+    /// multiply runs AVX2 code on a host that has it and serial code
+    /// elsewhere (the NAS, the Pi); decoding, the canonical-s and small-order
+    /// checks and the final comparison are one serial path. The verdicts are
+    /// pinned (the mixed-order ones by the group law) for both consensus
+    /// entry points, and a release runs this test on each CPU class.
+    #[test]
+    fn ed25519_verdicts_on_edge_inputs_are_pinned_for_every_cpu() {
+        let verdict = |key: &[u8], msg: &[u8], sig: &[u8]| {
+            let tx = verify_tx_signature(key, msg, sig).is_ok();
+            let block = crate::verify_signature(key, msg, sig).unwrap_or(false);
+            assert_eq!(tx, block, "the two entry points disagree");
+            tx
+        };
+        // Honest signatures over many keys verify: the refusals below are
+        // not vacuous.
+        for seed in 0u8..32 {
+            let key = SigningKey::from_bytes(&[seed; 32]);
+            for len in [0usize, 1, 64, 1000] {
+                let msg = vec![seed ^ 0x5a; len];
+                let sig = key.sign(&msg).to_bytes();
+                let public = key.verifying_key().to_bytes();
+                assert!(verdict(&public, &msg, &sig), "seed {seed}, {len} bytes");
+            }
+        }
+        let key = SigningKey::from_bytes(&[9; 32]);
+        let public = key.verifying_key().to_bytes();
+        let sig = key.sign(MSG).to_bytes();
+        // Every bit of the signature and of the key, flipped.
+        for bit in 0..512 {
+            let mut bad = sig;
+            bad[bit / 8] ^= 1 << (bit % 8);
+            assert!(!verdict(&public, MSG, &bad), "signature bit {bit}");
+        }
+        for bit in 0..256 {
+            let mut bad = public;
+            bad[bit / 8] ^= 1 << (bit % 8);
+            assert!(!verdict(&bad, MSG, &sig), "key bit {bit}");
+        }
+
+        // The group order L, little-endian (RFC 8032, 5.1).
+        let low = 0x14def9dea2f79cd65812631a5cf5d3edu128.to_le_bytes();
+        let mut order = [0u8; 32];
+        order[..16].copy_from_slice(&low);
+        order[31] = 0x10;
+        let a = key.to_scalar();
+        let two_64 = scalar_like(&a, 1u128 << 64);
+        let two_128 = two_64 * two_64;
+        // A little-endian integer mod L, as `Scalar::from_hash` reduces.
+        let reduce = |bytes: &[u8]| {
+            bytes
+                .chunks(16)
+                .rev()
+                .fold(scalar_like(&a, 0), |acc, chunk| {
+                    let limb = u128::from_le_bytes(chunk.try_into().expect("16 bytes"));
+                    acc * two_128 + scalar_like(&a, limb)
+                })
+        };
+        let l_mod_l = reduce(&order[..]).to_bytes();
+        assert_eq!(l_mod_l, [0; 32], "L is the group order");
+
+        // s + L: the same [s]B, refused as not reduced.
+        let mut unreduced = sig;
+        let mut carry = 0u16;
+        for (i, l) in order.iter().enumerate() {
+            let sum = u16::from(unreduced[32 + i]) + u16::from(*l) + carry;
+            unreduced[32 + i] = sum as u8;
+            carry = sum >> 8;
+        }
+        assert_eq!(carry, 0);
+        assert!(!verdict(&public, MSG, &unreduced), "s + L");
+
+        // Small-order keys (the identity; (0, -1) of order 2; (±√-1, 0) of
+        // order 4; y = p and y = p + 1, non-canonical), under (R = identity,
+        // s = 0) and under an honest signature.
+        let mut minus_one = [0xffu8; 32];
+        minus_one[0] = 0xec;
+        minus_one[31] = 0x7f;
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let mut minus_root = [0u8; 32];
+        minus_root[31] = 0x80;
+        let (mut y_p, mut y_p_plus_1) = (minus_one, minus_one);
+        y_p[0] = 0xed;
+        y_p_plus_1[0] = 0xee;
+        let mut forged = [0u8; 64];
+        forged[0] = 1;
+        for small in [identity, minus_one, [0; 32], minus_root, y_p, y_p_plus_1] {
+            assert!(!verdict(&small, MSG, &forged), "{}", hex::encode(small));
+            assert!(!verdict(&small, MSG, &sig), "{}", hex::encode(small));
+        }
+
+        // Mixed-order keys A + T, T of order 2 and of order 4, signed for
+        // that key with A's scalar a: R = [r]B, s = r + k·a, k = H(R, A + T,
+        // M). Then [s]B - [k](A + T) = R - [k]T: the signature verifies
+        // exactly when the order of T divides k.
+        let torsion = |bytes: [u8; 32]| VerifyingKey::from_bytes(&bytes).unwrap().to_edwards();
+        let a_point = key.verifying_key().to_edwards();
+        let nonce = SigningKey::from_bytes(&[0x33; 32]);
+        let (r, r_bytes) = (nonce.to_scalar(), nonce.verifying_key().to_bytes());
+        for (t, t_order) in [(torsion(minus_one), 2u8), (torsion([0; 32]), 4)] {
+            assert!(VerifyingKey::from(t).is_weak(), "T has small order");
+            let mixed_key = VerifyingKey::from(a_point + t);
+            assert!(!mixed_key.is_weak(), "A + T does not");
+            let mixed = mixed_key.to_bytes();
+            let mut verified = 0;
+            for n in 0u8..64 {
+                let msg = [n; 8];
+                let wide = Sha512::new()
+                    .chain_update(r_bytes)
+                    .chain_update(mixed)
+                    .chain_update(msg)
+                    .finalize();
+                let k = reduce(&wide[..]);
+                let s = r + k * a;
+                let mut sig = [0u8; 64];
+                sig[..32].copy_from_slice(&r_bytes);
+                sig[32..].copy_from_slice(&s.to_bytes());
+                let expected = k.to_bytes()[0] % t_order == 0;
+                assert_eq!(
+                    verdict(&mixed, &msg, &sig),
+                    expected,
+                    "order {t_order}, message {n}"
+                );
+                verified += usize::from(expected);
+            }
+            assert!(
+                verified > 0 && verified < 64,
+                "order {t_order}: {verified} of 64 verify"
+            );
+        }
+    }
 
     #[test]
     fn ml_dsa_65_sizes_are_fips_204_table_2() {
@@ -251,6 +426,7 @@ mod tests {
     /// signatures, and aws-lc verifies its signatures.
     #[test]
     fn rustcrypto_ml_dsa_agrees_with_aws_lc() {
+        use aws_lc_rs::signature::{UnparsedPublicKey, ML_DSA_65};
         use ml_dsa::{Keypair, MlDsa65, SigningKey as RcKey};
         for s in [0u8, 7, 0xa5, 0xff] {
             let seed = [s; 32];
@@ -278,7 +454,51 @@ mod tests {
                 Ok(TxScheme::MlDsa65),
                 "seed {s}"
             );
+            assert!(
+                UnparsedPublicKey::new(&ML_DSA_65, ours.public_key())
+                    .verify(MSG, theirs.as_slice())
+                    .is_ok(),
+                "seed {s}"
+            );
         }
+    }
+
+    /// B321 witness: the consensus verifier (RustCrypto) and aws-lc give one
+    /// verdict on malformed signatures too: an honest signature with bytes
+    /// flipped across it, and its hint section (the last ω + k = 61 bytes)
+    /// set to every edge value (indices out of order, counts past ω).
+    #[test]
+    fn rustcrypto_and_aws_lc_agree_on_malformed_ml_dsa_signatures() {
+        use aws_lc_rs::signature::{UnparsedPublicKey, ML_DSA_65};
+        let ml = MlDsa65Key::from_seed(&[7; 32]);
+        let pk = ml.public_key();
+        let sig = ml.sign(MSG);
+        let mut cases = Vec::new();
+        for i in (0..sig.len()).step_by(7) {
+            let mut bad = sig.clone();
+            bad[i] ^= 0x80;
+            cases.push(bad);
+        }
+        for i in sig.len() - 61..sig.len() {
+            for v in [0u8, 1, 0x36, 0x37, 0x7f, 0xff] {
+                let mut bad = sig.clone();
+                bad[i] = v;
+                cases.push(bad);
+            }
+        }
+        let mut accepted = 0;
+        for (n, case) in cases.iter().enumerate() {
+            let ours = verify_tx_signature(&pk, MSG, case).is_ok();
+            let theirs = UnparsedPublicKey::new(&ML_DSA_65, &pk)
+                .verify(MSG, case)
+                .is_ok();
+            assert_eq!(ours, theirs, "case {n}");
+            accepted += usize::from(ours);
+        }
+        assert!(
+            accepted < cases.len(),
+            "vacuous: every malformed signature verified"
+        );
     }
 
     const ML_DSA_65_GOLDEN_PK_SHA256_SEED_7: &str =

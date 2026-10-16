@@ -40,6 +40,8 @@ const MAX_MARKETS: u64 = 500;
 const DEFAULT_INDEXER_BATCH_SIZE: u64 = 500;
 const MAX_INDEXER_BATCH_SIZE: u64 = 2_000;
 const DEFAULT_INDEXER_BOOTSTRAP_BACKFILL: u64 = 5_000;
+/// The most blocks the bootstrap tail mode reaches back.
+const MAX_INDEXER_BOOTSTRAP_BACKFILL: u64 = 1_000_000;
 
 fn indexer_batch_size() -> u64 {
     env::var("AINCORE_INDEXER_BATCH_SIZE")
@@ -53,47 +55,111 @@ fn indexer_bootstrap_backfill() -> Option<u64> {
     env::var("AINCORE_INDEXER_BOOTSTRAP_BACKFILL")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
-        .map(|value| value.min(1_000_000))
+        .map(|value| value.min(MAX_INDEXER_BOOTSTRAP_BACKFILL))
 }
 
 fn permissive_cors_enabled() -> bool {
-    env::var("AINCORE_PERMISSIVE_CORS")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false)
+    env::var("AINCORE_PERMISSIVE_CORS").is_ok_and(|value| switch_on(&value))
 }
 
-fn decode_transfer(payload: &str) -> (Option<String>, u64) {
+/// B379: a switch is on at 1, true or yes, in any case, as the node reads
+/// it (B370). Only "1", "true", "TRUE", "yes" and "YES" were on, so "True"
+/// was off without a word.
+fn switch_on(value: &str) -> bool {
+    matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+}
+
+/// B379: every problem with the environment `get` gives (`get(name)`: the
+/// variable's value, if set), as the node's `env_check` lists them. A value
+/// the indexer could not read fell back to its default without a word: a
+/// batch size or a backfill that did not parse (or out of range, clamped),
+/// a trusted proxy that was not an address (dropped), a proxy port that did
+/// not parse (no proxy listener) or 0 (a port of the system's choosing).
+/// Each rule is the one the reading site applies, made strict.
+fn env_problems(get: impl Fn(&str) -> Option<String>) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (name, least, most) in [
+        ("AINCORE_INDEXER_BATCH_SIZE", 1, MAX_INDEXER_BATCH_SIZE),
+        (
+            "AINCORE_INDEXER_BOOTSTRAP_BACKFILL",
+            0,
+            MAX_INDEXER_BOOTSTRAP_BACKFILL,
+        ),
+    ] {
+        if let Some(raw) = get(name)
+            && !raw
+                .parse::<u64>()
+                .is_ok_and(|v| (least..=most).contains(&v))
+        {
+            problems.push(format!(
+                "{name}={raw:?} is not a whole number from {least} to {most}"
+            ));
+        }
+    }
+    let switch = ["0", "1", "false", "true", "no", "yes"];
+    if let Some(raw) = get("AINCORE_PERMISSIVE_CORS")
+        && !switch.contains(&raw.to_ascii_lowercase().as_str())
+    {
+        problems.push(format!(
+            "AINCORE_PERMISSIVE_CORS={raw:?} is not one of {}",
+            switch.join(", ")
+        ));
+    }
+    if let Some(raw) = get("AINCORE_INDEXER_TRUSTED_PROXIES") {
+        for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+            if entry.parse::<IpAddr>().is_err() {
+                problems.push(format!(
+                    "AINCORE_INDEXER_TRUSTED_PROXIES entry {entry:?} is not an IP address"
+                ));
+            }
+        }
+    }
+    if let Some(raw) = get("AINCORE_INDEXER_PROXY_PORT")
+        && !raw.trim().parse::<u16>().is_ok_and(|p| p > 0)
+    {
+        problems.push(format!("AINCORE_INDEXER_PROXY_PORT={raw:?} is not a port"));
+    }
+    problems
+}
+
+/// A `0x1::coin::transfer` call: its receiver, its amount in quanta (a
+/// decimal string: any `u128`) and its coin type.
+#[derive(Debug, PartialEq)]
+struct Transfer {
+    receiver: Option<String>,
+    amount: String,
+    coin: Option<String>,
+}
+
+fn decode_transfer(payload: &str) -> Option<Transfer> {
     let hex_payload = payload.trim_start_matches("0x");
-    let bytes = match hex::decode(hex_payload) {
-        Ok(bytes) => bytes,
-        Err(_) => return (None, 0),
+    let bytes = hex::decode(hex_payload).ok()?;
+    let vm_move::TransactionPayload::EntryFunction(call) =
+        bcs::from_bytes::<vm_move::TransactionPayload>(&bytes).ok()?
+    else {
+        return None;
     };
-
-    let tx_payload = match bcs::from_bytes::<vm_move::TransactionPayload>(&bytes) {
-        Ok(payload) => payload,
-        Err(_) => return (None, 0),
-    };
-
-    let vm_move::TransactionPayload::EntryFunction(call) = tx_payload else {
-        return (None, 0);
-    };
-
     let system_address = AccountAddress::from_hex_literal("0x1").expect("valid system address");
     if call.module.address() != &system_address
         || call.module.name().as_str() != "coin"
         || call.function != "transfer"
         || call.args.len() < 3
     {
-        return (None, 0);
+        return None;
     }
-
     let receiver =
         bcs::from_bytes::<move_core_types::account_address::AccountAddress>(&call.args[1])
             .ok()
             .map(|addr| addr.to_string());
-    let amount_u128 = bcs::from_bytes::<u128>(&call.args[2]).unwrap_or(0);
-    let amount = u64::try_from(amount_u128).unwrap_or(u64::MAX);
-    (receiver, amount)
+    // B361: the whole amount (it was cut to a u64, which the database then
+    // refused past i64::MAX, and the row was dropped without a word).
+    let amount = bcs::from_bytes::<u128>(&call.args[2]).ok()?.to_string();
+    let coin = call.ty_args.first().map(ToString::to_string);
+    Some(Transfer {
+        receiver,
+        amount,
+        coin,
+    })
 }
 
 fn tx_hash_hex(raw_tx: &str) -> String {
@@ -480,10 +546,12 @@ fn prepare_db(conn: &Connection) -> rusqlite::Result<()> {
             hash TEXT PRIMARY KEY,
             sender TEXT NOT NULL,
             receiver TEXT,
-            amount INTEGER,
+            amount TEXT,
             payload TEXT,
             block_height INTEGER,
-            timestamp INTEGER
+            timestamp INTEGER,
+            status TEXT,
+            coin TEXT
         )",
         [],
     )?;
@@ -531,6 +599,10 @@ fn prepare_db(conn: &Connection) -> rusqlite::Result<()> {
         [],
     );
 
+    // B378: after the state table (the migration resets the cursor in it)
+    // and after the trades' senders were read from the rows it drops.
+    migrate_transactions_v2(conn)?;
+
     // B265: every API query is a search of one of these (none had an
     // index but the sender's, so each request scanned a whole table).
     conn.execute_batch(
@@ -562,6 +634,58 @@ fn prepare_db(conn: &Connection) -> rusqlite::Result<()> {
         )?;
     }
 
+    Ok(())
+}
+
+/// B361: a table of the first schema (an INTEGER amount, no status or coin)
+/// rebuilt as the second, in one transaction. An amount as an INTEGER could
+/// not hold a transfer past i64::MAX quanta (~9.22 AIN), and TEXT put in an
+/// INTEGER column becomes a REAL past it, so the column itself changes.
+/// B378: the rows without a status (every first-schema row) are dropped and
+/// the cursor goes back to 0, so the bootstrap (`indexer_loop`) decides
+/// where indexing starts again and the blocks the node still holds are
+/// indexed again whole. Kept, an aborted or wBTC transfer stayed listed
+/// without its status, and a transfer the old u64 path dropped stayed
+/// missing. History below what the node holds is lost; DEX trades are not
+/// touched.
+fn migrate_transactions_v2(conn: &Connection) -> rusqlite::Result<()> {
+    let columns: Vec<(String, String)> = conn
+        .prepare("SELECT name, type FROM pragma_table_info('transactions')")?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let integer_amount = columns
+        .iter()
+        .any(|(name, ty)| name == "amount" && ty.eq_ignore_ascii_case("INTEGER"));
+    if !integer_amount {
+        return Ok(());
+    }
+    let rows: i64 = conn.query_row("SELECT COUNT(*) FROM transactions", [], |row| row.get(0))?;
+    conn.execute_batch(
+        "BEGIN;
+         ALTER TABLE transactions RENAME TO transactions_v1;
+         CREATE TABLE transactions (
+             hash TEXT PRIMARY KEY,
+             sender TEXT NOT NULL,
+             receiver TEXT,
+             amount TEXT,
+             payload TEXT,
+             block_height INTEGER,
+             timestamp INTEGER,
+             status TEXT,
+             coin TEXT
+         );
+         INSERT INTO transactions (hash, sender, receiver, amount, payload, block_height, timestamp)
+             SELECT hash, sender, receiver, CAST(amount AS TEXT), payload, block_height, timestamp
+             FROM transactions_v1;
+         DROP TABLE transactions_v1;
+         DELETE FROM transactions WHERE status IS NULL;
+         INSERT OR REPLACE INTO state (key, value) VALUES ('last_height', '0');
+         COMMIT;",
+    )?;
+    // B378: loud, the history it cannot bring back named.
+    eprintln!(
+        "⚠️ Indexer: the database was of the first schema: its {rows} transaction rows, written without their status, were dropped and the indexing cursor reset to 0. The bootstrap (AINCORE_INDEXER_BOOTSTRAP_BACKFILL) decides where indexing starts again; history below the blocks the node still holds CANNOT be recovered (an archive node with AINCORE_INDEXER_BOOTSTRAP_BACKFILL=0 indexes it all). DEX trades are kept."
+    );
     Ok(())
 }
 
@@ -672,6 +796,33 @@ fn complete_blocks<T>(
     }
 }
 
+/// B377: how many of `blocks` (the node's answer for a range from `start`)
+/// are at `start`, `start + 1`, ... by their own headers, as the bridge
+/// reads them (B261). The answer skips heights the node cannot read, and
+/// the cursor went to the highest block answered, past heights never
+/// indexed.
+fn leading_run(blocks: &[serde_json::Value], start: u64) -> usize {
+    blocks
+        .iter()
+        .zip(start..)
+        .take_while(|(block, height)| block["header"]["height"].as_u64() == Some(*height))
+        .count()
+}
+
+/// B377: the height the node no longer holds, when its answer for a range
+/// from `start` (`answered` blocks, the first `run` of them in order) does
+/// not begin with it: a first block past it, or no block while the node's
+/// `latest` height is at or above it. A range pruned whole was answered
+/// empty, and the loop asked again for good without a word.
+fn missing_height(run: usize, answered: usize, start: u64, latest: Option<u64>) -> Option<u64> {
+    let missing = run == 0 && (answered > 0 || latest.is_some_and(|latest| latest >= start));
+    missing.then_some(start)
+}
+
+/// B377: how often a height the node no longer holds is reported again
+/// while the indexer waits on it (a choice).
+const MISSING_REPORT_EVERY: Duration = Duration::from_secs(60);
+
 /// B260: how long a call to the node may take before it is an error (a
 /// choice: a heavy call waits up to 2 s for its turn, and a batch of blocks
 /// is up to 8 MiB). The client had no timeout, so one half-open connection
@@ -764,25 +915,60 @@ async fn fetch_latest_height() -> Option<u64> {
     )
 }
 
-fn index_transaction_row(conn: &Connection, tx_str: &str, height: u64, timestamp: u64) {
-    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(tx_str) {
-        let sender = parsed["sender"].as_str().unwrap_or("");
-        let payload = parsed["payload"].as_str().unwrap_or("");
-        let hash = tx_hash_hex(tx_str);
-        let (receiver, amount) = decode_transfer(payload);
-
-        let _ = conn.execute(
-            "INSERT OR IGNORE INTO transactions (hash, sender, receiver, amount, payload, block_height, timestamp)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![hash, sender, receiver, amount, payload, height, normalize_timestamp_secs(timestamp)],
-        );
-    }
+/// B361: a transaction's row: a transfer's receiver, amount and coin, and
+/// its receipt's status (`success`, or what it aborted with; none when the
+/// node had no receipt). Aborted transfers were listed as transfers, and an
+/// insert that failed was dropped while the batch's height still advanced.
+fn index_transaction_row(
+    conn: &Connection,
+    tx_str: &str,
+    height: u64,
+    timestamp: u64,
+    receipt: Option<&serde_json::Value>,
+) -> rusqlite::Result<()> {
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(tx_str) else {
+        return Ok(());
+    };
+    let sender = parsed["sender"].as_str().unwrap_or("");
+    let payload = parsed["payload"].as_str().unwrap_or("");
+    let hash = tx_hash_hex(tx_str);
+    let transfer = decode_transfer(payload);
+    let status = receipt.and_then(receipt_status);
+    // B378: a row indexed again replaces the one there (OR IGNORE kept the
+    // first, so a block indexed again could not correct its rows).
+    conn.execute(
+        "INSERT OR REPLACE INTO transactions
+         (hash, sender, receiver, amount, payload, block_height, timestamp, status, coin)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            hash,
+            sender,
+            transfer.as_ref().and_then(|t| t.receiver.clone()),
+            transfer.as_ref().map(|t| t.amount.clone()),
+            payload,
+            height,
+            normalize_timestamp_secs(timestamp),
+            status,
+            transfer.as_ref().and_then(|t| t.coin.clone()),
+        ],
+    )?;
+    Ok(())
 }
 
-fn index_dex_trade_row(conn: &Connection, trade: &DexTradeRecord) {
+/// A receipt's execution status (`success`, or how it failed).
+fn receipt_status(receipt: &serde_json::Value) -> Option<String> {
+    receipt
+        .get("execution_receipt")
+        .and_then(|r| r.get("status"))
+        .or_else(|| receipt.get("status"))
+        .and_then(|s| s.as_str())
+        .map(|s| s.chars().take(64).collect())
+}
+
+fn index_dex_trade_row(conn: &Connection, trade: &DexTradeRecord) -> rusqlite::Result<()> {
     // B265: the pool's newest trade, so the markets list reads pools, not
     // trades.
-    let _ = conn.execute(
+    conn.execute(
         "INSERT INTO dex_pools (token_x, token_y, pool_addr, last_trade_at) VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT (token_x, token_y, pool_addr)
          DO UPDATE SET last_trade_at = MAX(last_trade_at, excluded.last_trade_at)",
@@ -792,8 +978,8 @@ fn index_dex_trade_row(conn: &Connection, trade: &DexTradeRecord) {
             trade.pool_addr,
             trade.timestamp
         ],
-    );
-    let _ = conn.execute(
+    )?;
+    conn.execute(
         "INSERT OR REPLACE INTO dex_trades
          (tx_hash, pool_addr, function, token_x, token_y, token_in, token_out, amount_in, amount_out, block_height, timestamp, sender)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
@@ -811,7 +997,39 @@ fn index_dex_trade_row(conn: &Connection, trade: &DexTradeRecord) {
             trade.timestamp,
             trade.sender,
         ],
-    );
+    )?;
+    Ok(())
+}
+
+/// B361: a batch's rows and its height, all or nothing: a row that cannot be
+/// written fails the batch, which is read again (the height advanced past
+/// rows that were never written).
+fn write_batch(
+    conn: &Connection,
+    receipts: &[(PendingTx, Option<serde_json::Value>)],
+    indexed_to: u64,
+    last_height: u64,
+) -> rusqlite::Result<()> {
+    for (tx, receipt) in receipts {
+        let sender = serde_json::from_str::<serde_json::Value>(&tx.tx_str)
+            .ok()
+            .and_then(|v| v.get("sender").and_then(|s| s.as_str()).map(String::from))
+            .unwrap_or_default();
+        index_transaction_row(conn, &tx.tx_str, tx.height, tx.timestamp, receipt.as_ref())?;
+        if let Some(receipt) = receipt
+            && let Some(trade) =
+                dex_trade_from_receipt(&tx.hash, tx.height, tx.timestamp, &sender, receipt)
+        {
+            index_dex_trade_row(conn, &trade)?;
+        }
+    }
+    if indexed_to > last_height {
+        conn.execute(
+            "INSERT OR REPLACE INTO state (key, value) VALUES ('last_height', ?1)",
+            params![indexed_to.to_string()],
+        )?;
+    }
+    Ok(())
 }
 
 // --- Indexing Logic ---
@@ -831,11 +1049,14 @@ async fn indexer_loop(db: Arc<Mutex<Connection>>) {
             let bootstrap_height = latest_height.saturating_sub(bootstrap_backfill);
             if let Ok(conn) = db.lock() {
                 set_last_indexed_height(&conn, bootstrap_height);
-                println!(
-                    "⚡ Indexer bootstrap tail mode: latest={} backfill={} start={}",
+                // B379: loud, the history it skips named (a quiet line on
+                // stdout was all an operator saw).
+                eprintln!(
+                    "⚠️ Indexer bootstrap tail mode: latest={} backfill={}: indexing starts at height {}; blocks 1..={} are NOT indexed (AINCORE_INDEXER_BOOTSTRAP_BACKFILL=0 indexes from height 1, on a node that still holds them)",
                     latest_height,
                     bootstrap_backfill,
-                    bootstrap_height.saturating_add(1)
+                    bootstrap_height.saturating_add(1),
+                    bootstrap_height
                 );
             }
         }
@@ -843,6 +1064,8 @@ async fn indexer_loop(db: Arc<Mutex<Connection>>) {
 
     // B270: the blocks a read asks for (`next_batch`).
     let mut batch = batch_size;
+    // B377: the height last reported missing, and when.
+    let mut missing_reported: Option<(u64, Instant)> = None;
     loop {
         let last_height = {
             match db.lock() {
@@ -857,26 +1080,42 @@ async fn indexer_loop(db: Arc<Mutex<Connection>>) {
         let start_height = last_height.saturating_add(1);
         let mut indexed_any = false;
 
-        // Pull lag metric for observability
-        let latest_height_for_log = fetch_latest_height().await;
+        // Pull lag metric for observability (B377: and whether the node
+        // holds the start height).
+        let node_latest = fetch_latest_height().await;
 
         let fetched = fetch_blocks(start_height, batch).await;
         batch = next_batch(batch, fetched.is_ok(), batch_size);
         if let Ok(Some(blocks)) = fetched {
+            // B377: only the leading run of blocks at start_height,
+            // start_height + 1, ... by their own headers. The node's answer
+            // skips heights it cannot read (pruned, a read error, bad JSON),
+            // and the cursor went to the batch's highest block, past heights
+            // never indexed; a range pruned whole was answered empty, and
+            // the loop asked again for good without a word.
+            let run = leading_run(&blocks, start_height);
+            if let Some(missing) = missing_height(run, blocks.len(), start_height, node_latest) {
+                let due = missing_reported.is_none_or(|(height, at)| {
+                    height != missing || at.elapsed() >= MISSING_REPORT_EVERY
+                });
+                if due {
+                    eprintln!(
+                        "❌ Indexer: the node no longer holds block {missing} (pruned, or unreadable): indexing cannot go past it and waits there. An archive node is needed, or a reset of the indexer (its database removed, AINCORE_INDEXER_BOOTSTRAP_BACKFILL within what the node keeps)"
+                    );
+                    missing_reported = Some((missing, Instant::now()));
+                }
+            }
+
             // Phase 1 — collect ALL (height, timestamp, hash, tx_str) tuples across the batch.
             //          This lets us fan-out receipt fetches in parallel below.
             let mut pending: Vec<PendingTx> = Vec::new();
             let mut max_height_in_batch = last_height;
 
-            for block in &blocks {
+            for block in &blocks[..run] {
+                // `leading_run`: start_height and up, in order.
                 let height = block["header"]["height"].as_u64().unwrap_or(0);
-                if height == 0 || height < start_height {
-                    continue;
-                }
                 indexed_any = true;
-                if height > max_height_in_batch {
-                    max_height_in_batch = height;
-                }
+                max_height_in_batch = height;
                 let timestamp = value_to_u64(&block["header"]["timestamp"]).unwrap_or(0);
                 if let Some(txs) = block["transactions"].as_array() {
                     for tx in txs {
@@ -892,7 +1131,7 @@ async fn indexer_loop(db: Arc<Mutex<Connection>>) {
                 }
             }
 
-            if let Some(latest) = latest_height_for_log {
+            if let Some(latest) = node_latest {
                 let lag = latest.saturating_sub(last_height);
                 if lag > 100 || pending.len() > 50 {
                     println!(
@@ -931,35 +1170,25 @@ async fn indexer_loop(db: Arc<Mutex<Connection>>) {
 
             // Phase 3 — single DB lock per batch, drain all writes serially,
             // in one transaction with the height (B265).
+            let mut failed = false;
             if let Ok(mut conn) = db.lock()
                 && let Ok(conn) = conn.transaction()
             {
-                for (tx, receipt) in &receipts {
-                    let sender = serde_json::from_str::<serde_json::Value>(&tx.tx_str)
-                        .ok()
-                        .and_then(|v| v.get("sender").and_then(|s| s.as_str()).map(String::from))
-                        .unwrap_or_default();
-                    index_transaction_row(&conn, &tx.tx_str, tx.height, tx.timestamp);
-                    if let Some(receipt) = receipt
-                        && let Some(trade) = dex_trade_from_receipt(
-                            &tx.hash,
-                            tx.height,
-                            tx.timestamp,
-                            &sender,
-                            receipt,
-                        )
-                    {
-                        index_dex_trade_row(&conn, &trade);
+                match write_batch(&conn, &receipts, indexed_to, last_height) {
+                    Ok(()) => {
+                        if let Err(e) = conn.commit() {
+                            error!("Failed to commit the indexed batch: {}", e);
+                        }
+                    }
+                    // B361: dropped uncommitted, its height with it: the
+                    // batch is read again.
+                    Err(e) => {
+                        error!("Failed to index the batch from height {start_height}: {e}");
+                        failed = true;
                     }
                 }
-                if indexed_to > last_height {
-                    set_last_indexed_height(&conn, indexed_to);
-                }
-                if let Err(e) = conn.commit() {
-                    error!("Failed to commit the indexed batch: {}", e);
-                }
             }
-            if unread_at.is_some() {
+            if unread_at.is_some() || failed {
                 sleep(Duration::from_secs(2)).await;
             }
         }
@@ -1273,9 +1502,9 @@ const POOL_LAST_SQL: &str = pool_trades!("", "DESC");
 /// B265: an address's latest transactions, sent then received (the
 /// received side leaves out what it sent itself), each a search of its
 /// index (an OR over the two scanned every transaction).
-const HISTORY_SQL: &str = "SELECT hash, sender, receiver, amount, payload, block_height \
+const HISTORY_SQL: &str = "SELECT hash, sender, receiver, amount, payload, block_height, status, coin \
      FROM transactions WHERE sender = ?1 \
-     UNION ALL SELECT hash, sender, receiver, amount, payload, block_height \
+     UNION ALL SELECT hash, sender, receiver, amount, payload, block_height, status, coin \
      FROM transactions WHERE receiver = ?1 AND sender <> ?1 \
      ORDER BY block_height DESC LIMIT 50";
 
@@ -1306,6 +1535,8 @@ fn history(conn: &Connection, address: &str) -> rusqlite::Result<Vec<TxRecord>> 
             amount: row.get(3)?,
             payload: row.get(4)?,
             block_height: row.get(5)?,
+            status: row.get(6)?,
+            coin: row.get(7)?,
         })
     })?;
     Ok(rows.flatten().collect())
@@ -1395,9 +1626,15 @@ struct TxRecord {
     hash: String,
     sender: String,
     receiver: Option<String>,
-    amount: Option<u64>,
+    /// B361: quanta, in decimal (a transfer's whole `u128`).
+    amount: Option<String>,
     payload: String,
     block_height: u64,
+    /// B361: the receipt's status (`success`, or how it failed; none when
+    /// the node had no receipt): an aborted transfer moved nothing.
+    status: Option<String>,
+    /// B361: a transfer's coin type.
+    coin: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1619,6 +1856,13 @@ async fn health() -> impl Responder {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    // B379: a value the indexer cannot read stops it here, every problem
+    // listed (each fell back to a default without a word).
+    let problems = env_problems(|name| env::var(name).ok());
+    if !problems.is_empty() {
+        eprintln!("❌ {}", problems.join("; "));
+        std::process::exit(2);
+    }
     env_logger::init();
     info!("Starting AINCORE Indexer...");
 
@@ -1741,6 +1985,88 @@ mod tests {
         assert!(first.is_empty());
     }
 
+    use super::{env_problems, leading_run, missing_height, switch_on};
+
+    /// B377 witness: a batch takes the node's blocks at their own heights
+    /// from its start and stops at one the node skipped; a first block past
+    /// the start, or no block while the node is at or past it, is a height
+    /// the node no longer holds (the cursor went to the highest block
+    /// answered, past heights never indexed, and an empty answer for a
+    /// pruned range was asked again for good without a word).
+    #[test]
+    fn a_batch_stops_at_a_height_the_node_skipped() {
+        let at = |height: u64| serde_json::json!({"header": {"height": height}});
+        assert_eq!(leading_run(&[at(5), at(6), at(7)], 5), 3);
+        assert_eq!(leading_run(&[at(5), at(7), at(8)], 5), 1, "a gap");
+        assert_eq!(leading_run(&[at(6), at(7)], 5), 0, "a first block past");
+        assert_eq!(leading_run(&[at(4), at(5)], 5), 0, "a first block before");
+        assert_eq!(leading_run(&[at(5), serde_json::json!({})], 5), 1);
+        assert_eq!(leading_run(&[], 5), 0);
+        // The start is reported missing only when the node should hold it.
+        assert_eq!(missing_height(0, 2, 5, Some(9)), Some(5));
+        assert_eq!(missing_height(0, 2, 5, None), Some(5));
+        assert_eq!(missing_height(0, 0, 5, Some(5)), Some(5), "pruned whole");
+        assert_eq!(missing_height(0, 0, 5, Some(4)), None, "caught up");
+        assert_eq!(missing_height(0, 0, 5, None), None);
+        assert_eq!(missing_height(1, 3, 5, Some(9)), None, "a run to index");
+    }
+
+    /// B379 witness: a value the indexer cannot read stops it at boot, each
+    /// listed (a bad batch size, backfill, proxy port or trusted proxy fell
+    /// back to a default without a word, and `True` turned CORS off); the
+    /// values it reads are taken, a switch in any case.
+    #[test]
+    fn a_value_the_indexer_cannot_read_stops_it() {
+        let check = |vars: &[(&str, &str)]| {
+            env_problems(|name| {
+                vars.iter()
+                    .find(|(n, _)| *n == name)
+                    .map(|(_, v)| v.to_string())
+            })
+        };
+        assert!(check(&[]).is_empty());
+        for good in [
+            ("AINCORE_PERMISSIVE_CORS", "Yes"),
+            ("AINCORE_PERMISSIVE_CORS", "FALSE"),
+            ("AINCORE_PERMISSIVE_CORS", "0"),
+            ("AINCORE_PERMISSIVE_CORS", "no"),
+            ("AINCORE_INDEXER_BATCH_SIZE", "1"),
+            ("AINCORE_INDEXER_BATCH_SIZE", "2000"),
+            ("AINCORE_INDEXER_BOOTSTRAP_BACKFILL", "0"),
+            ("AINCORE_INDEXER_BOOTSTRAP_BACKFILL", "1000000"),
+            ("AINCORE_INDEXER_TRUSTED_PROXIES", "127.0.0.1, ::1,"),
+            ("AINCORE_INDEXER_PROXY_PORT", "3101"),
+            ("AINCORE_INDEXER_PROXY_PORT", " 3101 "),
+        ] {
+            assert_eq!(check(&[good]), Vec::<String>::new(), "{good:?} was refused");
+        }
+        let bad = [
+            ("AINCORE_PERMISSIVE_CORS", "on"),
+            ("AINCORE_INDEXER_BATCH_SIZE", "0"),
+            ("AINCORE_INDEXER_BATCH_SIZE", "2001"),
+            ("AINCORE_INDEXER_BATCH_SIZE", "5k"),
+            ("AINCORE_INDEXER_BOOTSTRAP_BACKFILL", "1000001"),
+            ("AINCORE_INDEXER_BOOTSTRAP_BACKFILL", "-1"),
+            ("AINCORE_INDEXER_TRUSTED_PROXIES", "127.0.0.1,proxy.local"),
+            ("AINCORE_INDEXER_PROXY_PORT", "0"),
+            ("AINCORE_INDEXER_PROXY_PORT", "70000"),
+            ("AINCORE_INDEXER_PROXY_PORT", "port"),
+        ];
+        for one in bad {
+            assert_eq!(check(&[one]).len(), 1, "{one:?} was taken");
+        }
+        // Every problem is listed, not the first alone.
+        let distinct = [bad[0], bad[1], bad[4], bad[6], bad[7]];
+        assert_eq!(check(&distinct).len(), distinct.len());
+        // The CORS switch reads what the check takes, in any case.
+        for on in ["1", "true", "True", "TRUE", "yes", "Yes", "YES"] {
+            assert!(switch_on(on), "{on:?} was off");
+        }
+        for off in ["0", "false", "no", "No", "on", ""] {
+            assert!(!switch_on(off), "{off:?} was on");
+        }
+    }
+
     /// B233 witness: an error answered for a receipt is an error, not "no
     /// receipt" (the batch's height advanced past a busy answer and its DEX
     /// trades were lost); a null result is no receipt.
@@ -1798,13 +2124,14 @@ mod tests {
         });
 
         let encoded = hex::encode(bcs::to_bytes(&payload).unwrap());
-        let (decoded_receiver, decoded_amount) = decode_transfer(&encoded);
+        let transfer = decode_transfer(&encoded).expect("a transfer");
 
         assert_eq!(
-            decoded_receiver.as_deref(),
+            transfer.receiver.as_deref(),
             Some("0000000000000000000000000000000022222222222222222222222222222222")
         );
-        assert_eq!(decoded_amount, 1234);
+        assert_eq!(transfer.amount, "1234");
+        assert_eq!(transfer.coin.as_deref(), Some("0x1::staking::AincoreCoin"));
     }
 
     #[test]
@@ -1812,10 +2139,7 @@ mod tests {
         let payload = vm_move::TransactionPayload::PublishModule(vec![vec![0xCA, 0xFE]]);
         let encoded = hex::encode(bcs::to_bytes(&payload).unwrap());
 
-        let (decoded_receiver, decoded_amount) = decode_transfer(&encoded);
-
-        assert!(decoded_receiver.is_none());
-        assert_eq!(decoded_amount, 0);
+        assert_eq!(decode_transfer(&encoded), None);
     }
 
     #[test]
@@ -2036,7 +2360,7 @@ mod tests {
         Connection, DAY_SECS, Duration, HISTORY_SQL, Instant, IpAddr, PAIR_FIRST_SQL,
         PAIR_LAST_SQL, PAIR_LATEST_SQL, PAIR_WINDOW_SQL, POOL_FIRST_SQL, POOL_LAST_SQL,
         POOL_WINDOW_SQL, POOLS_SQL, READERS, Reads, SENDER_TRADES_SQL, history,
-        index_dex_trade_row, markets, pair_summary, prepare_db, read, trade_row,
+        index_dex_trade_row, markets, pair_summary, prepare_db, read, trade_row, write_batch,
     };
     use std::sync::Arc;
 
@@ -2068,6 +2392,183 @@ mod tests {
                 let _ = std::fs::remove_file(format!("{}{suffix}", self.path));
             }
         }
+    }
+
+    /// B361 witness: a transfer is listed with its receipt's status and its
+    /// coin, and its whole amount (an aborted one was listed as a transfer,
+    /// and one past i64::MAX quanta, ~9.22 AIN, was dropped without a word
+    /// while the batch's height advanced); a batch with a row that cannot be
+    /// written commits nothing, its height included.
+    #[test]
+    fn a_transfer_is_listed_whole_with_its_status_and_coin() {
+        let db = TempDb::new("b361_transfer");
+        let mut conn = Connection::open(&db.path).unwrap();
+        let receiver =
+            AccountAddress::from_hex_literal("0x22222222222222222222222222222222").unwrap();
+        let payload = vm_move::TransactionPayload::EntryFunction(vm_move::EntryFunctionCall {
+            module: ModuleId::new(system_address(), Identifier::new("coin").unwrap()),
+            function: "transfer".to_string(),
+            ty_args: vec![aincore_coin_type()],
+            args: vec![
+                bcs::to_bytes(&system_address()).unwrap(),
+                bcs::to_bytes(&receiver).unwrap(),
+                bcs::to_bytes(&(100u128 * 10u128.pow(18))).unwrap(),
+            ],
+        });
+        let tx = serde_json::json!({
+            "sender": "attacker",
+            "payload": hex::encode(bcs::to_bytes(&payload).unwrap()),
+        })
+        .to_string();
+        let pending = PendingTx {
+            height: 7,
+            timestamp: 1,
+            hash: "h".into(),
+            tx_str: tx,
+        };
+        let aborted = serde_json::json!({
+            "status": "aborted",
+            "execution_receipt": {"status": "aborted", "error": "Move abort"},
+        });
+        {
+            let batch = conn.transaction().unwrap();
+            write_batch(&batch, &[(pending, Some(aborted))], 7, 0).unwrap();
+            batch.commit().unwrap();
+        }
+        let listed = history(&conn, "attacker").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].amount.as_deref(), Some("100000000000000000000"));
+        assert_eq!(listed[0].status.as_deref(), Some("aborted"));
+        assert_eq!(listed[0].coin.as_deref(), Some("0x1::staking::AincoreCoin"));
+        assert_eq!(super::get_last_indexed_height(&conn), 7);
+
+        // A row that cannot be written fails its batch, height and all.
+        conn.execute_batch("DROP TABLE dex_trades").unwrap();
+        let swap = serde_json::json!({"execution_receipt": {"status": "success", "metadata": {
+            "kind": "dex", "function": "swap_x_to_y", "pool_addr": "p",
+            "type_args": ["0x1::staking::AincoreCoin", "0x1::wbtc::WBTC"],
+            "token_in": "0x1::staking::AincoreCoin", "token_out": "0x1::wbtc::WBTC",
+            "amount_in": "1", "actual_amount_out": "1"}}});
+        let next = PendingTx {
+            height: 8,
+            timestamp: 2,
+            hash: "s".into(),
+            tx_str: serde_json::json!({"sender": "trader", "payload": ""}).to_string(),
+        };
+        let batch = conn.transaction().unwrap();
+        assert!(write_batch(&batch, &[(next, Some(swap))], 8, 7).is_err());
+        drop(batch);
+        assert_eq!(
+            super::get_last_indexed_height(&conn),
+            7,
+            "the height advanced"
+        );
+        assert!(history(&conn, "trader").unwrap().is_empty());
+    }
+
+    /// B361 witness: a database of the first schema (an INTEGER amount) is
+    /// rebuilt with a TEXT amount: TEXT put in an INTEGER column becomes a
+    /// REAL past i64::MAX. B378 witness: its rows, written without their
+    /// status, are dropped and the cursor goes back to 0, so the blocks the
+    /// node holds are indexed again (they were kept, aborted and wBTC
+    /// transfers listed without a status, and the cursor stayed where it
+    /// was); its DEX trades are kept, their senders read first.
+    #[test]
+    fn a_first_schema_database_is_rebuilt_and_indexed_again() {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = std::env::temp_dir()
+            .join(format!(
+                "aincore_indexer_b361_v1_{}_{n}.db",
+                std::process::id()
+            ))
+            .to_string_lossy()
+            .into_owned();
+        let db = TempDb { path };
+        let conn = Connection::open(&db.path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE transactions (hash TEXT PRIMARY KEY, sender TEXT NOT NULL,
+                 receiver TEXT, amount INTEGER, payload TEXT, block_height INTEGER,
+                 timestamp INTEGER);
+             INSERT INTO transactions VALUES ('old', 'a', 'b', 5, '', 3, 0);
+             CREATE TABLE state (key TEXT PRIMARY KEY, value TEXT);
+             INSERT INTO state VALUES ('last_height', '900');
+             CREATE TABLE dex_trades (tx_hash TEXT PRIMARY KEY, pool_addr TEXT NOT NULL,
+                 function TEXT NOT NULL, token_x TEXT NOT NULL, token_y TEXT NOT NULL,
+                 token_in TEXT NOT NULL, token_out TEXT NOT NULL, amount_in TEXT NOT NULL,
+                 amount_out TEXT NOT NULL, block_height INTEGER NOT NULL,
+                 timestamp INTEGER NOT NULL);
+             INSERT INTO dex_trades VALUES ('old', 'p', 'swap_x_to_y', 'x', 'y', 'x', 'y',
+                 '1', '1', 3, 0);",
+        )
+        .unwrap();
+        prepare_db(&conn).unwrap();
+        // B378: the row without a status is gone, the cursor back to 0.
+        assert!(history(&conn, "a").unwrap().is_empty(), "a row kept");
+        assert_eq!(
+            super::get_last_indexed_height(&conn),
+            0,
+            "the cursor stayed"
+        );
+        // B378: the DEX trade is kept, its sender read from the row first.
+        let trader: String = conn
+            .query_row(
+                "SELECT sender FROM dex_trades WHERE tx_hash = 'old'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(trader, "a");
+        // A second open migrates nothing: the cursor is left alone.
+        super::set_last_indexed_height(&conn, 7);
+        prepare_db(&conn).unwrap();
+        assert_eq!(super::get_last_indexed_height(&conn), 7);
+        // B378: a row indexed again replaces the one there (OR IGNORE kept
+        // the first, its status unknown). The rows this test writes by hand
+        // carry a payload, as every indexed row does: `history` skips a row
+        // it cannot read, and a NULL payload is one.
+        let tx = serde_json::json!({"sender": "again", "payload": ""}).to_string();
+        let hash = super::tx_hash_hex(&tx);
+        conn.execute(
+            "INSERT INTO transactions (hash, sender, payload, block_height) VALUES (?1, 'again', '', 5)",
+            [&hash],
+        )
+        .unwrap();
+        let pending = PendingTx {
+            height: 5,
+            timestamp: 0,
+            hash,
+            tx_str: tx,
+        };
+        let aborted = serde_json::json!({"status": "aborted"});
+        write_batch(&conn, &[(pending, Some(aborted))], 5, 7).unwrap();
+        let again = history(&conn, "again").unwrap();
+        assert_eq!(again.len(), 1);
+        assert_eq!(
+            again[0].status.as_deref(),
+            Some("aborted"),
+            "the first row kept"
+        );
+        assert_eq!(super::get_last_indexed_height(&conn), 7);
+        // B361: the rebuilt column keeps a whole u128 as text (an INTEGER
+        // column made it a REAL, which no reader takes for a string).
+        let big = "340282366920938463463374607431768211455";
+        conn.execute(
+            "INSERT INTO transactions (hash, sender, amount, payload, block_height) VALUES ('big', 'a', ?1, '', 4)",
+            [big],
+        )
+        .unwrap();
+        let stored: String = conn
+            .query_row(
+                "SELECT typeof(amount) FROM transactions WHERE hash = 'big'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "text", "the amount column is not TEXT");
+        let listed = history(&conn, "a").unwrap();
+        assert_eq!(listed.len(), 1, "the row was not listed");
+        assert_eq!(listed[0].amount.as_deref(), Some(big));
     }
 
     /// B265 witness: every query the API runs is a search of an index (each
@@ -2179,7 +2680,7 @@ mod tests {
         let (x, y) = ("0x1::staking::AincoreCoin", "0x1::wbtc::WBTC");
         let trades: Vec<DexTradeRecord> = (0..40).map(|i| trade(i, now, i % 3 != 0)).collect();
         for t in &trades {
-            index_dex_trade_row(&conn, t);
+            index_dex_trade_row(&conn, t).unwrap();
         }
         let mut oldest_first = trades.clone();
         oldest_first.sort_by_key(|t| t.timestamp);
@@ -2322,12 +2823,17 @@ mod tests {
     }
 
     /// B280 witness: one cached markets list serves every `limit` (a list
-    /// per limit let a client skip the cache by varying it).
+    /// per limit let a client skip the cache by varying it), read for the
+    /// most any request may ask: two markets, and a first request for one
+    /// must not leave a list of one for the next (an r27 survivor).
     #[actix_web::test]
     async fn one_markets_list_serves_every_limit() {
         let db = TempDb::new("b280_markets");
         let conn = Connection::open(&db.path).unwrap();
-        index_dex_trade_row(&conn, &trade(0, super::now_secs(), true));
+        index_dex_trade_row(&conn, &trade(0, super::now_secs(), true)).unwrap();
+        let mut other_pool = trade(1, super::now_secs(), true);
+        other_pool.pool_addr = "pool2".into();
+        index_dex_trade_row(&conn, &other_pool).unwrap();
         let state = actix_web::web::Data::new(super::AppState {
             reads: Arc::new(Reads::open(&db.path, READERS).unwrap()),
             client_ip: super::ClientIp::default(),
@@ -2344,7 +2850,12 @@ mod tests {
                 .peer_addr("127.0.0.1:5000".parse().unwrap())
                 .to_request();
             let body: serde_json::Value = actix_web::test::call_and_read_body_json(&app, req).await;
-            assert_eq!(body.as_array().map(Vec::len), Some(1), "limit {limit}");
+            let expected = limit.min(2);
+            assert_eq!(
+                body.as_array().map(Vec::len),
+                Some(expected),
+                "limit {limit}"
+            );
         }
         assert!(state.reads.markets.lock().unwrap().is_some());
         assert!(

@@ -29,17 +29,15 @@ services:
       - "0.0.0.0:9102:9102"   # libp2p: consensus + sync sessions (base port + 100)
       - "0.0.0.0:8002:8002"   # REST API / RPC
     volumes:
-      - ./nas_data:/root/.aincore/data
-      - ${AINCORE_GENESIS_FILE:?set AINCORE_GENESIS_FILE to the genesis.json of the chain this node joins}:/root/.aincore/genesis.json:ro
+      - ./nas_data:/home/aincore/.aincore/data
+      - ${AINCORE_GENESIS_FILE:?set AINCORE_GENESIS_FILE to the genesis.json of the chain this node joins}:/home/aincore/.aincore/genesis.json:ro
     environment:
-      - AINCORE_PORT=9002
-      - AINCORE_API_PORT=8002
       # B269: reachable from the published port and the indexer.
       - AINCORE_RPC_BIND=0.0.0.0
-      - AINCORE_GENESIS_PATH=/root/.aincore/genesis.json
+      - AINCORE_GENESIS_PATH=/home/aincore/.aincore/genesis.json
       - RUST_LOG=info
       - RUST_BACKTRACE=1
-    command: ["node", "--port", "9002", "--rpc-port", "8002", "--datadir", "/root/.aincore/data"]
+    command: ["node", "--port", "9002", "--rpc-port", "8002", "--datadir", "/home/aincore/.aincore/data"]
     # NAS Resource Limits (F2-423: 2 cores, 4GB RAM)
     deploy:
       resources:
@@ -66,7 +64,7 @@ services:
     restart: unless-stopped
     command: ["indexer"]
     volumes:
-      - ./nas_data/indexer:/root/.aincore
+      - ./nas_data/indexer:/home/aincore/.aincore
     environment:
       - NODE_RPC_URL=http://aincore-node:8002/rpc
       - RUST_LOG=info

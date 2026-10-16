@@ -103,9 +103,12 @@ pub fn record_twin(storage: &StateDB, a: &Vertex, b: &Vertex) {
     let _ = storage.put(&key, &item);
 }
 
-/// The bodies this node holds for `v`'s slot under another digest.
+/// The bodies this node holds for `v`'s slot under another digest. A slot
+/// row that cannot be read gives none here: staging reads the same row in
+/// its transaction and fails there (B456).
 pub fn other_bodies(storage: &StateDB, v: &Vertex) -> Vec<Vertex> {
     crate::staging::slot_digests(storage, v.epoch, v.round, &v.author)
+        .unwrap_or_default()
         .into_iter()
         .filter(|digest| *digest != v.hash)
         .filter_map(|digest| {

@@ -4,7 +4,10 @@
 #   ./fund-validator.sh <alamat-64-hex> [jumlah-AIN]
 #
 # Runs ON a validator host: it signs with that node's own node.key, which never
-# leaves the machine. Default 1010 AIN = MIN_STAKE (1000) plus gas headroom.
+# leaves the machine. Default 1010 AIN = MIN_STAKE (1000) plus gas headroom
+# (the join, and B441: the node's proof of boot, which the node must note
+# below the boundary block of the epoch its join lands in for it to sign in
+# its first member epoch).
 set -euo pipefail
 ADDR="${1:-}"
 AMOUNT="${2:-1010}"

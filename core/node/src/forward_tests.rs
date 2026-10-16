@@ -1,17 +1,31 @@
 use super::*;
 
 fn signed_tx(seed: u8, seq: u64) -> String {
+    signed_tx_priced(seed, seq, 1)
+}
+
+/// `signed_tx` at `gas_price` (B453: a fee-bumped replacement of it).
+fn signed_tx_priced(seed: u8, seq: u64, gas_price: u64) -> String {
+    signed_publish(seed, seq, gas_price, vec![seed, seq as u8])
+}
+
+/// The canonical transaction of `seed`'s key at `seq` and `gas_price`
+/// publishing `module`, its gas limit covering its bytes and at least
+/// 100,000 gas of execution (B462: its publish floor, for large ones).
+fn signed_publish(seed: u8, seq: u64, gas_price: u64, module: Vec<u8>) -> String {
     use ed25519_dalek::Signer;
     let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
     let sender = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
-    let payload = vm_move::TransactionPayload::PublishModule(vec![vec![seed, seq as u8]]);
+    let modules = vec![module];
+    let execution = executor::admission::publish_floor(&modules).max(100_000);
+    let payload = vm_move::TransactionPayload::PublishModule(modules);
     let mut tx = serde_json::json!({
         "chain_id": blockchain::chain_id(),
         "sender": sender,
         "input_objects": [],
         "payload": hex::encode(bcs::to_bytes(&payload).unwrap()),
         "args": [],
-        "gas_price": 1,
+        "gas_price": gas_price,
         "sequence_number": seq,
         "public_key": hex::encode(key.verifying_key().to_bytes()),
         "gas_limit": 0,
@@ -20,7 +34,7 @@ fn signed_tx(seed: u8, seq: u64) -> String {
     let unsized_len = tx.to_string().len();
     tx["gas_limit"] = serde_json::json!(executor::admission::gas_limit_covering(
         unsized_len,
-        100_000
+        execution
     ));
     let parsed: executor::Transaction = serde_json::from_value(tx.clone()).unwrap();
     let message = executor::admission::signing_message(&parsed);
@@ -262,6 +276,13 @@ async fn an_observer_forwards_its_mempool_to_a_member() {
             "never a non-member"
         );
     }
+    // B452: refused for good by members, it never ran here: the same bytes
+    // are taken again.
+    observer
+        .lock()
+        .unwrap()
+        .add_transaction(txs[2].clone())
+        .expect("refused again after its drop");
 
     // Nobody answers: the batch returns to the front of the queue, in order.
     let lonely = Arc::new(Mutex::new(Mempool::new()));
@@ -357,6 +378,12 @@ async fn a_transaction_never_taken_leaves_at_its_ttl() {
     }
     forward_once_at(&observer, &client, &state, t0 + FORWARD_TTL_SECS).await;
     assert!(!waiting(&observer), "still forwarded past its TTL");
+    // B452: it never ran, so the same bytes are taken again.
+    observer
+        .lock()
+        .unwrap()
+        .add_transaction(tx)
+        .expect("refused again after its TTL");
 }
 
 /// B53/B134 witness: a member that answers Accepted and drops the
@@ -928,6 +955,75 @@ async fn a_refusal_for_now_drops_nothing() {
     assert!(!held(&observer), "vacuous: refusals for good kept it");
 }
 
+/// B453 witness: a fee-bumped replacement whose original every member holds
+/// on loan to a vertex is refused for now, not for good: the observer keeps
+/// it, and once the original comes back unrun at a member, the replacement
+/// asked again replaces it there. The refusal was for good, so members over
+/// a third of the stake holding the original on loan dropped the
+/// replacement after the RPC had answered "sent".
+#[tokio::test]
+async fn a_replacement_of_a_transaction_on_loan_is_kept() {
+    let original = signed_tx_priced(62, 0, 1);
+    let bump = signed_tx_priced(62, 0, 2);
+    let names = ["l1", "l2"];
+    let members: Vec<network::SessionPeer> = names.iter().map(|n| session(n, true)).collect();
+    // Each member holds the original on loan to a vertex.
+    let pools: Vec<Arc<Mutex<Mempool>>> = names
+        .iter()
+        .map(|_| {
+            let mut mp = Mempool::new();
+            mp.add_transaction(original.clone()).unwrap();
+            assert_eq!(
+                mp.get_pending_transactions_at(1, 100),
+                std::slice::from_ref(&original),
+                "vacuous: the original is not on loan"
+            );
+            Arc::new(Mutex::new(mp))
+        })
+        .collect();
+    let asked = submit(std::slice::from_ref(&bump));
+    let v = verdicts(&serve_tx_submit(&pools[0], &asked).unwrap());
+    assert!(
+        matches!(&v[0], Verdict::Later(r) if r.contains("on loan")),
+        "{v:?}"
+    );
+    let observer = Arc::new(Mutex::new(Mempool::new()));
+    observer
+        .lock()
+        .unwrap()
+        .add_transaction(bump.clone())
+        .unwrap();
+    let (s1, s2) = (Arc::clone(&pools[0]), Arc::clone(&pools[1]));
+    let client = fake_network(members, move |peer, wire| {
+        let pool = if peer == "l1" { &s1 } else { &s2 };
+        serve_tx_submit(pool, wire).ok_or_else(|| "refused".into())
+    });
+    let state = ForwardState::default();
+    let t0 = 1_000_000;
+    assert_eq!(forward_once_at(&observer, &client, &state, t0).await, 0);
+    assert!(
+        observer.lock().unwrap().any_pending(|p| *p == bump),
+        "refused while its original was on loan: dropped"
+    );
+    // No block settled the original: back from its loan at every member.
+    for pool in &pools {
+        assert_eq!(pool.lock().unwrap().requeue_stale_at(30, 130), 1);
+    }
+    let stale = t0 + FORWARD_RETRY_SECS + 1;
+    assert_eq!(
+        forward_once_at(&observer, &client, &state, stale).await,
+        1,
+        "not asked again once its loan was stale"
+    );
+    let replaced = |pool: &Arc<Mutex<Mempool>>| {
+        pool.lock().unwrap().get_all_pending() == std::slice::from_ref(&bump)
+    };
+    assert!(
+        pools.iter().any(replaced),
+        "the replacement did not replace the original"
+    );
+}
+
 /// B251 witness: a forwarder that named `MAX_MEMBER_IDS` members over its
 /// life still records a new member's verdicts once the records naming the
 /// old ones are gone (ids were given for good, and from then on a new
@@ -987,4 +1083,169 @@ fn a_submit_batch_yields_to_a_waiting_consensus_thread() {
             "vacuous: {reply}"
         );
     });
+}
+
+/// B475 witness: the checks of transactions from outside (an RPC send's, a
+/// submit batch's) let a waiting consensus thread take the pool's lock
+/// before their dedup lookups, as an admission does (B259): every RPC send
+/// took it at once.
+#[test]
+fn outside_checks_yield_to_a_waiting_consensus_thread() {
+    let pool = Mutex::new(Mempool::new());
+    let tx = signed_tx(9, 1);
+    let done = AtomicBool::new(false);
+    let waiting = mempool::ConsensusWaiting::begin();
+    std::thread::scope(|s| {
+        let checking = s.spawn(|| {
+            let checked = check_from_outside(&pool, vec![tx.clone()]);
+            done.store(true, Ordering::SeqCst);
+            checked
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        let early = done.load(Ordering::SeqCst);
+        drop(waiting);
+        let checked = checking.join().unwrap();
+        assert!(
+            !early,
+            "outside checks went before a waiting consensus thread"
+        );
+        assert!(
+            checked[0].is_ok(),
+            "vacuous: {:?}",
+            checked[0].as_ref().err()
+        );
+    });
+}
+
+/// B462: a pool on a database of its own in which the keys of `seeds` hold
+/// an account and plenty of AIN, so its gates and its evictions run.
+fn funded_pool(seeds: &[u8]) -> Arc<Mutex<Mempool>> {
+    let db = Arc::new(
+        storage::StateDB::open(&storage::test_dir::test_dir_str("forward_pool"))
+            .expect("a test database"),
+    );
+    for &seed in seeds {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let sender = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
+        executor::test_support::set_sequence_number(
+            &db,
+            &sender,
+            &hex::encode(key.verifying_key().to_bytes()),
+            0,
+        );
+        executor::test_support::set_ain_balance(&db, &sender, 10u128.pow(30));
+    }
+    Arc::new(Mutex::new(Mempool::with_storage(db)))
+}
+
+/// B462 witness: what members over a third of the stake refused for now
+/// holds no room at an observer: deferred, a ready transaction evicts it
+/// from a pool full by its bytes, though a member was down and the
+/// transaction went back to the queue to ask it (B247); a minority's
+/// refusals for now defer nothing; taken by a member, it holds its room
+/// again. Kept to their TTL and never evicted, transactions the members
+/// refused only for now (their payer short there, by a transaction only
+/// they held) filled an observer's pool, and its RPC answered every user
+/// "Mempool full".
+#[tokio::test]
+async fn what_members_refused_for_now_holds_no_room() {
+    let (filler, first, second) = (63u8, 64u8, 66u8);
+    let observer = funded_pool(&[filler, first, second]);
+    let admit = |tx: &String| observer.lock().unwrap().add_transaction(tx.clone());
+    let mut held = 0;
+    for seq in 0..mempool::MAX_NONCE_AHEAD - 1 {
+        if admit(&signed_publish(filler, seq, 1, vec![seq as u8; 45 * 1024])).is_err() {
+            break;
+        }
+        held += 1;
+    }
+    // A KiB more than a filler, so neither fits the room a filler left.
+    let newcomer = |seed: u8| signed_publish(seed, 0, 1, vec![seed; 46 * 1024]);
+    let (one, two) = (newcomer(first), newcomer(second));
+    let full = admit(&one).unwrap_err();
+    assert!(full.contains("bytes held"), "vacuous: {full} ({held} held)");
+    let members = vec![session("m1", true), session("m2", true), session("m3", true)];
+    let state = ForwardState::default();
+    let t0 = 1_000_000;
+    // One member refuses for now, the others are down: a minority.
+    let minority = fake_network(members.clone(), |peer, wire| match peer {
+        "m1" => answer_all(wire, Verdict::Later("Insufficient balance".into())),
+        _ => Err("gone".into()),
+    });
+    forward_once_at(&observer, &minority, &state, t0).await;
+    let full = admit(&one).unwrap_err();
+    assert!(
+        full.contains("bytes held"),
+        "one member's refusal for now deferred it: {full}"
+    );
+    // Two of the three refuse for now, the third is down.
+    let refusing = fake_network(members.clone(), |peer, wire| match peer {
+        "m3" => Err("gone".into()),
+        _ => answer_all(wire, Verdict::Later("Insufficient balance".into())),
+    });
+    forward_once_at(&observer, &refusing, &state, t0 + FORWARD_RETRY_SECS).await;
+    admit(&one).expect("refused for room held by what members refused for now");
+    // The members take them: they hold their room again.
+    let taking = Arc::new(Mutex::new(Mempool::new()));
+    let served = Arc::clone(&taking);
+    let accepting = fake_network(members, move |peer, wire| match peer {
+        "m3" => Err("gone".into()),
+        _ => serve_tx_submit(&served, wire).ok_or_else(|| "refused".into()),
+    });
+    forward_once_at(&observer, &accepting, &state, t0 + 2 * FORWARD_RETRY_SECS).await;
+    let full = admit(&two).unwrap_err();
+    assert!(
+        full.contains("bytes held"),
+        "what the members took stayed deferred: {full}"
+    );
+}
+
+/// B476 witness: through an observer, a fee-bumped replacement takes the
+/// place of an original the observer is forwarding, and replaces it at the
+/// member that took it. The observer refused it while the original was on
+/// loan (to its forwarder, in no vertex) and re-queued and loaned the
+/// original again in one lock hold every `FORWARD_RETRY_SECS`, so no
+/// replacement got in until the original ran, was refused for good or
+/// reached its TTL.
+#[tokio::test]
+async fn a_replacement_takes_the_place_of_an_original_being_forwarded() {
+    let original = signed_tx_priced(65, 0, 1);
+    let bump = signed_tx_priced(65, 0, 2);
+    let observer = Arc::new(Mutex::new(Mempool::new()));
+    observer
+        .lock()
+        .unwrap()
+        .add_transaction(original.clone())
+        .unwrap();
+    let member = Arc::new(Mutex::new(Mempool::new()));
+    let served = Arc::clone(&member);
+    let client = fake_network(vec![session("m", true)], move |_, wire| {
+        serve_tx_submit(&served, wire).ok_or_else(|| "refused".into())
+    });
+    let state = ForwardState::default();
+    let t0 = 1_000_000;
+    assert_eq!(forward_once_at(&observer, &client, &state, t0).await, 1);
+    assert!(
+        observer.lock().unwrap().any_pending(|p| *p == original),
+        "vacuous: the original is not on loan"
+    );
+    observer
+        .lock()
+        .unwrap()
+        .add_transaction(bump.clone())
+        .expect("a fee bump of an original being forwarded");
+    {
+        let o = observer.lock().unwrap();
+        assert!(
+            !o.any_pending(|p| *p == original),
+            "the original stayed beside its replacement"
+        );
+        assert_eq!(o.get_all_pending(), std::slice::from_ref(&bump));
+    }
+    assert_eq!(forward_once_at(&observer, &client, &state, t0 + 1).await, 1);
+    assert_eq!(
+        member.lock().unwrap().get_all_pending(),
+        std::slice::from_ref(&bump),
+        "the member kept the original"
+    );
 }

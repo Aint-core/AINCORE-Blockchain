@@ -65,6 +65,60 @@ pub const MAX_EVICTIONS_PER_ADMISSION: usize = 256;
 const MAX_REQUEUE_ATTEMPTS: u8 = 3;
 const MAX_SEEN_TXS: usize = 50000;
 
+/// The identities of transactions seen, for deduplication, the oldest
+/// leaving first. B368: bounded by its order's own length. An identity
+/// forgotten (replaced, evicted, expired) left its entry in the order for
+/// good, and the order was popped only while the set was full, so every
+/// replacement, which is free, grew it by an identity until restart.
+struct SeenTxs {
+    /// Each identity, with the number of its latest insertion.
+    ids: std::collections::HashMap<String, u64>,
+    /// Insertions in order; one whose identity was forgotten or inserted
+    /// again is stale, and popped in its turn.
+    order: VecDeque<(String, u64)>,
+    next: u64,
+    max: usize,
+}
+
+impl SeenTxs {
+    fn new(max: usize) -> Self {
+        Self {
+            ids: std::collections::HashMap::new(),
+            order: VecDeque::new(),
+            next: 0,
+            max,
+        }
+    }
+
+    fn contains(&self, id: &str) -> bool {
+        self.ids.contains_key(id)
+    }
+
+    fn insert(&mut self, id: String) {
+        while self.order.len() >= self.max {
+            let Some((old, at)) = self.order.pop_front() else {
+                break;
+            };
+            if self.ids.get(&old) == Some(&at) {
+                self.ids.remove(&old);
+            }
+        }
+        let at = self.next;
+        self.next += 1;
+        self.ids.insert(id.clone(), at);
+        self.order.push_back((id, at));
+    }
+
+    fn forget(&mut self, id: &str) {
+        self.ids.remove(id);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.ids.len()
+    }
+}
+
 /// Seconds since the Unix epoch, for callers without a clock of their own.
 fn wall_secs() -> u64 {
     std::time::SystemTime::now()
@@ -170,15 +224,27 @@ struct Held {
     unpaid_since: Option<u64>,
     /// The attempts carried from a requeue into its next loan.
     requeue_attempts: u8,
-    /// On loan to a vertex: (loaned at, in the caller's clock; attempts).
+    /// On loan to a vertex (or B476: to the forwarder): (loaned at, in the
+    /// caller's clock; attempts).
     loan: Option<(u64, u8)>,
+    /// B476: the loan is to this node's forwarder (`loan_for_forwarding_at`),
+    /// not to a vertex, so a fee-bumped replacement takes its place.
+    forwarding: bool,
+    /// B462: refused for now by members over a third of the stake, as this
+    /// node's forwarder last heard (`defer`), queued or on loan: set and
+    /// cleared by the forwarder alone.
+    deferred: bool,
 }
 
 /// B201: why `add_checked` did not admit a transaction, and whether only
 /// for now (the fee, the pool's room, a nonce gap, the payer's balance, the
-/// pre-charge at today's byte gas). A forwarder keeps a transaction refused
-/// for now until its TTL: two such refusals dropped it for good, after the
-/// RPC had answered "sent".
+/// pre-charge at today's byte gas; B453: its sequence on loan to a vertex).
+/// A forwarder keeps a transaction refused for now until its TTL: two such
+/// refusals dropped it for good, after the RPC had answered "sent". A
+/// replacement under the price bump is refused for good (geth's
+/// "replacement transaction underpriced"). B462: what members over a third
+/// of the stake refused for now holds no room at the forwarder against a
+/// ready transaction (`Mempool::defer`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refusal {
     pub reason: String,
@@ -212,11 +278,10 @@ impl std::fmt::Display for Refusal {
 pub struct Mempool {
     /// The queue, in order: the transactions not on loan (B239: by id).
     pending_txs: VecDeque<TxId>,
-    seen_txs: HashSet<String>,    // Deduplication
-    seen_order: VecDeque<String>, // Bounded cache tracking
-    /// sender:sequence_number → the queued transaction (B239: so a
-    /// replacement finds the one it replaces by a point lookup; it walked
-    /// the queue).
+    seen_txs: SeenTxs,
+    /// sender:sequence_number → the transaction held, queued or on loan
+    /// (B239: so a replacement finds the one it replaces by a point lookup;
+    /// it walked the queue. B313: one per sender:sequence, on loan too).
     pending_nonces: std::collections::HashMap<String, TxId>,
     /// B239: every transaction held, queued or on loan, by id. LOANED, NOT
     /// GONE (orphan-loss fix): transactions handed to consensus by
@@ -264,8 +329,7 @@ impl Mempool {
     pub fn new() -> Self {
         Self {
             pending_txs: VecDeque::new(),
-            seen_txs: HashSet::new(),
-            seen_order: VecDeque::new(),
+            seen_txs: SeenTxs::new(MAX_SEEN_TXS),
             pending_nonces: std::collections::HashMap::new(),
             held: std::collections::HashMap::new(),
             by_hash: std::collections::HashMap::new(),
@@ -420,6 +484,30 @@ impl Mempool {
         let nonce_key = format!("{}:{}", parsed_tx.sender, parsed_tx.sequence_number);
         let replacing = if let Some(&old) = self.pending_nonces.get(&nonce_key) {
             match self.held.get(&old) {
+                // B313: one transaction a sender:sequence. One on loan to a
+                // vertex is neither replaced nor joined: a second beside it
+                // was parked by selection from there on and counted ready by
+                // `ready_run_end`, so the sender's queue was never evicted
+                // and its newcomers evicted other senders'. Its loan ends
+                // when a block runs it, or at `requeue_stale`'s age (and it
+                // may be loaned again at once).
+                // B453: refused for now (B201): back from its loan unrun, it
+                // may be replaced, so a forwarder keeps the newcomer and asks
+                // again (a refusal for good counted toward dropping it).
+                // B476: one on loan to this node's forwarder is in no
+                // vertex: it is replaced as a queued one is (the members
+                // judge the replacement against their own copies, B453).
+                // Refused, it was re-queued and loaned again in one lock
+                // hold every `FORWARD_RETRY_SECS`, so no replacement got in
+                // until it ran, members refused it for good or its TTL.
+                Some(loaned) if loaned.loan.is_some() && !loaned.forwarding => {
+                    let on_loan = format!(
+                        "Duplicate pending nonce for sender {} sequence {} (on loan to a \
+                         vertex: a replacement is taken only once it comes back unrun)",
+                        parsed_tx.sender, parsed_tx.sequence_number
+                    );
+                    return Err(Refusal::for_now(on_loan));
+                }
                 Some(waiting)
                     if parsed_tx.gas_price.saturating_mul(100)
                         >= waiting
@@ -450,7 +538,10 @@ impl Mempool {
         // space with unlimited fresh keypairs. The paymaster is held to it too
         // (B13): its signature is verified now, so its balance is the one that
         // pays. Without storage (unit tests) the gate is skipped.
-        if let Some(storage) = &self.storage {
+        // B462: the payer's parked transactions evicted for this one.
+        let mut evicted: Vec<TxId> = Vec::new();
+        let storage = self.storage.clone();
+        if let Some(storage) = &storage {
             // B15: below the committed base fee the executor would refuse it.
             let base_fee = executor::committed_base_fee(storage);
             if parsed_tx.gas_price < base_fee {
@@ -496,10 +587,33 @@ impl Mempool {
             let need = waiting.saturating_add(gas_cost);
             match executor::committed_ain_balance(storage, &checked.payer) {
                 Some(balance) if balance < need => {
-                    return Err(Refusal::for_now(format!(
-                        "Insufficient balance for gas: have {}, need {} (gas_limit {} × gas_price {}, plus {} for the payer's waiting transactions)",
-                        balance, need, parsed_tx.gas_limit, parsed_tx.gas_price, waiting
-                    )));
+                    // B462: a ready transaction its payer falls short of
+                    // only by its own parked ones (never offered, so never
+                    // charged) evicts them, as a full pool evicts parked
+                    // ones for it (B70); they are evicted only if together
+                    // they make it whole (B231). They held the balance
+                    // against what can run, and only where they were held:
+                    // a member holding a parked transaction no observer saw
+                    // refused for now, for free, every ready one of its
+                    // payer the observer admitted, and those then held the
+                    // observer's pool full to their TTL.
+                    let victims = if self.is_ready(
+                        storage,
+                        &parsed_tx.sender,
+                        parsed_tx.sequence_number,
+                        parsed_tx.gas_price,
+                    ) {
+                        self.payer_victims(storage, &checked.payer, need - balance, replacing)
+                    } else {
+                        None
+                    };
+                    let Some(victims) = victims else {
+                        return Err(Refusal::for_now(format!(
+                            "Insufficient balance for gas: have {}, need {} (gas_limit {} × gas_price {}, plus {} for the payer's waiting transactions)",
+                            balance, need, parsed_tx.gas_limit, parsed_tx.gas_price, waiting
+                        )));
+                    };
+                    evicted = victims;
                 }
                 Some(_) => {}
                 None => {
@@ -542,23 +656,39 @@ impl Mempool {
         let replaced_len = replacing
             .and_then(|id| self.held.get(&id))
             .map_or(0, |h| h.meta.raw_len);
+        // B462: the payer's parked transactions it evicts make room too.
+        let evicted_len: usize = evicted
+            .iter()
+            .filter_map(|id| self.held.get(id))
+            .map(|h| h.meta.raw_len)
+            .sum();
         // Every held transaction is queued or on loan.
-        let full_count = replacing.is_none() && self.held.len() >= MAX_PENDING_TXS;
-        let held = self.held_bytes().saturating_sub(replaced_len);
+        let full_count = replacing.is_none()
+            && self.held.len().saturating_sub(evicted.len()) >= MAX_PENDING_TXS;
+        let held = self
+            .held_bytes()
+            .saturating_sub(replaced_len)
+            .saturating_sub(evicted_len);
         let over_bytes = held
             .saturating_add(tx.len())
             .saturating_sub(MAX_PENDING_BYTES);
         if full_count || over_bytes > 0 {
-            let victims = match self.storage.clone() {
+            let victims = match &storage {
                 Some(storage)
                     if self.is_ready(
-                        &storage,
+                        storage,
                         &parsed_tx.sender,
                         parsed_tx.sequence_number,
                         parsed_tx.gas_price,
                     ) =>
                 {
-                    self.parked_victims(&storage, usize::from(full_count), over_bytes, replacing)
+                    self.parked_victims(
+                        storage,
+                        usize::from(full_count),
+                        over_bytes,
+                        replacing,
+                        &evicted,
+                    )
                 }
                 _ => None,
             };
@@ -574,27 +704,23 @@ impl Mempool {
                     format!("Mempool full ({held} bytes held / {MAX_PENDING_BYTES})")
                 }));
             };
-            self.drop_all_waiting(&victims);
+            evicted.extend(victims);
+        }
+        if !evicted.is_empty() {
+            self.drop_all_waiting(&evicted);
             println!(
-                "🧹 Mempool full: evicted {} parked transaction(s) for a ready one",
-                victims.len()
+                "🧹 Mempool: evicted {} parked transaction(s) for a ready one",
+                evicted.len()
             );
         }
 
         if let Some(old) = replacing {
+            // B368: no line of its own (a replacement is free; its admission
+            // is logged below).
             self.drop_waiting(old);
-            println!("🔁 Mempool: replaced a waiting transaction at a higher price");
-        }
-
-        // Bounded LRU-style eviction
-        if self.seen_txs.len() >= MAX_SEEN_TXS {
-            if let Some(old_tx) = self.seen_order.pop_front() {
-                self.seen_txs.remove(&old_tx);
-            }
         }
 
         self.seen_txs.insert(tx_hash.clone());
-        self.seen_order.push_back(tx_hash.clone());
         let id = self.next_id;
         self.next_id += 1;
         self.pending_nonces.insert(nonce_key, id);
@@ -633,6 +759,8 @@ impl Mempool {
                 unpaid_since: None,
                 requeue_attempts: 0,
                 loan: None,
+                forwarding: false,
+                deferred: false,
             },
         );
         self.pending_txs.push_back(id);
@@ -686,6 +814,19 @@ impl Mempool {
 
     /// Select up to `limit` transactions and loan them, stamped `now_secs`.
     pub fn get_pending_transactions_at(&mut self, limit: usize, now_secs: u64) -> Vec<String> {
+        self.select_at(limit, now_secs, false)
+    }
+
+    /// B476: `get_pending_transactions_at` for this node's forwarder: the
+    /// loans are to it, not to a vertex, so a fee-bumped replacement takes
+    /// their place (`add_checked`).
+    pub fn loan_for_forwarding_at(&mut self, limit: usize, now_secs: u64) -> Vec<String> {
+        self.select_at(limit, now_secs, true)
+    }
+
+    /// Select up to `limit` transactions and loan them, stamped `now_secs`,
+    /// to the forwarder (`forwarding`) or to a vertex.
+    fn select_at(&mut self, limit: usize, now_secs: u64, forwarding: bool) -> Vec<String> {
         if limit == 0 || self.pending_txs.is_empty() {
             return Vec::new();
         }
@@ -730,30 +871,26 @@ impl Mempool {
         let mut dead: Vec<TxId> = Vec::new();
         let storage = self.storage.clone();
         if let Some(storage) = &storage {
-            let loaned = self.loaned_seqs();
             let base_fee = executor::committed_base_fee(storage);
             for (sender, q) in by_sender.iter_mut() {
                 let committed = self.committed_next(storage, sender);
-                let mut expected = committed;
+                // B313: the run is `ready_run_end`'s, the rule the eviction
+                // scan and a newcomer's readiness read (selection kept a copy
+                // of its own, B297's class).
+                let end = self.ready_run_end(sender, committed, base_fee, u64::MAX, false);
                 let mut ready = Vec::with_capacity(q.len());
-                let mut parked_from = q.len();
-                for (at, &(seq, gas_price, idx)) in q.iter().enumerate() {
+                let mut parked = Vec::new();
+                for &(seq, gas_price, idx) in q.iter() {
                     if seq < committed {
                         dead.push(ids[idx]);
-                        continue;
+                    } else if seq < end {
+                        ready.push((seq, gas_price, idx));
+                    } else {
+                        parked.push(idx);
                     }
-                    while loaned.get(sender).is_some_and(|s| s.contains(&expected)) {
-                        expected += 1;
-                    }
-                    if seq != expected || gas_price < base_fee {
-                        parked_from = at;
-                        break;
-                    }
-                    ready.push((seq, gas_price, idx));
-                    expected += 1;
                 }
                 // B98: a parked transaction leaves after PARKED_TTL_SECS.
-                for &(_, _, idx) in &q[parked_from..] {
+                for &idx in &parked {
                     if let Some(h) = self.held.get_mut(&ids[idx]) {
                         let since = *h.parked_since.get_or_insert(now_secs);
                         if now_secs.saturating_sub(since) >= PARKED_TTL_SECS {
@@ -871,11 +1008,9 @@ impl Mempool {
             h.unpaid_since = None;
             let attempts = std::mem::take(&mut h.requeue_attempts);
             h.loan = Some((now_secs, attempts));
+            // B476: to whom.
+            h.forwarding = forwarding;
             result.push(h.raw.clone());
-            let key = format!("{}:{}", h.meta.sender, h.meta.seq);
-            if self.pending_nonces.get(&key) == Some(&id) {
-                self.pending_nonces.remove(&key);
-            }
         }
         // Keep unselected txs in their original FIFO order for the next round.
         self.pending_txs = ids
@@ -913,6 +1048,8 @@ impl Mempool {
     /// Orphan-loss fix: consensus reports the raw transactions that actually
     /// EXECUTED in a committed block; only those leave the loan ledger for good.
     /// Deferred/failed ones stay inflight and come back via `requeue_stale`.
+    /// B452: only those: one that leaves without having run goes through
+    /// `drop_unexecuted`, which forgets its identity too.
     pub fn mark_executed(&mut self, raws: &[String]) {
         if raws.is_empty() {
             return;
@@ -931,14 +1068,47 @@ impl Mempool {
         }
     }
 
-    /// Return loaned transactions that never executed within `max_age` to the
-    /// pending queue. Heals both failure shapes the live cluster hit: a vertex
-    /// that never committed (orphaned payload), and a transaction that reached a
-    /// block ahead of its nonce and was refused by the executor. Re-queued
-    /// entries re-register their `sender:sequence` guard so a duplicate
-    /// submission is still refused at admission; `seen_txs` is intentionally
-    /// left alone (the tx has genuinely been seen — resubmission stays deduped).
-    /// Returns how many were re-queued.
+    /// B452: transactions that leave without having run (a forwarder gave up
+    /// on them: its TTL, or refusals from members over a third of the
+    /// stake), queued or on loan, with their dedup identities: their senders
+    /// may submit them again, as after any other drop of one that never ran.
+    /// `mark_executed` kept the identity, and the same bytes were refused as
+    /// a duplicate for the next `MAX_SEEN_TXS` admissions.
+    pub fn drop_unexecuted(&mut self, raws: &[String]) {
+        let gone: Vec<TxId> = raws.iter().filter_map(|raw| self.id_of(raw)).collect();
+        if !gone.is_empty() {
+            self.drop_all_waiting(&gone);
+        }
+    }
+
+    /// B462: what this node's forwarder heard of transactions it holds:
+    /// `refused`, refused for now (`Verdict::Later`) by members over a third
+    /// of the stake, are deferred; `cleared` are no longer. A deferred one,
+    /// queued or on loan, ends its sender's ready run for the eviction scan
+    /// and a newcomer's readiness (`ready_run_end`: those members hold
+    /// nothing of it, so what follows waits on it there), and a full pool
+    /// evicts it, with the rest of its run, for a ready transaction as it
+    /// evicts parked ones (B70); selection still offers it, so the members
+    /// are asked again (B216/B247) and it may run. Kept to their TTL and
+    /// never evicted, transactions the members refused only for now (a
+    /// payer short there, by a transaction only they held) filled an
+    /// observer's pool, and its RPC answered every user "Mempool full".
+    pub fn defer(&mut self, refused: &[String], cleared: &[String]) {
+        for (raws, deferred) in [(refused, true), (cleared, false)] {
+            for raw in raws {
+                let Some(id) = self.id_of(raw) else {
+                    continue;
+                };
+                if let Some(h) = self.held.get_mut(&id) {
+                    if h.deferred != deferred {
+                        h.deferred = deferred;
+                        self.version += 1;
+                    }
+                }
+            }
+        }
+    }
+
     /// Return transactions that were LOANED by `get_pending_transactions` but
     /// never shipped in a vertex (the block-builder trimmed them to fit the
     /// vertex byte budget). They are put back at the FRONT of the queue in
@@ -989,8 +1159,9 @@ impl Mempool {
             let Some((_, attempts)) = h.loan.take() else {
                 continue;
             };
+            // B452: its identity goes too, as at `requeue_stale_at`'s cap.
             if attempts + 1 >= MAX_REQUEUE_ATTEMPTS {
-                self.forget(id);
+                self.forget_unseen(id);
                 continue;
             }
             h.requeue_attempts = attempts + 1;
@@ -1048,7 +1219,12 @@ impl Mempool {
     }
 
     /// Re-queue loans at least `max_age_secs` old at `now_secs`, in the same
-    /// clock the loans were stamped with.
+    /// clock the loans were stamped with. Heals both failure shapes the live
+    /// cluster hit: a vertex that never committed (orphaned payload), and a
+    /// transaction that reached a block ahead of its nonce and was refused by
+    /// the executor. Re-queued entries re-register their `sender:sequence`
+    /// guard and keep their identity, so a duplicate submission is still
+    /// refused at admission. Returns how many were re-queued.
     pub fn requeue_stale_at(&mut self, max_age_secs: u64, now_secs: u64) -> usize {
         let stale = self.stale_loans(max_age_secs, now_secs);
         let mut requeued = 0usize;
@@ -1057,8 +1233,14 @@ impl Mempool {
             // RE-AUDIT HIGH: bounded. A tx that keeps failing (bad nonce forever,
             // unpayable gas) must not become an immortal 30s loop that burns
             // every validator's CPU and block space.
+            // B452: no block settled it, so its identity goes too, as a parked
+            // one's does at its TTL: its sender may submit it again (one that
+            // ran unseen here is refused by its used sequence number). It
+            // stayed, refusing the same bytes as a duplicate for the next
+            // `MAX_SEEN_TXS` admissions; the cap bounds the loop, which the
+            // identity never did (a sender re-signs for free).
             if attempts + 1 >= MAX_REQUEUE_ATTEMPTS {
-                self.forget(id);
+                self.forget_unseen(id);
                 dropped += 1;
                 continue;
             }
@@ -1072,18 +1254,6 @@ impl Mempool {
             );
         }
         requeued
-    }
-
-    /// B70: each sender's sequence numbers loaned to vertices.
-    fn loaned_seqs(&self) -> std::collections::HashMap<String, HashSet<u64>> {
-        let mut out: std::collections::HashMap<String, HashSet<u64>> =
-            std::collections::HashMap::new();
-        for h in self.held.values().filter(|h| h.loan.is_some()) {
-            out.entry(h.meta.sender.clone())
-                .or_default()
-                .insert(h.meta.seq);
-        }
-        out
     }
 
     /// B94: whether the block would charge `raw` (its pre-charge fits its
@@ -1137,7 +1307,7 @@ impl Mempool {
             return false;
         }
         let committed = self.committed_next(storage, sender);
-        self.ready_run_end(sender, committed, base_fee, seq) == seq
+        self.ready_run_end(sender, committed, base_fee, seq, true) == seq
     }
 
     /// B297: where `sender`'s ready run ends, the rule selection parks by:
@@ -1145,8 +1315,21 @@ impl Mempool {
     /// holds (B239: its own transactions, not a scan of the pool), up to the
     /// first that is waiting and priced under `base_fee`, and not past
     /// `limit`. Selection, the eviction scan and a newcomer's readiness all
-    /// read it (B244 made two of them agree).
-    fn ready_run_end(&self, sender: &str, committed: u64, base_fee: u128, limit: u64) -> u64 {
+    /// read it (B244 made two of them agree; B313, selection, the third).
+    /// B313: with `unpaid_stops`, a waiting one stamped unpaid ends it too:
+    /// the last selection offered nothing of the run past it (its payer fell
+    /// short, B188), which the eviction scan and a newcomer's readiness
+    /// read; selection itself checks payers anew each pass. B462: and a
+    /// deferred one (`defer`), queued or on loan; selection offers it, so
+    /// the members are asked again.
+    fn ready_run_end(
+        &self,
+        sender: &str,
+        committed: u64,
+        base_fee: u128,
+        limit: u64,
+        unpaid_stops: bool,
+    ) -> u64 {
         let mut end = committed;
         if let Some(seqs) = self.by_sender.get(sender) {
             while end < limit {
@@ -1154,9 +1337,12 @@ impl Mempool {
                     break;
                 };
                 let stops = ids.iter().any(|id| {
-                    self.held
-                        .get(id)
-                        .is_some_and(|h| h.loan.is_none() && h.meta.gas_price < base_fee)
+                    self.held.get(id).is_some_and(|h| {
+                        (unpaid_stops && h.deferred)
+                            || (h.loan.is_none()
+                                && (h.meta.gas_price < base_fee
+                                    || (unpaid_stops && h.unpaid_since.is_some())))
+                    })
                 });
                 if stops {
                     break;
@@ -1169,20 +1355,77 @@ impl Mempool {
 
     /// B70/B231: the parked transactions (not ready, still waiting) to evict
     /// so that `slots` more fit and `bytes` more are free, `exclude` (B245:
-    /// the transaction a replacement replaces, already counted out) apart:
-    /// the furthest above their senders' next sequence numbers first, ties
-    /// by their raw hashes (deterministic), at most
-    /// `MAX_EVICTIONS_PER_ADMISSION`. `None`, and nothing evicted, when they
-    /// cannot make that room. B239: the scan is remembered until the pool,
-    /// the committed height or the base fee changes, so admissions refused
-    /// for now do not scan the pool again and again.
+    /// the transaction a replacement replaces, already counted out) and
+    /// `chosen` (B462: the payer's parked ones evicted already, counted out
+    /// and toward the cap) apart: the furthest above their senders' next
+    /// sequence numbers first, ties by their raw hashes (deterministic), at
+    /// most `MAX_EVICTIONS_PER_ADMISSION` with `chosen`. `None`, and nothing
+    /// evicted, when they cannot make that room.
     fn parked_victims(
         &mut self,
         storage: &StateDB,
         slots: usize,
         bytes: usize,
         exclude: Option<TxId>,
+        chosen: &[TxId],
     ) -> Option<Vec<TxId>> {
+        self.refresh_parked(storage);
+        let scan = self.parked_scan.as_ref()?;
+        let skip: HashSet<TxId> = chosen.iter().copied().collect();
+        let (mut freed, mut victims) = (0usize, Vec::new());
+        for &(_, _, len, id) in &scan.parked {
+            if victims.len() >= slots && freed >= bytes {
+                break;
+            }
+            if Some(id) == exclude || skip.contains(&id) {
+                continue;
+            }
+            if chosen.len() + victims.len() >= MAX_EVICTIONS_PER_ADMISSION {
+                return None;
+            }
+            freed = freed.saturating_add(len);
+            victims.push(id);
+        }
+        (victims.len() >= slots && freed >= bytes).then_some(victims)
+    }
+
+    /// B462: `payer`'s parked transactions (the eviction scan's, in its
+    /// order, `exclude` apart) whose costs together cover `short`, at most
+    /// `MAX_EVICTIONS_PER_ADMISSION`. `None`, and nothing evicted, when they
+    /// cannot.
+    fn payer_victims(
+        &mut self,
+        storage: &StateDB,
+        payer: &str,
+        short: u128,
+        exclude: Option<TxId>,
+    ) -> Option<Vec<TxId>> {
+        self.refresh_parked(storage);
+        let scan = self.parked_scan.as_ref()?;
+        let (mut covered, mut victims) = (0u128, Vec::new());
+        for &(_, _, _, id) in &scan.parked {
+            if covered >= short {
+                break;
+            }
+            if Some(id) == exclude {
+                continue;
+            }
+            let Some(h) = self.held.get(&id).filter(|h| h.meta.payer == payer) else {
+                continue;
+            };
+            if victims.len() == MAX_EVICTIONS_PER_ADMISSION {
+                return None;
+            }
+            covered = covered.saturating_add(h.meta.cost);
+            victims.push(id);
+        }
+        (covered >= short).then_some(victims)
+    }
+
+    /// B239: the eviction scan (`parked_scan`) made again only when the
+    /// pool, the committed height or the base fee changed since the last,
+    /// so admissions refused for now do not scan the pool again and again.
+    fn refresh_parked(&mut self, storage: &StateDB) {
         let base_fee = executor::committed_base_fee(storage);
         let height = storage.get("latest_height").ok().flatten();
         let fresh = self.parked_scan.as_ref().is_some_and(|scan| {
@@ -1197,22 +1440,6 @@ impl Mempool {
                 parked,
             });
         }
-        let scan = self.parked_scan.as_ref()?;
-        let (mut freed, mut victims) = (0usize, Vec::new());
-        for &(_, _, len, id) in &scan.parked {
-            if victims.len() >= slots && freed >= bytes {
-                break;
-            }
-            if Some(id) == exclude {
-                continue;
-            }
-            if victims.len() == MAX_EVICTIONS_PER_ADMISSION {
-                return None;
-            }
-            freed = freed.saturating_add(len);
-            victims.push(id);
-        }
-        (victims.len() >= slots && freed >= bytes).then_some(victims)
     }
 
     /// B70/B244: the queued transactions selection parks, in eviction
@@ -1222,7 +1449,8 @@ impl Mempool {
     /// nothing of the sender from there, so all of it is parked (only that
     /// one transaction was, and the rest of its run was neither offered nor
     /// evictable). And one whose payer did not cover it at the last pass
-    /// (B188).
+    /// (B188). B462: and one deferred (`defer`), queued or on loan to the
+    /// forwarder, with what follows it.
     fn scan_parked(
         &mut self,
         storage: &StateDB,
@@ -1236,11 +1464,16 @@ impl Mempool {
             std::collections::HashMap::with_capacity(senders.len());
         for sender in senders {
             let committed = self.committed_next_at(storage, height, &sender);
-            let end = self.ready_run_end(&sender, committed, base_fee, u64::MAX);
+            let end = self.ready_run_end(&sender, committed, base_fee, u64::MAX, true);
             runs.insert(sender, (committed, end));
         }
         let mut parked: Vec<(u64, String, usize, TxId)> = Vec::new();
-        for id in &self.pending_txs {
+        let deferred = self
+            .held
+            .iter()
+            .filter(|(_, h)| h.deferred && h.loan.is_some())
+            .map(|(id, _)| id);
+        for id in self.pending_txs.iter().chain(deferred) {
             let Some(h) = self.held.get(id) else {
                 continue;
             };
@@ -1248,7 +1481,7 @@ impl Mempool {
             let Some(&(committed, end)) = runs.get(&m.sender) else {
                 continue;
             };
-            if m.seq >= end || h.unpaid_since.is_some() {
+            if m.seq >= end {
                 parked.push((
                     m.seq.saturating_sub(committed),
                     m.raw_hash.clone(),
@@ -1261,7 +1494,8 @@ impl Mempool {
         parked
     }
 
-    /// B231: `drop_waiting` for several, the queue filtered once.
+    /// B231: `drop_waiting` for several, the queue filtered once (B452: and
+    /// any of them on loan).
     fn drop_all_waiting(&mut self, ids: &[TxId]) {
         let gone: HashSet<TxId> = ids.iter().copied().collect();
         self.pending_txs.retain(|id| !gone.contains(id));
@@ -1277,9 +1511,10 @@ impl Mempool {
         self.forget_unseen(id);
     }
 
-    /// B239: a transaction leaves the pool (executed, or dropped after its
-    /// requeues): its entry, its hash and its nonce guard. Its dedup identity
-    /// stays (an executed one must not be replayed).
+    /// B239: a transaction leaves the pool (executed): its entry, its hash
+    /// and its nonce guard. Its dedup identity stays (an executed one must not
+    /// be replayed). B452: one that leaves without having run goes through
+    /// `forget_unseen`.
     fn forget(&mut self, id: TxId) -> Option<Held> {
         let h = self.held.remove(&id)?;
         self.version += 1;
@@ -1310,10 +1545,11 @@ impl Mempool {
     }
 
     /// `forget`, and its dedup identity too: its sender may submit it again
-    /// (evicted, replaced, expired, or never able to run).
+    /// (evicted, replaced, expired, never able to run, or B452: dropped at
+    /// its requeue cap or by its forwarder).
     fn forget_unseen(&mut self, id: TxId) {
         if let Some(h) = self.forget(id) {
-            self.seen_txs.remove(&h.meta.dedup);
+            self.seen_txs.forget(&h.meta.dedup);
         }
     }
 

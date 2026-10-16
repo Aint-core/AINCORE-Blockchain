@@ -1,8 +1,9 @@
 // B65 witnesses: a transaction pays for its writes. Included in `tests`.
 use super::*;
 use crate::state_gas::{
-    next_state_byte_gas, write_cost, WriteCost, IO_BYTES_PER_GAS, IO_GAS_PER_WRITE,
-    MIN_STATE_BYTE_GAS, NEW_KEY_BYTES, STATE_BYTE_GAS_KEY, TARGET_STATE_BYTES,
+    history_gas, next_state_byte_gas, write_cost, WriteCost, BODY_BLOCKS_KEPT, GAS_PER_HISTORY_ROW,
+    HISTORY_BLOCKS_HELD, HISTORY_GAS_PER_KEY, HISTORY_GAS_PER_OLD_BYTE, IO_BYTES_PER_GAS,
+    IO_GAS_PER_WRITE, MIN_STATE_BYTE_GAS, NEW_KEY_BYTES, STATE_BYTE_GAS_KEY, TARGET_STATE_BYTES,
 };
 use move_core_types::account_address::AccountAddress;
 use move_core_types::identifier::Identifier;
@@ -134,6 +135,168 @@ fn a_module_the_state_cannot_hold_aborts_its_publish() {
     );
 }
 
+/// B340: a module at 0xcafe (`nv`) whose entry `native_push` calls
+/// `0x1::vector::push_back<u64>` as a function, and whose `opcode_push` uses
+/// the `VecPushBack` opcode the compiler emits for that call.
+fn vector_native_module() -> Vec<u8> {
+    use move_binary_format::file_format::{
+        empty_module, AbilitySet, AddressIdentifierIndex, Bytecode, CodeUnit, FunctionDefinition,
+        FunctionHandle, FunctionHandleIndex, FunctionInstantiation, FunctionInstantiationIndex,
+        IdentifierIndex, ModuleHandle, ModuleHandleIndex, Signature, SignatureIndex,
+        SignatureToken, Visibility,
+    };
+    let mut m = empty_module();
+    m.address_identifiers = vec![blob_address(), AccountAddress::ONE];
+    m.identifiers = ["nv", "vector", "push_back", "native_push", "opcode_push"]
+        .iter()
+        .map(|name| Identifier::new(*name).unwrap())
+        .collect();
+    m.module_handles.push(ModuleHandle {
+        address: AddressIdentifierIndex(1),
+        name: IdentifierIndex(1),
+    });
+    m.signatures = vec![
+        Signature(vec![]),
+        Signature(vec![
+            SignatureToken::MutableReference(Box::new(SignatureToken::Vector(Box::new(
+                SignatureToken::TypeParameter(0),
+            )))),
+            SignatureToken::TypeParameter(0),
+        ]),
+        Signature(vec![SignatureToken::U64]),
+        Signature(vec![SignatureToken::Vector(Box::new(SignatureToken::U64))]),
+    ];
+    let handle = |module: u16, name: u16, parameters: u16, type_parameters: Vec<AbilitySet>| {
+        FunctionHandle {
+            module: ModuleHandleIndex(module),
+            name: IdentifierIndex(name),
+            parameters: SignatureIndex(parameters),
+            return_: SignatureIndex(0),
+            type_parameters,
+        }
+    };
+    m.function_handles = vec![
+        handle(1, 2, 1, vec![AbilitySet::EMPTY]),
+        handle(0, 3, 0, vec![]),
+        handle(0, 4, 0, vec![]),
+    ];
+    m.function_instantiations = vec![FunctionInstantiation {
+        handle: FunctionHandleIndex(0),
+        type_parameters: SignatureIndex(2),
+    }];
+    let entry = |function: u16, push: Bytecode| FunctionDefinition {
+        function: FunctionHandleIndex(function),
+        visibility: Visibility::Public,
+        is_entry: true,
+        acquires_global_resources: vec![],
+        code: Some(CodeUnit {
+            locals: SignatureIndex(3),
+            code: vec![
+                Bytecode::VecPack(SignatureIndex(2), 0),
+                Bytecode::StLoc(0),
+                Bytecode::MutBorrowLoc(0),
+                Bytecode::LdU64(7),
+                push,
+                Bytecode::Ret,
+            ],
+        }),
+    };
+    m.function_defs = vec![
+        entry(1, Bytecode::CallGeneric(FunctionInstantiationIndex(0))),
+        entry(2, Bytecode::VecPushBack(SignatureIndex(2))),
+    ];
+    let mut bytes = vec![];
+    m.serialize(&mut bytes).unwrap();
+    bytes
+}
+
+/// B340 witness: a `std::vector` native called as a function aborts,
+/// charged (its `push_back` took the pushed value off the memory quota while
+/// the vector kept it, so the quota stopped bounding memory); the opcode
+/// the compiler emits for the same call runs.
+#[test]
+fn a_vector_native_called_as_a_function_aborts() {
+    let (db, key, sender) = blob_chain("b340_natives", 61);
+    {
+        let _seed = db.seeding();
+        db.put(
+            &vm_move::state_keys::module_key(&blob_address(), "nv"),
+            &hex::encode(vector_native_module()),
+        )
+        .unwrap();
+    }
+    let executor = Executor::new(db.clone());
+    let call = |function: &str| {
+        let call = EntryFunctionCall {
+            module: ModuleId::new(blob_address(), Identifier::new("nv").unwrap()),
+            function: function.to_string(),
+            ty_args: vec![],
+            args: vec![],
+        };
+        hex::encode(bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(call)).unwrap())
+    };
+    let opcode = signed_tx(&key, &sender, &call("opcode_push"), 0, 1_000_000, 1);
+    run(&db, &executor, &opcode).expect("executed");
+    assert_eq!(
+        receipt_status(&db, &opcode),
+        "success",
+        "vacuous: the module does not run"
+    );
+    let native = signed_tx(&key, &sender, &call("native_push"), 1, 1_000_000, 1);
+    let balance = coin_balance(&db, &sender);
+    run(&db, &executor, &native).expect("executed, charged");
+    assert_eq!(receipt_status(&db, &native), "aborted");
+    let receipt: serde_json::Value = serde_json::from_str(
+        &db.get(&format!("tx_receipt:{}", tx_hash_hex(&native)))
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let code = vm_move::BYTECODE_ONLY_NATIVE.to_string();
+    assert!(
+        receipt["error"].as_str().is_some_and(|e| e.contains(&code)),
+        "vacuous: aborted for another reason: {receipt}"
+    );
+    assert!(
+        coin_balance(&db, &sender) < balance,
+        "the abort was not charged"
+    );
+}
+
+/// B343 witness: a publish defining a struct that nests past 128 levels is
+/// a charged abort, before the VM loads it (a chain packed in memory nested
+/// ~20,000 deep, and the stack overflowed on every node).
+#[test]
+fn a_publish_nesting_too_deep_aborts_charged() {
+    let (db, key, sender) = blob_chain("b343_publish", 60);
+    let executor = Executor::new(db.clone());
+    let at = parse_move_address(&sender).unwrap();
+    let module = crate::deps::tests::deep_module(at, 128, 0, 0);
+    let payload = hex::encode(
+        bcs::to_bytes(&vm_move::TransactionPayload::PublishModule(vec![module])).unwrap(),
+    );
+    let balance = coin_balance(&db, &sender);
+    let tx = signed_tx(&key, &sender, &payload, 0, 1_000_000, 1);
+    run(&db, &executor, &tx).expect("executed, charged");
+    assert_eq!(receipt_status(&db, &tx), "aborted");
+    let receipt: serde_json::Value = serde_json::from_str(
+        &db.get(&format!("tx_receipt:{}", tx_hash_hex(&tx)))
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        receipt["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("nests 129 deep")),
+        "vacuous: aborted for another reason: {receipt}"
+    );
+    assert!(
+        coin_balance(&db, &sender) < balance,
+        "the abort was not charged"
+    );
+}
+
 /// B170 witness: a republish pays for the version it replaces and that
 /// version's closure (its compatibility check loads them), and a module
 /// republished earlier in the block is refused to anything that loads it.
@@ -160,6 +323,28 @@ fn a_republish_pays_for_what_it_replaces() {
 fn run_updates(db: &StateDB, updates: Vec<(String, Option<String>)>) {
     let _seed = db.seeding();
     apply_updates(db, updates);
+}
+
+#[test]
+fn an_estimate_counts_payer_history_once_when_the_payload_changes_it() {
+    let (db, key, sender) = blob_chain("estimate_payer_history_once", 73);
+    let recipient = create_account(&db, &SigningKey::from_bytes(&[74; 32]));
+    set_coin_store(&db, &recipient, 0);
+    let executor = Executor::new(db.clone());
+    let payload = coin_transfer_payload(&sender, &recipient, 100);
+    let before = coin_balance(&db, &sender);
+    let estimate = executor
+        .estimate_gas(&signed_tx(&key, &sender, &payload, 0, 0, 1))
+        .unwrap();
+    assert_eq!(estimate.aborted, None);
+    let raw = signed_tx(&key, &sender, &payload, 0, estimate.execution_gas(), 1);
+    let (updates, _) = executor.execute_transaction(&raw).expect("transfer admitted");
+    assert_eq!(estimate.writes, write_cost(&db, &updates), "history counted once");
+    assert_eq!(coin_balance(&db, &sender), before, "simulation does not write");
+    run_updates(&db, updates);
+    assert_eq!(receipt_status(&db, &raw), "success");
+    assert_eq!(coin_balance(&db, &recipient), 100);
+    assert_eq!(coin_balance(&db, &sender), before - gas_of(&raw) as u128 - 100);
 }
 
 /// B65 witness: a new resource costs its key, its value and the tree's rows
@@ -229,15 +414,17 @@ fn a_transaction_pays_for_the_state_bytes_it_adds() {
 
 /// B65 witness: what a set of writes costs. Growth counts, a shrink or a
 /// delete adds nothing (no refunds), a key written twice counts once at its
-/// last value, history keys are not state, and every state write pays I/O.
+/// last value, history keys are not state, and every state write pays I/O
+/// (and, B460, each change the tree history it leaves).
 #[test]
 fn only_added_state_bytes_are_charged_and_nothing_is_refunded() {
     let db = temp_db("b65_write_cost");
     let account = format!("obj:{}", "aa".repeat(32));
     let fresh = format!("obj:{}", "bb".repeat(32));
+    let old = "x".repeat(100);
     {
         let _seed = db.seeding();
-        db.put(&account, &"x".repeat(100)).unwrap();
+        db.put(&account, &old).unwrap();
     }
     let cost = |writes: &[(&str, Option<&str>)]| {
         let writes: Vec<(String, Option<String>)> = writes
@@ -263,11 +450,145 @@ fn only_added_state_bytes_are_charged_and_nothing_is_refunded() {
     assert_eq!(cost(&[(&receipt, Some("a receipt"))]), WriteCost::default());
     assert_eq!(
         cost(&[(&account, Some(&grown))]).io_gas,
-        IO_GAS_PER_WRITE + ((account.len() + 130) as u64).div_ceil(IO_BYTES_PER_GAS)
+        IO_GAS_PER_WRITE
+            + ((account.len() + 130) as u64).div_ceil(IO_BYTES_PER_GAS)
+            + history_gas(Some(old.as_str()))
     );
     assert_eq!(
         cost(&[(&account, None)]).io_gas,
-        IO_GAS_PER_WRITE + (account.len() as u64).div_ceil(IO_BYTES_PER_GAS)
+        IO_GAS_PER_WRITE
+            + (account.len() as u64).div_ceil(IO_BYTES_PER_GAS)
+            + history_gas(Some(old.as_str()))
+    );
+}
+
+/// B460 witness: every change to a state key pays for the tree history it
+/// leaves, even one that adds no state: a rewrite of the same length, a
+/// delete (its old value row and path), a new key (its path's nodes, no
+/// old value). The same bytes, or a delete of an absent key, change nothing
+/// and pay I/O only. Before B460 each paid I/O only.
+#[test]
+fn a_changed_key_pays_for_the_history_it_leaves() {
+    let db = temp_db("b460_history");
+    let account = format!("obj:{}", "aa".repeat(32));
+    let fresh = format!("obj:{}", "bb".repeat(32));
+    let old = "x".repeat(100);
+    {
+        let _seed = db.seeding();
+        db.put(&account, &old).unwrap();
+    }
+    let cost = |key: &str, value: Option<&str>| {
+        write_cost(&db, &[(key.to_string(), value.map(str::to_string))])
+    };
+    let io = |key: &str, value: Option<&str>| {
+        let written = (key.len() + value.map_or(0, str::len)) as u64;
+        IO_GAS_PER_WRITE + written.div_ceil(IO_BYTES_PER_GAS)
+    };
+    let kept = HISTORY_GAS_PER_KEY + 100 * HISTORY_GAS_PER_OLD_BYTE;
+    assert_eq!(history_gas(Some(old.as_str())), kept);
+    let same_length = "y".repeat(100);
+    let rewrite = cost(&account, Some(same_length.as_str()));
+    assert_eq!(rewrite.new_bytes, 0, "a rewrite adds no state");
+    assert_eq!(
+        rewrite.io_gas,
+        io(&account, Some(same_length.as_str())) + kept
+    );
+    assert_eq!(cost(&account, None).io_gas, io(&account, None) + kept);
+    assert_eq!(
+        cost(&fresh, Some("yy")).io_gas,
+        io(&fresh, Some("yy")) + HISTORY_GAS_PER_KEY
+    );
+    assert_eq!(
+        cost(&account, Some(old.as_str())).io_gas,
+        io(&account, Some(old.as_str())),
+        "the same bytes change nothing"
+    );
+    assert_eq!(cost(&fresh, None).io_gas, io(&fresh, None));
+}
+
+/// B460: the history price's derivation. A block at the gas target leaves
+/// no more tree rows than the default pruner removes per block, and a gas
+/// unit spent on history holds no more disk over its window than one spent
+/// on body bytes over theirs (research note, section 2: `BYTE_GAS` a byte,
+/// stored about twice, kept 100,000 blocks): the history window and the
+/// pruner's rate are what the price pays for.
+#[test]
+fn the_history_price_fits_the_pruner_and_the_disk() {
+    let changed = TARGET_BLOCK_GAS / HISTORY_GAS_PER_KEY;
+    assert!(
+        changed * state_commit::HISTORY_ROWS_PER_KEY <= state_commit::PRUNE_ROWS_PER_BLOCK,
+        "{changed} changed keys a target block"
+    );
+    // Disk byte-blocks one gas buys as body bytes, times BYTE_GAS.
+    let body = 2 * BODY_BLOCKS_KEPT;
+    let rows = state_commit::HISTORY_ROWS_PER_KEY * state_commit::MAX_HISTORY_ROW_BYTES;
+    assert!(
+        rows * HISTORY_BLOCKS_HELD * admission::BYTE_GAS <= body * HISTORY_GAS_PER_KEY,
+        "a changed key's rows"
+    );
+    assert!(
+        2 * HISTORY_BLOCKS_HELD * admission::BYTE_GAS <= body * HISTORY_GAS_PER_OLD_BYTE,
+        "an old value's row, in hex"
+    );
+}
+
+/// B460 witness: a block's transactions pay for the tree rows the block
+/// leaves for the pruner, at the rate the pruner sustains at the gas target
+/// (the block's own writes included). Each transfer changes three keys: its
+/// sender's account and two coin stores. Before B460 their writes paid I/O
+/// only, ~180 gas a key, and the rows cost 10,000 each.
+#[test]
+fn a_block_pays_for_the_tree_rows_it_leaves() {
+    let db = temp_db("b460_block_rows");
+    load_stdlib(&db);
+    {
+        let _seed = db.seeding();
+        db.set_federation_key("00000000000000000000000000000000")
+            .unwrap();
+    }
+    let proposer = create_account(&db, &SigningKey::from_bytes(&[99u8; 32]));
+    set_coin_store(&db, &proposer, 0);
+    let executor = Executor::new(db.clone());
+    let (mut txs, mut paid) = (Vec::new(), 0u64);
+    for i in 0..20u8 {
+        let key = SigningKey::from_bytes(&[100 + i; 32]);
+        let sender = create_account(&db, &key);
+        set_coin_store(&db, &sender, 1_000_000_000_000_000);
+        let to = SigningKey::from_bytes(&[150 + i; 32]);
+        let recipient = crypto::derive_address(to.verifying_key().as_bytes()).unwrap();
+        set_coin_store(&db, &recipient, 0);
+        let payload = coin_transfer_payload(&sender, &recipient, 1);
+        let estimate = executor
+            .estimate_gas(&signed_tx(&key, &sender, &payload, 0, 0, 1))
+            .expect("the estimate runs");
+        assert_eq!(estimate.aborted, None);
+        paid += estimate.writes.io_gas;
+        let execution = estimate.execution_gas();
+        txs.push(signed_tx(&key, &sender, &payload, 0, execution, 1));
+    }
+    seed_genesis_tree(&db);
+    let Ok(BlockExecOutcome::Executed(summary)) = executor.execute_block_checked_at(
+        txs,
+        &proposer,
+        1,
+        block_time(1),
+        0,
+        &[],
+        &[],
+        |_, _| Ok(()),
+    ) else {
+        panic!("block must execute");
+    };
+    assert_eq!(
+        summary.body.len(),
+        20,
+        "positive control: every transfer ran"
+    );
+    let rows = state_commit::history_rows(&db, 1).unwrap();
+    assert!(rows >= 20 * 3 * 2, "positive control: {rows} rows");
+    assert!(
+        rows * GAS_PER_HISTORY_ROW <= paid,
+        "{rows} rows left, {paid} gas paid for the writes"
     );
 }
 
@@ -448,7 +769,13 @@ fn the_charges_own_writes_are_priced_before_anything_runs() {
         "charged in full"
     );
 
-    let limit = 20_000;
+    // B460: an existing account's charge is its nonce bump, with the tree
+    // history that leaves.
+    let probe = signed_tx(&key, &sender, &store(&sender), 0, 0, 1);
+    let account_writes = executor
+        .charge_account_writes(&parse(&probe), &sender)
+        .expect("nonce 0");
+    let limit = executor.charge_gas(&parse(&probe), &account_writes) + 20_000;
     let tx = signed_tx(&key, &sender, &store(&sender), 0, limit, 1);
     assert!(executor.can_pay(&parse(&tx), &tx));
     run(&db, &executor, &tx).expect("charged");

@@ -37,7 +37,7 @@ fn members() -> Vec<Member> {
                     stake: 100,
                     ed25519_public_key: hex::encode(ed),
                     bls_public_key: hex::encode(bls.pubkey_raw(&bls_seed)),
-                    bls_pop: hex::encode(bls.prove_possession_raw(&bls_seed)),
+                    bls_pop: hex::encode(bls.prove_possession_raw(&bls_seed, &ed)),
                 },
             }
         })
@@ -575,6 +575,115 @@ fn pending_digests_follow_every_change() {
         drained.iter().all(|v| !buf.contains(&v.hash)),
         "a drained digest is held"
     );
+}
+
+/// A vertex by `m` at `round` citing `parents` (author, digest) at the
+/// round below: what waits in the PENDING buffer on their certificates.
+fn citing(m: &Member, round: u64, parents: &[(String, String)]) -> Vertex {
+    let mut v = twin(m, round, "waits");
+    v.parent_refs = parents
+        .iter()
+        .map(|(author, digest)| blockchain::ParentRef {
+            round: round - 1,
+            author: author.clone(),
+            digest: digest.clone(),
+            proof: None,
+            cert: None,
+        })
+        .collect();
+    v.parents = v.parent_refs.iter().map(|r| r.digest.clone()).collect();
+    v.hash = v.hash_v4_with_domain(CHAIN, GENESIS);
+    v
+}
+
+/// B442 witness: a held vertex is handed back by `certified` once, at the
+/// last of the parent slots it waits on (a slot named twice counts once),
+/// and never after it left the buffer (removed, pruned, drained or
+/// evicted), what it waited on forgotten with it. Every certificate took
+/// the whole buffer out, scanned each held vertex's refs and handed back
+/// every vertex naming its slot, each judged again with Layer S.
+#[test]
+fn a_waiting_vertex_is_woken_once_by_its_last_parent() {
+    let all = members();
+    let parents: Vec<(String, String)> = all
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.info.address.clone(), format!("{:064x}", 0x442_0000 + i)))
+        .collect();
+    let certified = |buf: &mut PendingBuffer, round: u64, i: usize| -> Vec<String> {
+        buf.certified(round, &parents[i].0, &parents[i].1)
+            .into_iter()
+            .map(|v| v.hash)
+            .collect()
+    };
+    let mut buf = PendingBuffer::default();
+    let a = citing(&all[0], FIRST + 1, &parents);
+    let b = citing(&all[1], FIRST + 1, &parents);
+    assert!(buf.push_waiting(a.clone(), &[0, 1]).is_none());
+    assert!(buf.push_waiting(b.clone(), &[1, 2, 2]).is_none());
+    assert!(
+        certified(&mut buf, FIRST, 1).is_empty(),
+        "woken with a parent left"
+    );
+    assert!(
+        certified(&mut buf, FIRST, 3).is_empty(),
+        "woken by a parent it does not wait on"
+    );
+    assert!(
+        certified(&mut buf, FIRST + 1, 0).is_empty(),
+        "woken by another round's slot"
+    );
+    assert_eq!(certified(&mut buf, FIRST, 0), vec![a.hash.clone()]);
+    assert!(!buf.contains(&a.hash), "a woken vertex is still held");
+    assert!(certified(&mut buf, FIRST, 0).is_empty(), "woken twice");
+    assert_eq!(
+        certified(&mut buf, FIRST, 2),
+        vec![b.hash.clone()],
+        "a slot named twice was counted twice"
+    );
+    assert_eq!(buf.wake_index_len(), 0, "a woken vertex's waits were kept");
+    // Each leaves the buffer before its last parent is certified.
+    let removed = citing(&all[2], FIRST + 2, &parents);
+    buf.push_waiting(removed.clone(), &[3]);
+    assert!(buf
+        .remove(&removed.author, removed.round, &removed.hash)
+        .is_some());
+    assert!(
+        certified(&mut buf, FIRST + 1, 3).is_empty(),
+        "a removed vertex woke"
+    );
+    let pruned = citing(&all[2], FIRST + 3, &parents);
+    buf.push_waiting(pruned.clone(), &[3]);
+    buf.prune_to(FIRST + 3);
+    assert!(!buf.contains(&pruned.hash), "a vertex at the floor is held");
+    assert!(
+        certified(&mut buf, FIRST + 2, 3).is_empty(),
+        "a pruned vertex woke"
+    );
+    let drained = citing(&all[2], FIRST + 4, &parents);
+    buf.push_waiting(drained.clone(), &[3]);
+    assert_eq!(buf.take_all().len(), 1);
+    assert!(
+        certified(&mut buf, FIRST + 3, 3).is_empty(),
+        "a drained vertex woke"
+    );
+    for r in 0..PENDING_MAX_PER_AUTHOR as u64 {
+        assert!(buf
+            .push_waiting(citing(&all[3], FIRST + 10 + r, &parents), &[3])
+            .is_none());
+    }
+    let top = FIRST + 10 + PENDING_MAX_PER_AUTHOR as u64;
+    let evicted = buf
+        .push_waiting(citing(&all[3], top, &parents), &[3])
+        .expect("a full share evicts");
+    assert_eq!(evicted.round, top, "vacuous: another vertex was evicted");
+    assert!(
+        certified(&mut buf, top - 1, 3).is_empty(),
+        "an evicted vertex woke"
+    );
+    buf.prune_to(u64::MAX);
+    assert_eq!(buf.len(), 0);
+    assert_eq!(buf.wake_index_len(), 0, "a vertex that left kept its waits");
 }
 
 /// S2 review 2: the stored body is canonical, without transport fields, so

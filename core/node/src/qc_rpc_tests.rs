@@ -35,7 +35,7 @@ fn cert(db: &StateDB, epoch: u64, height: u64) -> QuorumCertificate {
             stake: 100,
             ed25519_public_key: "00".repeat(32),
             bls_public_key: hex::encode(bls.pubkey_raw(&seed)),
-            bls_pop: hex::encode(bls.prove_possession_raw(&seed)),
+            bls_pop: hex::encode(bls.prove_possession_raw(&seed, &[0u8; 32])),
         }];
         let key = if e == 0 {
             "genesis:validator_set:v1"

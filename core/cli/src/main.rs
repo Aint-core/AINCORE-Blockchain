@@ -24,16 +24,35 @@ fn derive_validator_bls_identity(wallet: &Wallet) -> anyhow::Result<(Vec<u8>, Ve
     let mut seed = [0u8; 32];
     seed.copy_from_slice(&digest);
     let bls = crypto::bls::BLSEngine::consensus();
-    Ok((bls.pubkey_raw(&seed), bls.prove_possession_raw(&seed)))
+    // B354: the proof of possession binds the validator's Ed25519 key.
+    let owner = hex::decode(wallet.public_key())?;
+    Ok((
+        bls.pubkey_raw(&seed),
+        bls.prove_possession_raw(&seed, &owner),
+    ))
 }
 
 /// The spending wallet: the ML-DSA-65 seed given with `--pqc-seed`, or else
 /// the Ed25519 key file.
-fn load_wallet(pqc_seed: &Option<String>, keyfile: &str) -> anyhow::Result<Wallet> {
-    match pqc_seed {
-        Some(seed) => Wallet::load_ml_dsa_65(Path::new(seed)),
-        None => Wallet::load_or_create(Path::new(keyfile)),
+/// The signing wallet: an ML-DSA-65 seed, (B350) an encrypted keystore from
+/// `keys generate|import` (its password asked at a hidden prompt), or the
+/// plaintext key file.
+fn load_wallet(
+    pqc_seed: &Option<String>,
+    keystore: &Option<String>,
+    keyfile: &str,
+) -> anyhow::Result<Wallet> {
+    if let Some(seed) = pqc_seed {
+        return Wallet::load_ml_dsa_65(Path::new(seed));
     }
+    if let Some(keystore) = keystore {
+        let password = rpassword::prompt_password("🔑 Keystore password: ")
+            .context("Failed to read the keystore password")?;
+        let key = keystore::KeyManager::decrypt(keystore, &password)
+            .map_err(|e| anyhow::anyhow!("cannot open the keystore {keystore}: {e}"))?;
+        return Wallet::from_ed25519_hex(&key);
+    }
+    Wallet::load_or_create(Path::new(keyfile))
 }
 
 /// A signed transaction carrying `payload`: priced at the node's base fee
@@ -48,6 +67,7 @@ fn signed_tx_json(
     payload: String,
     sequence_number: u64,
     execution: Option<u64>,
+    fees: &FeePolicy,
 ) -> anyhow::Result<String> {
     let chain_id = signing_chain(chain_id, &client.network()?)?;
     let price = client.call("aincore_getGasPrice", json!([]))?;
@@ -82,7 +102,9 @@ fn signed_tx_json(
                 .ok_or_else(|| anyhow::anyhow!("unexpected aincore_estimateGas answer: {answer}"))?
         }
     };
+    fees.check(execution, gas_price)?;
     tx.gas_limit = executor::admission::gas_limit_covering(unsized_len, execution);
+    fees.confirm(tx.gas_limit, gas_price)?;
     tx.signature = wallet.sign(executor::admission::signing_message(&tx).as_bytes());
     Ok(serde_json::to_string(&tx)?)
 }
@@ -141,6 +163,12 @@ struct Cli {
     #[arg(long)]
     pqc_seed: Option<String>,
 
+    /// B350: sign with this encrypted keystore (from `keys generate` or
+    /// `keys import`) instead of the plaintext key file; its password is
+    /// asked at a hidden prompt
+    #[arg(long)]
+    keystore: Option<String>,
+
     /// Chain ID used in signed transactions (or AINCORE_CHAIN_ID env). B243:
     /// required to sign, and it must be the chain the node runs: a default
     /// of AINCORE-MAINNET-1 signed mainnet-valid transactions for a user who
@@ -152,6 +180,69 @@ struct Cli {
     /// (`aincore_estimateGas`) when not given (B65)
     #[arg(long, global = true)]
     execution_gas: Option<u64>,
+
+    /// B362: refuse to sign at a gas price above this (quanta a gas); the
+    /// node's price is otherwise shown with the fee it makes and confirmed
+    #[arg(long, global = true)]
+    max_gas_price: Option<u128>,
+
+    /// B362: sign without asking to confirm the fee (for scripts)
+    #[arg(long, global = true)]
+    assume_yes: bool,
+}
+
+/// B362: what a signer takes from the node's price and estimate.
+struct FeePolicy {
+    max_gas_price: Option<u128>,
+    assume_yes: bool,
+}
+
+impl FeePolicy {
+    /// The node's estimate and price, refused past a transaction's gas limit
+    /// or `--max-gas-price` (both are the RPC's word: a hostile one named a
+    /// price that spent the whole balance on one transfer's fee).
+    fn check(&self, execution: u64, gas_price: u128) -> anyhow::Result<()> {
+        if execution > executor::MAX_GAS_LIMIT {
+            anyhow::bail!(
+                "the node's estimate, {execution} gas, is past a transaction's {} \
+                 (give --execution-gas)",
+                executor::MAX_GAS_LIMIT
+            );
+        }
+        if let Some(max) = self.max_gas_price {
+            if gas_price > max {
+                anyhow::bail!("the node's gas price, {gas_price}, is above --max-gas-price {max}");
+            }
+        }
+        Ok(())
+    }
+
+    /// The most the transaction pays, shown, and signed only once confirmed
+    /// (or with `--assume-yes`), as Aptos's CLI asks.
+    fn confirm(&self, gas_limit: u64, gas_price: u128) -> anyhow::Result<()> {
+        let fee = u128::from(gas_limit).saturating_mul(gas_price);
+        println!(
+            "Fee: at most {} AIN ({fee} quanta): {gas_limit} gas at {gas_price} quanta a gas",
+            ain_text(fee)
+        );
+        if self.assume_yes {
+            return Ok(());
+        }
+        print!("Sign and submit? [y/N] ");
+        std::io::Write::flush(&mut std::io::stdout())?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if confirmed(&answer) {
+            Ok(())
+        } else {
+            anyhow::bail!("not submitted")
+        }
+    }
+}
+
+/// B362: a yes to the fee's question.
+fn confirmed(answer: &str) -> bool {
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 #[derive(Subcommand)]
@@ -213,15 +304,16 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum KeysSubcommand {
-    /// Generate a new encrypted keypair
+    /// Generate a new encrypted keypair (B328: in `$HOME/.aincore/keys` by
+    /// default, never the working directory)
     Generate {
-        #[arg(long, default_value = "./keys")]
-        out: String,
+        #[arg(long)]
+        out: Option<String>,
     },
     /// Import a private key (entered at a hidden prompt — never via CLI arg)
     Import {
-        #[arg(long, default_value = "./keys")]
-        out: String,
+        #[arg(long)]
+        out: Option<String>,
     },
 }
 
@@ -243,6 +335,10 @@ fn signing_chain<'a>(named: &'a Option<String>, node: &str) -> anyhow::Result<&'
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let client = RpcClient::new(&cli.rpc);
+    let fees = FeePolicy {
+        max_gas_price: cli.max_gas_price,
+        assume_yes: cli.assume_yes,
+    };
     let chain_id = cli
         .chain_id
         .clone()
@@ -279,40 +375,21 @@ fn main() -> anyhow::Result<()> {
             let address = crypto::derive_address(&public_key)
                 .map_err(|e| anyhow::anyhow!("failed to derive the address: {e}"))?;
 
-            let seed_path = format!("{}/mldsa65.seed", out);
-            let pk_path = format!("{}/mldsa65.pub", out);
-            let addr_path = format!("{}/mldsa65_address.txt", out);
-            std::fs::write(&pk_path, hex::encode(&public_key))?;
-            // The seed is a spendable signing identity: owner-only (0600) from
-            // creation, like node.key (audit H-5).
-            {
-                #[cfg(unix)]
-                {
-                    use std::io::Write as _;
-                    use std::os::unix::fs::OpenOptionsExt;
-                    let mut f = std::fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .mode(0o600)
-                        .open(&seed_path)?;
-                    f.write_all(hex::encode(seed).as_bytes())?;
-                }
-                #[cfg(not(unix))]
-                {
-                    std::fs::write(&seed_path, hex::encode(seed))?;
-                }
-            }
-            std::fs::write(&addr_path, &address)?;
+            let (seed_path, pk_path) = save_pqc_key(Path::new(&out), &seed, &public_key, &address)?;
 
             println!("Post-quantum key generated (ML-DSA-65, FIPS 204)");
-            println!("Public key:  {} ({} bytes)", pk_path, public_key.len());
-            println!("Seed:        {} (32 bytes, mode 0600)", seed_path);
+            println!(
+                "Public key:  {} ({} bytes)",
+                pk_path.display(),
+                public_key.len()
+            );
+            println!("Seed:        {} (32 bytes, mode 0600)", seed_path.display());
             println!("Address:     {}", a1n(&address));
             println!("Address hex: {}", address);
             println!();
             println!(
                 "Sign with it: aincore-cli --pqc-seed {} <command>",
-                seed_path
+                seed_path.display()
             );
             println!("SECURITY: the seed is the key; keep it secret (stored unencrypted, 0600).");
         }
@@ -321,7 +398,7 @@ fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&res)?);
         }
         Commands::SubmitProof { device, quality } => {
-            let wallet = load_wallet(&cli.pqc_seed, &cli.keyfile)?;
+            let wallet = load_wallet(&cli.pqc_seed, &cli.keystore, &cli.keyfile)?;
             let sender = wallet.address();
 
             // Get Seq Number
@@ -356,6 +433,7 @@ fn main() -> anyhow::Result<()> {
                 payload,
                 seq_num,
                 cli.execution_gas,
+                &fees,
             )?;
             let res = client.call("aincore_sendTransaction", json!([tx_json]))?;
             println!("✅ Proof Submitted: {}", res);
@@ -364,7 +442,7 @@ fn main() -> anyhow::Result<()> {
             let addr = if let Some(a) = address {
                 require_address_hex(&a)?
             } else {
-                let wallet = load_wallet(&cli.pqc_seed, &cli.keyfile)?;
+                let wallet = load_wallet(&cli.pqc_seed, &cli.keystore, &cli.keyfile)?;
                 wallet.address()
             };
 
@@ -415,7 +493,7 @@ fn main() -> anyhow::Result<()> {
             } else {
                 format!("{amount} AIN")
             };
-            let wallet = load_wallet(&cli.pqc_seed, &cli.keyfile)?;
+            let wallet = load_wallet(&cli.pqc_seed, &cli.keystore, &cli.keyfile)?;
             let sender = wallet.address();
 
             println!("🔍 Loading sender metadata: {}", sender);
@@ -462,74 +540,70 @@ fn main() -> anyhow::Result<()> {
                 payload,
                 seq_num,
                 gas_limit.or(cli.execution_gas),
+                &fees,
             )?;
             let res = client.call("aincore_sendTransaction", json!([tx_str]))?;
             println!("✅ Transaction submitted: {}", res);
         }
         Commands::Publish { path } => {
-            let wallet = load_wallet(&cli.pqc_seed, &cli.keyfile)?;
+            let wallet = load_wallet(&cli.pqc_seed, &cli.keystore, &cli.keyfile)?;
             let sender = wallet.address();
             let source_path = Path::new(&path);
 
             println!("📦 Publishing module from: {:?}", source_path);
 
-            // 1. Compile using move_compiler_tool
-            // We assume the tool is in the same target dir or accessible via PATH
-            // For dev environment, we look in ../../target/debug/
-            let compiler_tool = "../../target/debug/move_compiler_tool";
-            let output_dir = "temp_build";
-
+            // 1. Compile with move_compiler_tool: the stdlib as dependencies
+            // (B363: given after `--sources`, every stdlib module was a
+            // target, and the first `.mv` the directory listed, often
+            // `ascii.mv`, was the one signed and sent), into a directory of
+            // this run's own (`./temp_build` was removed whatever it held).
+            let compiler_tool = std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(|dir| dir.join("move_compiler_tool")))
+                .filter(|tool| tool.exists())
+                .unwrap_or_else(|| {
+                    Path::new("../../target/debug/move_compiler_tool").to_path_buf()
+                });
             // Path to Stdlib sources (Hardcoded for dev environment)
             let stdlib_path = "../vm_move/stdlib/sources";
-
-            // Clean/Create temp dir
-            if Path::new(output_dir).exists() {
-                std::fs::remove_dir_all(output_dir)?;
-            }
-            std::fs::create_dir(output_dir)?;
+            let stdlib: Vec<std::path::PathBuf> = std::fs::read_dir(stdlib_path)
+                .with_context(|| format!("the stdlib sources are not at {stdlib_path}"))?
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("move"))
+                .collect();
+            let output_dir = private_build_dir()?;
 
             println!("   Compiling...");
-
-            // Collect all .move files from stdlib
-            let mut cmd = std::process::Command::new(compiler_tool);
-            cmd.arg("--sources").arg(path);
-
-            // Add stdlib files
-            if let Ok(entries) = std::fs::read_dir(stdlib_path) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.extension().and_then(|s| s.to_str()) == Some("move") {
-                        cmd.arg(path);
-                    }
-                }
-            }
-
-            let status = cmd
-                .arg("--output")
-                .arg(output_dir)
+            let status = compile_command(&compiler_tool, &path, &stdlib, &output_dir)
                 .status()
                 .context("Failed to execute move_compiler_tool. Make sure it is built.")?;
 
             if !status.success() {
+                let _ = std::fs::remove_dir_all(&output_dir);
                 anyhow::bail!("Compilation failed.");
             }
 
-            // 2. Read compiled bytecode
-            // Find the .mv file in output_dir
-            let mut bytecode = Vec::new();
-            for entry in std::fs::read_dir(output_dir)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.extension().and_then(|s| s.to_str()) == Some("mv") {
-                    println!("   Found compiled module: {:?}", path);
-                    bytecode = std::fs::read(path)?;
-                    break; // Only support single module publish for now
+            // 2. The one module the source compiled to.
+            let compiled: Vec<std::path::PathBuf> = std::fs::read_dir(&output_dir)?
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("mv"))
+                .collect();
+            let bytecode = match compiled.as_slice() {
+                [module] => {
+                    println!("   Found compiled module: {:?}", module);
+                    std::fs::read(module)?
                 }
-            }
-
-            if bytecode.is_empty() {
-                anyhow::bail!("No compiled module found in output directory.");
-            }
+                other => {
+                    let _ = std::fs::remove_dir_all(&output_dir);
+                    anyhow::bail!(
+                        "the source compiled to {} modules: publish one module a file",
+                        other.len()
+                    );
+                }
+            };
+            std::fs::remove_dir_all(&output_dir)?;
 
             // 3. Construct Payload
             let bytecode_hex = hex::encode(bytecode);
@@ -546,23 +620,21 @@ fn main() -> anyhow::Result<()> {
                 payload,
                 sequence_number,
                 cli.execution_gas,
+                &fees,
             )?;
             let res = client.call("aincore_sendTransaction", json!([tx_str]))?;
             println!("✅ Publish Transaction submitted: {}", res);
-
-            // Cleanup
-            std::fs::remove_dir_all(output_dir)?;
         }
         Commands::Keys { command } => match command {
             KeysSubcommand::Generate { out } => {
-                KeysCmd::generate(&out)?;
+                KeysCmd::generate(&keys::out_dir(out)?)?;
             }
             KeysSubcommand::Import { out } => {
-                KeysCmd::import(&out)?;
+                KeysCmd::import(&keys::out_dir(out)?)?;
             }
         },
         Commands::RegisterValidator => {
-            let wallet = load_wallet(&cli.pqc_seed, &cli.keyfile)?;
+            let wallet = load_wallet(&cli.pqc_seed, &cli.keystore, &cli.keyfile)?;
             let sender = wallet.address();
 
             println!("🔒 Registering Validator for address: {}", sender);
@@ -599,13 +671,14 @@ fn main() -> anyhow::Result<()> {
                 payload,
                 sequence_number,
                 cli.execution_gas,
+                &fees,
             )?;
             let res = client.call("aincore_sendTransaction", json!([tx_json]))?;
             println!("✅ Validator Registration Submitted: {}", res);
         }
         Commands::Faucet { to, amount } => {
             let to = require_address_hex(&to)?;
-            let wallet = load_wallet(&cli.pqc_seed, &cli.keyfile)?;
+            let wallet = load_wallet(&cli.pqc_seed, &cli.keystore, &cli.keyfile)?;
             let sender = wallet.address();
 
             println!("🚰 Faucet: Sending {} AIN to {}", amount, a1n(&to));
@@ -645,6 +718,7 @@ fn main() -> anyhow::Result<()> {
                 payload,
                 sequence_number,
                 cli.execution_gas,
+                &fees,
             )?;
             let res = client.call("aincore_sendTransaction", json!([tx_json]))?;
             println!("✅ Faucet Transaction Submitted: {}", res);
@@ -656,6 +730,96 @@ fn main() -> anyhow::Result<()> {
 
 /// One AIN in quanta (the coin's 18 decimals).
 const QUANTA_PER_AIN: u128 = 1_000_000_000_000_000_000;
+
+/// B364: an ML-DSA-65 key's three files in `out`: its seed first (owner-only,
+/// 0600, as node.key: audit H-5), then its public key and address, none over
+/// a file that exists. A second run wrote a new public key over the old one,
+/// then failed on the seed's `create_new`: a public key without its seed,
+/// whose address could receive and never spend.
+fn save_pqc_key(
+    out: &Path,
+    seed: &[u8; 32],
+    public_key: &[u8],
+    address: &str,
+) -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf)> {
+    let seed_path = out.join("mldsa65.seed");
+    let pk_path = out.join("mldsa65.pub");
+    let addr_path = out.join("mldsa65_address.txt");
+    for path in [&seed_path, &pk_path, &addr_path] {
+        if path.exists() {
+            anyhow::bail!(
+                "{} exists: a key is never written over (move it, or name another --out)",
+                path.display()
+            );
+        }
+    }
+    let write_new = |path: &Path, contents: &[u8], private: bool| -> std::io::Result<()> {
+        use std::io::Write as _;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            if private {
+                std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = private;
+        options.open(path)?.write_all(contents)
+    };
+    write_new(&seed_path, hex::encode(seed).as_bytes(), true)?;
+    write_new(&pk_path, hex::encode(public_key).as_bytes(), false)?;
+    write_new(&addr_path, address.as_bytes(), false)?;
+    Ok((seed_path, pk_path))
+}
+
+/// B363: the compiler's command: the user's source its only target, the
+/// stdlib its dependencies (compiled, not emitted), into `out`.
+fn compile_command(
+    tool: &Path,
+    source: &str,
+    stdlib: &[std::path::PathBuf],
+    out: &Path,
+) -> std::process::Command {
+    let mut cmd = std::process::Command::new(tool);
+    cmd.arg("--sources")
+        .arg(source)
+        .arg("--deps")
+        .args(stdlib)
+        .arg("--output")
+        .arg(out);
+    cmd
+}
+
+/// B363: a new directory of this run's own for the compiler's output, under
+/// the system's temporary directory (never one that exists).
+fn private_build_dir() -> anyhow::Result<std::path::PathBuf> {
+    use rand::RngCore;
+    let dir = std::env::temp_dir().join(format!(
+        "aincore-publish-{}-{:016x}",
+        std::process::id(),
+        rand::rngs::OsRng.next_u64()
+    ));
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    }
+    builder
+        .create(&dir)
+        .with_context(|| format!("could not create {}", dir.display()))?;
+    Ok(dir)
+}
+
+/// B362: quanta in AIN, its 18 decimals without trailing zeros.
+fn ain_text(quanta: u128) -> String {
+    let (whole, frac) = (quanta / QUANTA_PER_AIN, quanta % QUANTA_PER_AIN);
+    if frac == 0 {
+        return whole.to_string();
+    }
+    let frac = format!("{frac:018}");
+    format!("{whole}.{}", frac.trim_end_matches('0'))
+}
 
 /// B296: an amount in AIN with up to 18 decimals ("1010", "0.25"), in quanta.
 fn parse_ain(text: &str) -> anyhow::Result<u128> {
@@ -694,6 +858,131 @@ mod amount_tests {
         assert!(super::parse_ain("").is_err());
         assert!(super::parse_ain("-1").is_err());
         assert!(super::parse_ain("1e3").is_err());
+    }
+}
+
+#[cfg(test)]
+mod fee_tests {
+    use super::*;
+
+    /// B362 witness: the node's price and estimate are a stranger's word: a
+    /// price above `--max-gas-price` and an estimate past a transaction's gas
+    /// limit are refused, and only a yes signs the fee shown (a hostile RPC
+    /// named a price that spent the whole balance on one transfer's fee).
+    #[test]
+    fn the_nodes_price_is_bounded_and_its_fee_confirmed() {
+        let fees = FeePolicy {
+            max_gas_price: Some(100),
+            assume_yes: false,
+        };
+        assert!(fees.check(1_000, 100).is_ok());
+        assert!(fees.check(1_000, 101).is_err(), "a price past the bound");
+        assert!(
+            fees.check(executor::MAX_GAS_LIMIT + 1, 1).is_err(),
+            "an estimate past a transaction's limit"
+        );
+        assert!(confirmed("y\n") && confirmed(" YES "));
+        assert!(!confirmed("") && !confirmed("n") && !confirmed("yes please"));
+        assert_eq!(ain_text(QUANTA_PER_AIN * 3 / 2), "1.5");
+        assert_eq!(ain_text(7), "0.000000000000000007");
+        assert_eq!(ain_text(0), "0");
+    }
+
+    /// B363 witness: the stdlib compiles as the source's dependencies only,
+    /// into a new directory of the run's own (given after `--sources`, every
+    /// stdlib module was a target, and the first `.mv` listed was the one
+    /// signed and sent; `./temp_build` was removed whatever it held).
+    #[test]
+    fn the_stdlib_compiles_as_dependencies_only() {
+        let stdlib = [std::path::PathBuf::from("std/ascii.move")];
+        let cmd = compile_command(Path::new("tool"), "mine.move", &stdlib, Path::new("out"));
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "--sources",
+                "mine.move",
+                "--deps",
+                "std/ascii.move",
+                "--output",
+                "out"
+            ]
+        );
+        let (a, b) = (private_build_dir().unwrap(), private_build_dir().unwrap());
+        assert_ne!(a, b);
+        assert!(a.starts_with(std::env::temp_dir()));
+        std::fs::remove_dir(&a).unwrap();
+        std::fs::remove_dir(&b).unwrap();
+    }
+
+    /// B364 witness: a key is never written over: a second key in the same
+    /// directory is refused before any file is touched (it wrote its public
+    /// key over the first one's, then failed on the seed). A public key
+    /// alone is refused too, and the seed is written first: one that cannot
+    /// be written leaves no public key.
+    #[test]
+    fn a_second_pqc_key_writes_over_nothing() {
+        let out = std::env::temp_dir().join(format!(
+            "aincore-b364-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir(&out).unwrap();
+        save_pqc_key(&out, &[1; 32], b"first", "addr1").unwrap();
+        let read = |name: &str| std::fs::read_to_string(out.join(name)).unwrap();
+        let before = (
+            read("mldsa65.seed"),
+            read("mldsa65.pub"),
+            read("mldsa65_address.txt"),
+        );
+        assert!(save_pqc_key(&out, &[2; 32], b"second", "addr2").is_err());
+        let after = (
+            read("mldsa65.seed"),
+            read("mldsa65.pub"),
+            read("mldsa65_address.txt"),
+        );
+        assert_eq!(before, after, "a file was written over");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(out.join("mldsa65.seed"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+
+        // A public key alone (its seed moved away): refused, the public key
+        // kept, no seed or address written beside it (a new key pair over
+        // the old public key otherwise).
+        std::fs::remove_file(out.join("mldsa65.seed")).unwrap();
+        std::fs::remove_file(out.join("mldsa65_address.txt")).unwrap();
+        assert!(save_pqc_key(&out, &[3; 32], b"third", "addr3").is_err());
+        assert_eq!(read("mldsa65.pub"), before.1, "the public key written over");
+        assert!(!out.join("mldsa65.seed").exists(), "a seed written");
+        assert!(
+            !out.join("mldsa65_address.txt").exists(),
+            "an address written"
+        );
+
+        // The seed first: a seed that cannot be written leaves no public key
+        // (a dangling link passes `exists`, and `create_new` refuses it).
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(out.join("mldsa65.pub")).unwrap();
+            std::os::unix::fs::symlink(out.join("nowhere"), out.join("mldsa65.seed")).unwrap();
+            assert!(save_pqc_key(&out, &[4; 32], b"fourth", "addr4").is_err());
+            assert!(
+                std::fs::symlink_metadata(out.join("mldsa65.pub")).is_err(),
+                "a public key written before its seed"
+            );
+            assert!(!out.join("mldsa65_address.txt").exists());
+            assert!(!out.join("nowhere").exists());
+        }
+        std::fs::remove_dir_all(&out).unwrap();
     }
 }
 

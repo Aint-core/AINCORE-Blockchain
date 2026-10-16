@@ -329,6 +329,48 @@ fn check_epoch_interval_pinned(stored: Option<String>, env: Option<String>) -> R
     Ok(pinned)
 }
 
+/// B384: every boot list entry the node cannot dial, with why: an empty
+/// entry, or one `sessions::libp2p_bootnode` (the parser `boot_dial_list`
+/// dials with) refuses. `boot_dial_list` dropped such an entry with one log
+/// line, so a mistyped list booted the node isolated.
+fn bad_bootnodes(entries: &[String]) -> Vec<String> {
+    entries
+        .iter()
+        .filter_map(|given| {
+            if given.trim().is_empty() {
+                return Some("an empty entry".to_string());
+            }
+            node::sessions::libp2p_bootnode(given).err()
+        })
+        .collect()
+}
+
+/// B384: `--bootnodes` and `AINCORE_PUBLIC_SEED_BOOTNODE` (unset or blank:
+/// none), checked at boot as strictly as every other flag (B331): every
+/// entry the node cannot dial is named. A list of only bad entries was
+/// also non-empty, so the public seed was skipped too.
+fn check_bootnodes(bootnodes: &[String], public_seed: Option<String>) -> Result<(), String> {
+    let mut problems: Vec<String> = bad_bootnodes(bootnodes)
+        .into_iter()
+        .map(|e| format!("--bootnodes: {e}"))
+        .collect();
+    if let Some(seed) = public_seed.filter(|s| !s.trim().is_empty()) {
+        problems.extend(
+            bad_bootnodes(&[seed])
+                .into_iter()
+                .map(|e| format!("AINCORE_PUBLIC_SEED_BOOTNODE: {e}")),
+        );
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "bootnodes the node cannot dial: {}",
+            problems.join("; ")
+        ))
+    }
+}
+
 /// B87: write a secret (node.key: it derives the Ed25519 identity, the
 /// validator's BLS seed and the DA at-rest key) owner-only from the first
 /// byte: a temporary file created 0600 and exclusively, written, synced,
@@ -391,6 +433,19 @@ async fn main() {
     node::abort_on_panic();
     // === ARGUMENT PARSER ===
     let config = config::NodeConfig::parse();
+    // B349: and the environment, as strictly as the flags.
+    if let Err(why) = node::env_check::check() {
+        eprintln!("❌ {why}");
+        std::process::exit(2);
+    }
+    // B384: and the boot list, with the parser it is dialled with.
+    if let Err(why) = check_bootnodes(
+        &config.bootnodes,
+        std::env::var("AINCORE_PUBLIC_SEED_BOOTNODE").ok(),
+    ) {
+        eprintln!("❌ {why}");
+        std::process::exit(2);
+    }
 
     // Unpack config for backward compatibility
     let port = config.port;
@@ -499,6 +554,13 @@ async fn main() {
     let node_id = node_addr_hex.clone(); // Use address as node_id for consensus matching
 
     let db_path = format!("{}/validator_{}.db", datadir, port);
+    // B326: never an empty chain beside this node's own under another port.
+    if let Some(other) = node::other_validator_db(&datadir_path, port) {
+        eprintln!(
+            "❌ FATAL: {datadir}/{other} is this node's database under another port, and port {port} has none: run with that --port"
+        );
+        std::process::exit(1);
+    }
 
     // Automated state-sync bootstrap: on a fresh datadir, optionally load a
     // published snapshot so a new public-testnet node starts near the tip
@@ -966,8 +1028,10 @@ async fn main() {
                     c.try_create_vertex();
                     // G4 S1: the sessions admit C_E and C_{E+1}.
                     if let Some((epoch, current, next)) = c.session_committees() {
+                        // B405: a member that abstains (RC-3) proposes
+                        // nothing: it forwards like a node outside.
                         ticker_member.store(
-                            current.iter().any(|m| m.address == ticker_node_id),
+                            current.iter().any(|m| m.address == ticker_node_id) && c.v4_signs(),
                             Ordering::SeqCst,
                         );
                         let key = (epoch, next.is_some());
@@ -1224,7 +1288,7 @@ mod boot_identity_tests {
             ed25519_public_key: "00".repeat(32),
             bls_public_key: hex::encode(crypto::bls::BLSEngine::consensus().pubkey_raw(&[7; 32])),
             bls_pop: hex::encode(
-                crypto::bls::BLSEngine::consensus().prove_possession_raw(&[7; 32]),
+                crypto::bls::BLSEngine::consensus().prove_possession_raw(&[7; 32], &[0u8; 32]),
             ),
         }];
         let second = format!("obj:{}", "cd".repeat(32));
@@ -1728,5 +1792,51 @@ mod secret_file_tests {
             assert_eq!(mode, 0o600, "narrowed to {mode:o}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod bootnode_tests {
+    use super::{bad_bootnodes, check_bootnodes};
+
+    fn list(entries: &[&str]) -> Vec<String> {
+        entries.iter().map(|e| e.to_string()).collect()
+    }
+
+    /// B384 witness: a boot list entry the node cannot dial is refused at
+    /// boot, every one named. `boot_dial_list` dropped it with one log line
+    /// and the node booted isolated (a list of only bad entries also
+    /// skipped `AINCORE_PUBLIC_SEED_BOOTNODE`); a bad public seed is
+    /// refused the same way.
+    #[test]
+    fn a_bootnode_the_node_cannot_dial_is_refused() {
+        let good = list(&[
+            "127.0.0.1:9001",
+            "[::1]:9001",
+            "seed.example.org:9001",
+            "/ip4/10.0.0.1/tcp/9001",
+        ]);
+        assert_eq!(bad_bootnodes(&good), Vec::<String>::new());
+        assert!(check_bootnodes(&good, Some("/ip4/10.0.0.2/tcp/9001".into())).is_ok());
+        assert!(check_bootnodes(&[], None).is_ok());
+        assert!(
+            check_bootnodes(&[], Some(" ".into())).is_ok(),
+            "blank is unset"
+        );
+
+        let bad = bad_bootnodes(&list(&[
+            "127.0.0.1",
+            "127.0.0.1:9001",
+            "/ip4/10.0.0.1",
+            "",
+            "localhost:99999",
+        ]));
+        assert_eq!(bad.len(), 4, "{bad:?}");
+
+        let err = check_bootnodes(&list(&["nohost", "10.0.0.1:65500"]), None).unwrap_err();
+        assert!(err.contains("nohost") && err.contains("65500"), "{err}");
+        let err = check_bootnodes(&good, Some("/dns4/seed.example.org".into())).unwrap_err();
+        assert!(err.contains("AINCORE_PUBLIC_SEED_BOOTNODE"), "{err}");
+        assert!(!err.contains("--bootnodes"), "{err}");
     }
 }

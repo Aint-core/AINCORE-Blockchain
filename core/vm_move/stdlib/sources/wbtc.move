@@ -1,10 +1,9 @@
 /// Wrapped Bitcoin (wBTC) Module for AINCORE
-/// 
-/// This module implements a wrapped Bitcoin token that represents BTC 
-/// locked in the Bitcoin multisig wallet.
-/// 
-/// Only the bridge authority can mint/burn wBTC.
-/// 1 wBTC = 1 BTC (always 1:1 backed)
+///
+/// Only the bridge authority mints wBTC. B314: genesis names an authority no
+/// key signs for, so nothing mints wBTC (and nothing rotates the authority)
+/// until a bridge that verifies BTC deposits on chain is installed by a
+/// protocol upgrade. No BTC backs wBTC before then, and `burn` releases none.
 module 0x1::wbtc {
     use std::signer;
     use std::error;
@@ -70,8 +69,8 @@ module 0x1::wbtc {
         config.total_minted = config.total_minted + amount;
     }
 
-    /// Burn wBTC (anyone can burn their own wBTC to withdraw BTC)
-    /// Emits event for bridge to release BTC from multisig
+    /// Burn wBTC (anyone can burn their own). Nothing releases BTC for it
+    /// yet: no bridge reads it (B314).
     public entry fun burn(
         account: &signer,
         amount: u128,
@@ -94,9 +93,6 @@ module 0x1::wbtc {
         // Update stats
         let config = borrow_global_mut<BridgeConfig>(@0x1);
         config.total_burned = config.total_burned + amount;
-        
-        // Event will be emitted here for bridge to pick up
-        // Bridge will then release BTC to btc_address
     }
 
     /// Register account to hold wBTC

@@ -120,6 +120,29 @@ pub const MAX_DECISION_ROWS: u64 = 5_000;
 pub const GC_DEPTH: u64 = 50;
 const GC_FLOOR_KEY: &str = "consensus:gc_floor";
 
+/// B468: a row the engine resumes from at boot. Absent is the caller's
+/// default; a row that cannot be read (a read error, or not UTF-8) fails the
+/// boot, as GC-4's committed sequence does. Read as absent, a g that could
+/// not be read was 0: E3 refused only round 0 (in a later epoch
+/// `begin_epoch` wrote its first round less one back over the real g), and a
+/// slot whose attestation guard GC-3 had deleted could be attested again.
+fn boot_row(storage: &StateDB, key: &str) -> Option<String> {
+    match storage.try_get(key) {
+        Ok(row) => row,
+        Err(e) => panic!("{key} cannot be read at boot: {e}"),
+    }
+}
+
+/// B468: a number the engine resumes from at boot. One that does not parse
+/// fails the boot too; it was read as absent.
+fn boot_number(storage: &StateDB, key: &str) -> Option<u64> {
+    let row = boot_row(storage, key)?;
+    match row.parse::<u64>() {
+        Ok(n) => Some(n),
+        Err(e) => panic!("{key} is not a number at boot ({row:?}): {e}"),
+    }
+}
+
 /// DE-6: `consensus:anchor_decision:{E:020}:{r:020}` holds `C:{digest}` or
 /// `S`, written once in the acceptance transaction.
 /// B36: anchor decisions are keyed under this epoch whatever the epoch
@@ -141,6 +164,10 @@ pub struct CommitInfo {
     /// anchor: a member rebuilding the block needs every round above it
     /// (after skipped anchors it is far below this anchor less GC_DEPTH).
     pub decision_floor: u64,
+    /// B318: the cursor the decision started from (`next_anchor_round`
+    /// before this anchor): a member that decided the block before this one
+    /// stands there, and stages payloads only within `LEAD` of it.
+    pub decision_cursor: u64,
 }
 
 /// A decision without side effects. The caller must hold the engine lock from
@@ -284,56 +311,66 @@ impl OrderingEngine {
     pub fn new_with_storage(storage: Arc<StateDB>) -> Self {
         let vdf = VDFEngine::new(50).ok();
 
+        // B468: every row this boot resumes from is absent (its default) or
+        // read whole; one present that cannot be read or parse fails the boot
+        // (`boot_row`, `boot_number`, and GC-4's scan below). The folded QC
+        // is the exception: a pruned one is absent, and only the beacon,
+        // which decides nothing, reads it.
+
         // Load committed_rounds from DB (backward-compatible: old data may be a
         // huge unbounded Vec<u64>; we derive the high-water mark from it and
         // then keep only the most recent window in memory).
         let mut committed_rounds: HashSet<u64> = HashSet::new();
         let mut finalized_round: u64 = 0;
-        if let Ok(Some(json)) = storage.get("consensus:committed_rounds") {
-            if let Ok(rounds) = serde_json::from_str::<Vec<u64>>(&json) {
-                println!("🔄 Restored {} committed rounds from DB", rounds.len());
-                finalized_round = rounds.iter().copied().max().unwrap_or(0);
-                let cutoff = finalized_round.saturating_sub(COMMITTED_ROUNDS_WINDOW);
-                committed_rounds = rounds.into_iter().filter(|r| *r >= cutoff).collect();
-            }
+        if let Some(json) = boot_row(&storage, "consensus:committed_rounds") {
+            let rounds: Vec<u64> = match serde_json::from_str(&json) {
+                Ok(rounds) => rounds,
+                Err(e) => panic!("consensus:committed_rounds does not parse at boot: {e}"),
+            };
+            println!("🔄 Restored {} committed rounds from DB", rounds.len());
+            finalized_round = rounds.iter().copied().max().unwrap_or(0);
+            let cutoff = finalized_round.saturating_sub(COMMITTED_ROUNDS_WINDOW);
+            committed_rounds = rounds.into_iter().filter(|r| *r >= cutoff).collect();
         }
         // Prefer the explicit persisted high-water mark when present (newer nodes
         // persist it); fall back to the value derived from the set above.
-        if let Ok(Some(s)) = storage.get("consensus:finalized_round") {
-            if let Ok(persisted) = s.parse::<u64>() {
-                finalized_round = finalized_round.max(persisted);
-            }
+        if let Some(persisted) = boot_number(&storage, "consensus:finalized_round") {
+            finalized_round = finalized_round.max(persisted);
         }
 
         // GC-4: rebuild the committed set from every `cseq` row above g. Each
         // row is one committed anchor's sequence; nothing above g was ever
-        // deleted, so this is exact, and the same on every node.
-        let gc_floor = storage
-            .get(GC_FLOOR_KEY)
-            .ok()
-            .flatten()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
+        // deleted, so this is exact, and the same on every node. B456: so a
+        // row that cannot be read fails the boot (as the V4 engine's does).
+        // A read error ended the scan, and a row above g that did not parse
+        // was skipped: the vertices it committed were left out, and the next
+        // anchor's walk ordered them again (a header no other node built).
+        // B468: g itself too; only an absent row is 0. GC-3 deleted the
+        // guards at and below g on the premise that g is durable and
+        // monotone, and E3 refuses those rounds only while g holds.
+        let gc_floor = boot_number(&storage, GC_FLOOR_KEY).unwrap_or(0);
         let mut committed_sequence: Vec<String> = Vec::new();
         let mut committed_set: HashMap<String, u64> = HashMap::new();
         {
             let mut rows: Vec<(u64, Vec<String>)> = Vec::new();
-            for row in storage.db.prefix_iterator(COMMITTED_SEQ_KEY_PREFIX.as_bytes()) {
-                let Ok((key, value)) = row else {
-                    break;
+            let held = match storage.try_scan_prefix(COMMITTED_SEQ_KEY_PREFIX) {
+                Ok(held) => held,
+                Err(e) => panic!("the committed sequence cannot be read: {e}"),
+            };
+            for (key, value) in held {
+                let Some(round) = key
+                    .strip_prefix(COMMITTED_SEQ_KEY_PREFIX)
+                    .and_then(|r| r.parse::<u64>().ok())
+                else {
+                    panic!("a committed-sequence row names no round: {key}");
                 };
-                if !key.starts_with(COMMITTED_SEQ_KEY_PREFIX.as_bytes()) {
-                    break;
+                if round <= gc_floor {
+                    continue;
                 }
-                let round = std::str::from_utf8(&key[COMMITTED_SEQ_KEY_PREFIX.len()..])
-                    .ok()
-                    .and_then(|r| r.parse::<u64>().ok());
-                let hashes = serde_json::from_slice::<Vec<String>>(&value).ok();
-                if let (Some(round), Some(hashes)) = (round, hashes) {
-                    if round > gc_floor {
-                        rows.push((round, hashes));
-                    }
-                }
+                let Ok(hashes) = serde_json::from_str::<Vec<String>>(&value) else {
+                    panic!("the committed sequence of round {round} does not parse");
+                };
+                rows.push((round, hashes));
             }
             rows.sort_by_key(|(r, _)| *r);
             for (round, hashes) in rows {
@@ -355,11 +392,7 @@ impl OrderingEngine {
         // authoritative digest over the FULL committed history. Re-hashing the
         // reloaded (truncated + reversed) committed_sequence would diverge from
         // peers that never restarted, so we chain from the stored value instead.
-        let finality_digest = storage
-            .get("consensus:finality_digest")
-            .ok()
-            .flatten()
-            .unwrap_or_default();
+        let finality_digest = boot_row(&storage, "consensus:finality_digest").unwrap_or_default();
 
         // SEC-#22/#12: restore the leader-election beacon on restart. The beacon is
         // a pure function of (last anchor round, cumulative finality digest) — both
@@ -372,12 +405,8 @@ impl OrderingEngine {
         let mut last_vdf_output = vec![0u8; 32];
         let mut folded_qc_height: Option<u64> = None;
         if let Some(ref v) = vdf {
-            let last_anchor_round = storage
-                .get("consensus:last_anchor_round")
-                .ok()
-                .flatten()
-                .and_then(|s| s.parse::<u64>().ok());
-            let digest = storage.get("consensus:finality_digest").ok().flatten();
+            let last_anchor_round = boot_number(&storage, "consensus:last_anchor_round");
+            let digest = boot_row(&storage, "consensus:finality_digest");
             if let (Some(ar), Some(d)) = (last_anchor_round, digest.as_ref()) {
                 if let Ok((output, _proof)) = v.compute(&Self::beacon_challenge(ar, d)) {
                     step1_beacon = output;
@@ -400,16 +429,8 @@ impl OrderingEngine {
             // earlier base — whose later heights had no complete QC — is ignored, so
             // restart matches the live unfolded beacon in that case. A missing QC
             // (pruned) likewise falls back to the Step-1 base.
-            let folded_h = storage
-                .get("consensus:beacon_folded_qc_height")
-                .ok()
-                .flatten()
-                .and_then(|s| s.parse::<u64>().ok());
-            let folded_ar = storage
-                .get("consensus:beacon_folded_anchor_round")
-                .ok()
-                .flatten()
-                .and_then(|s| s.parse::<u64>().ok());
+            let folded_h = boot_number(&storage, "consensus:beacon_folded_qc_height");
+            let folded_ar = boot_number(&storage, "consensus:beacon_folded_anchor_round");
             if let (Some(h), Some(far), Some(lar)) = (folded_h, folded_ar, last_anchor_round) {
                 if far == lar {
                     if let Some(agg) = Self::load_qc_aggregate_signature(&storage, h) {
@@ -426,10 +447,8 @@ impl OrderingEngine {
         // ahead (it also encodes SKIP decisions past the last commit); otherwise
         // derive from the finality high-water mark.
         let mut next_anchor_round = finalized_round.saturating_add(1).max(1);
-        if let Ok(Some(s)) = storage.get("consensus:next_anchor_round") {
-            if let Ok(persisted) = s.parse::<u64>() {
-                next_anchor_round = next_anchor_round.max(persisted);
-            }
+        if let Some(persisted) = boot_number(&storage, "consensus:next_anchor_round") {
+            next_anchor_round = next_anchor_round.max(persisted);
         }
 
         Self {
@@ -1126,6 +1145,7 @@ impl OrderingEngine {
                 anchor_hash: anchor_vertex_hash.to_string(),
                 finality_digest: digest,
                 decision_floor: self.gc_floor,
+                decision_cursor: self.next_anchor_round,
             },
             previous_finalized_round: self.finalized_round,
             previous_next_anchor_round: self.next_anchor_round,
@@ -4376,6 +4396,85 @@ mod tests {
             commit_fingerprint(&a_restarted),
             "one anchor, two sequences"
         );
+    }
+
+    /// B456 witness (GC-4): a committed-sequence row above g that does not
+    /// parse fails the boot. Skipped, the vertices it committed were left out
+    /// of the committed set this rebuild must hold exactly, and the next
+    /// anchor's walk ordered them again: a header no other node built.
+    #[test]
+    #[should_panic(expected = "the committed sequence of round 9 does not parse")]
+    fn a_committed_sequence_row_that_does_not_parse_fails_the_boot() {
+        let db = temp_db("b456_cseq_unparsed");
+        db.put("consensus:gc_floor", "8").unwrap();
+        db.put("consensus:cseq:9", "[\"not closed").unwrap();
+        let _engine = OrderingEngine::new_with_storage(db);
+    }
+
+    /// B456 witness (GC-4): nor one that is not UTF-8 (one byte of a digest
+    /// rotted): read lossily, it parsed, and named another digest.
+    #[test]
+    #[should_panic(expected = "the committed sequence cannot be read")]
+    fn a_committed_sequence_row_that_is_not_utf8_fails_the_boot() {
+        let db = temp_db("b456_cseq_rotted");
+        let mut batch = storage::rocksdb::WriteBatch::default();
+        batch.put(b"consensus:cseq:9", b"[\"aa\xff\"]");
+        db.write_batch(batch).unwrap();
+        let _engine = OrderingEngine::new_with_storage(db);
+    }
+
+    /// B456 control: a row at or below g is not part of the rebuild (GC-4),
+    /// and clean rows above it are restored.
+    #[test]
+    fn the_committed_set_is_rebuilt_from_the_rows_above_g() {
+        let db = temp_db("b456_cseq_floor");
+        db.put("consensus:gc_floor", "8").unwrap();
+        db.put("consensus:cseq:7", "[\"not closed").unwrap();
+        db.put("consensus:cseq:9", "[\"aa\",\"bb\"]").unwrap();
+        let engine = OrderingEngine::new_with_storage(db);
+        assert_eq!(engine.committed_set.get("aa"), Some(&9));
+        assert_eq!(engine.committed_set.len(), 2);
+    }
+
+    /// B468 witness: every row the engine resumes from at boot fails the
+    /// boot when it is present but cannot be read (not UTF-8: a rotted byte,
+    /// which `try_get` reports as it does a read error) or does not parse.
+    /// Read as absent, g fell to 0 (E3 then refused only round 0, and a
+    /// later epoch's `begin_epoch` wrote its first round less one back over
+    /// the real g), and the other rows put the engine back at a state it
+    /// never held. Control: absent, each row is its default.
+    #[test]
+    fn a_boot_row_that_cannot_be_read_fails_the_boot() {
+        let cases: [(&str, &[u8]); 9] = [
+            ("consensus:gc_floor", &b"\xb18"[..]),
+            ("consensus:gc_floor", &b"eight"[..]),
+            ("consensus:committed_rounds", &b"[7, 8"[..]),
+            ("consensus:finalized_round", &b"nine"[..]),
+            ("consensus:next_anchor_round", &b"1\xff"[..]),
+            ("consensus:finality_digest", &b"ab\xffcd"[..]),
+            ("consensus:last_anchor_round", &b"-1"[..]),
+            ("consensus:beacon_folded_qc_height", &b"ten"[..]),
+            ("consensus:beacon_folded_anchor_round", &b"\xff"[..]),
+        ];
+        for (i, (key, bad)) in cases.into_iter().enumerate() {
+            let db = temp_db(&format!("b468_boot_row_{i}"));
+            let mut batch = storage::rocksdb::WriteBatch::default();
+            batch.put(key.as_bytes(), bad);
+            db.write_batch(batch).unwrap();
+            let boot = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                OrderingEngine::new_with_storage(Arc::clone(&db))
+            }));
+            assert!(boot.is_err(), "{key} = {bad:?} was read as absent");
+            let mut batch = storage::rocksdb::WriteBatch::default();
+            batch.delete(key.as_bytes());
+            db.write_batch(batch).unwrap();
+            let engine = OrderingEngine::new_with_storage(db);
+            assert_eq!(
+                (engine.gc_floor, engine.finalized_round, engine.next_anchor_round),
+                (0, 0, 1),
+                "control: {key} absent is not its default"
+            );
+        }
     }
 
     /// Second review of S5, MEDIUM-2: DE-6 refuses an adopted anchor that is

@@ -19,7 +19,12 @@ use storage::StateDB;
 /// as state-tree version 0, and its identity binds `state_root(0)`.
 /// G1 S11: a genesis of this version is a V4 (certified-DAG) chain; an older
 /// binary refuses it.
-const GENESIS_VERSION: &str = "g1-certified-dag-v6";
+/// v7 (B325): what rounds 16 to 19 changed in what nodes compute together
+/// (a block's body, B284; its receipts root, B292; finality votes, B320; the
+/// gas of Move values, B315; the genesis authorities, B314): a v6 database
+/// (testnet V4) does not run on this build. It reopened when the stdlib's
+/// hash happened to match, and would compute other blocks than its peers.
+const GENESIS_VERSION: &str = "g1-certified-dag-v7";
 /// G1 S11: every new chain is V4 (`consensus::v4::VERTEX_FORMAT_KEY`).
 const GENESIS_VERTEX_FORMAT: &str = "4";
 /// G1 S11 / RC-3: the launch time (unix seconds), in the root.
@@ -101,6 +106,11 @@ fn system_resource_key(resource: &str) -> String {
     format!("resource_{}_{}", system_address(), resource)
 }
 
+/// B314: an address no key signs for: an account address is the SHA-256 of a
+/// public key, and no system call signs as 0x0. Genesis gives it the
+/// authorities no single key may hold (wBTC's mint).
+const NO_KEY_ADDRESS: AccountAddress = AccountAddress::ZERO;
+
 fn parse_move_addr(hex_addr: &str) -> Result<AccountAddress, GenesisError> {
     let bytes = hex::decode(hex_addr)?;
     if bytes.len() != AccountAddress::LENGTH {
@@ -166,6 +176,7 @@ fn parse_validator_public_key(
 /// built it. Returns `(bls_public_key, bls_pop)` as raw bytes.
 fn resolve_genesis_bls_identity(
     validator: &str,
+    ed25519_public_key: &[u8],
     bls_public_key_hex: Option<&str>,
     bls_pop_hex: Option<&str>,
 ) -> Result<(Vec<u8>, Vec<u8>), GenesisError> {
@@ -190,7 +201,8 @@ fn resolve_genesis_bls_identity(
             pop.len()
         )));
     }
-    match bls.verify_possession(&pk, &pop) {
+    // B354: bound to the validator's Ed25519 key.
+    match bls.verify_possession(&pk, &pop, ed25519_public_key) {
         Ok(true) => Ok((pk, pop)),
         Ok(false) => Err(GenesisError::InvalidData(
             "Genesis validator bls_pop failed proof-of-possession verification".to_string(),
@@ -588,6 +600,9 @@ fn verify_genesis_integrity(storage: &Arc<StateDB>) -> Result<(), GenesisError> 
     let validator_set: ValidatorSet =
         decode_resource(storage, &system_resource_key("0x1::staking::ValidatorSet"))?;
     let _validator_count = validator_set.validators.len();
+    // B414: `cumulative_burned` (0x1::staking::SupplyStats), from genesis on.
+    let _supply_stats: u128 =
+        decode_resource(storage, &system_resource_key("0x1::staking::SupplyStats"))?;
     let _epoch: Epoch = decode_resource(storage, &system_resource_key("0x1::epoch::Epoch"))?;
     let params = stored_chain_params(storage)?;
     // G5 P-1: Move's epoch (unlock heights) and the Rust epoch (committee
@@ -698,7 +713,8 @@ pub struct GenesisFile {
     /// G1 S11 / RC-3: the launch time, unix seconds. A validator takes its
     /// first guard origin (`AINCORE_GUARD_ORIGIN_INIT=1`) only within the
     /// launch window after it, so the flag left set on a wiped database
-    /// later cannot re-arm signing. Without it the flag is never honored.
+    /// later cannot re-arm signing. B383: required; a file without it is
+    /// refused (optional here only so the refusal names the field).
     #[serde(default)]
     pub genesis_time: Option<u64>,
     /// G5 A4 BW-2: bootstrap weight; none on a chain without it.
@@ -852,10 +868,6 @@ impl GenesisWrites {
             &format!("obj:{}", object.id),
             &serde_json::to_string(object)?,
         )
-    }
-
-    fn set_federation_key(&mut self, addr: &str) -> Result<(), GenesisError> {
-        self.put("sys:config:federation_addr", addr)
     }
 
     /// TA-1: the root of version 0 and the identity, both from these writes.
@@ -1181,6 +1193,7 @@ pub fn build_genesis(
     let genesis_burn_percentage: u8;
     let genesis_min_base_fee: u128;
     let genesis_tip_agreement_n: u64;
+    let genesis_time: u64;
 
     {
         let config = file;
@@ -1241,6 +1254,27 @@ pub fn build_genesis(
             )?,
         };
         chain_params.validate()?;
+        // B383: the launch time is required, as the chain parameters are. A
+        // file without it was taken and wrote no `sys:genesis_time`, so no
+        // validator could ever take its first guard origin: the launch was
+        // dead and RC-3's warning blamed the launch window. 0 (1970) is the
+        // same dead launch.
+        genesis_time = match config.genesis_time {
+            None => {
+                return Err(GenesisError::InvalidData(
+                    "genesis.json must pin genesis_time, the launch time in unix seconds \
+                     (genesis-tool writes it): validators take their first guard origin \
+                     only within the launch window after it"
+                        .to_string(),
+                ));
+            }
+            Some(0) => {
+                return Err(GenesisError::InvalidData(
+                    "genesis.json genesis_time must be greater than 0".to_string(),
+                ));
+            }
+            Some(t) => t,
+        };
         // FX-7: the defaults these keys' readers used when the keys were absent.
         genesis_min_base_fee = match &config.min_base_fee {
             Some(fee) => {
@@ -1263,11 +1297,18 @@ pub fn build_genesis(
             Some(p) => p,
             None => DEFAULT_BURN_PERCENTAGE,
         };
+        // B446: only 1. Every new chain is V4 (G1 S11), whose sync takes each
+        // block and finality row only with its own verified QC and runs no
+        // tip-agreement gate (`ChainSync::sync_over_sessions`): a larger N
+        // named a gate that never runs. Any N >= 1 was taken; where the gate
+        // ran, an N above the member sessions a node reaches stopped its
+        // sync for good.
         genesis_tip_agreement_n = match config.tip_agreement_n {
-            Some(0) => {
-                return Err(GenesisError::InvalidData(
-                    "genesis.json tip_agreement_n must be at least 1".to_string(),
-                ));
+            Some(n) if n != DEFAULT_TIP_AGREEMENT_N => {
+                return Err(GenesisError::InvalidData(format!(
+                    "genesis.json tip_agreement_n {n} is not {DEFAULT_TIP_AGREEMENT_N}: \
+                     a V4 chain runs no tip-agreement gate (each synced block needs its own QC)"
+                )));
             }
             Some(n) => n,
             None => DEFAULT_TIP_AGREEMENT_N,
@@ -1341,6 +1382,7 @@ pub fn build_genesis(
             // FX-7: explicit, PoP-verified BLS keys for every validator.
             let (bls_public_key, bls_pop) = resolve_genesis_bls_identity(
                 &val.address,
+                &public_key,
                 val.bls_public_key.as_deref(),
                 val.bls_pop.as_deref(),
             )?;
@@ -1436,9 +1478,8 @@ pub fn build_genesis(
     // G1 S11: the chain is V4; the key is state, so the root (and with it the
     // identity) binds the format.
     storage.put(consensus::v4::VERTEX_FORMAT_KEY, GENESIS_VERTEX_FORMAT)?;
-    if let Some(t) = file.genesis_time {
-        storage.put(GENESIS_TIME_KEY, &t.to_string())?;
-    }
+    // B383: always written (a file without it is refused above).
+    storage.put(GENESIS_TIME_KEY, &genesis_time.to_string())?;
     storage.put("sys:chain_id", &genesis_chain_id)?;
 
     // SEC-#13: pin the canonical epoch-block interval on-chain. The executor
@@ -1450,12 +1491,8 @@ pub fn build_genesis(
         &genesis_epoch_block_interval.to_string(),
     )?;
 
-    // === GENESIS LOCK: Register the Genesis Validator address ===
-    // This address will be PERMANENTLY BLOCKED from transfers (Anti-Rugpull).
-    // The Executor checks sys:config:federation_addr before every transfer.
-    if let Some((first_addr, _)) = genesis_validators.first() {
-        storage.set_federation_key(first_addr)?;
-    }
+    // B314: no `sys:config:federation_addr` (it named validator #1 as
+    // "PERMANENTLY BLOCKED from transfers"; nothing ever read it).
 
     // AUDIT-#7 FIX: the Move ValidatorSet.total_supply is the emission anchor —
     // staking.move::distribute_rewards mints against `remaining = MAX_SUPPLY -
@@ -1517,6 +1554,24 @@ pub fn build_genesis(
     let hex_bytes = hex::encode(bytes);
     storage.put(&key, &hex_bytes)?;
 
+    // B414: the emission anchor's burn ledger exists from height 0.
+    // `staking::burn_ain` and `slash_unbonding` credit `cumulative_burned`
+    // only when it exists, and it was first created by the block-end fee
+    // burn or the first payout: a burn before then (a genesis account's
+    // proposal fee) lowered the net supply uncredited and was re-minted.
+    // EmissionPools and EmissionState have no such gap: every reader takes
+    // their absence as the zero genesis would write.
+    #[derive(serde::Serialize)]
+    struct SupplyStats {
+        cumulative_burned: u128,
+    }
+    storage.put(
+        &system_resource_key("0x1::staking::SupplyStats"),
+        &hex::encode(bcs::to_bytes(&SupplyStats {
+            cumulative_burned: 0,
+        })?),
+    )?;
+
     for (addr, _) in &genesis_validators {
         let move_addr = parse_move_addr(addr)?;
         let coin_store = Coin { value: 0 };
@@ -1548,10 +1603,11 @@ pub fn build_genesis(
     // Weight with no coins: it is never in a coin store, the Move stake or
     // the supply (BW-8), only in the committee weights above.
     // Each operator's ceiling is its genesis weight and its score starts full
-    // (BW-6). Epoch 0's bootstrap split (BW-8) and the protected list (BW-12)
-    // are written with it.
-    if let Some(boot) = &file.bootstrap {
-        let state = executor::BootstrapState {
+    // (BW-6). Epoch 0's bootstrap split (BW-8) is written with it.
+    let bootstrap_state = file
+        .bootstrap
+        .as_ref()
+        .map(|boot| executor::BootstrapState {
             s_min: boot.s_min_ain,
             genesis_ceilings: bootstrap_weights.values().sum(),
             full_since: None,
@@ -1570,17 +1626,28 @@ pub fn build_genesis(
                     score: executor::BOOTSTRAP_SCORE_SCALE,
                 })
                 .collect(),
-        };
-        storage.put(executor::BOOTSTRAP_KEY, &serde_json::to_string(&state)?)?;
+        });
+    if let Some(state) = &bootstrap_state {
+        storage.put(executor::BOOTSTRAP_KEY, &serde_json::to_string(state)?)?;
         storage.put(
             &executor::bootstrap_split_key(0),
             &serde_json::to_string(&bootstrap_weights)?,
         )?;
-        storage.put(
-            &executor::bootstrap_protected_key(),
-            &hex::encode(bcs::to_bytes(&executor::bootstrap_protected_of(&state))?),
-        )?;
     }
+    // BW-12, B374: what a full set never displaces from the first block: the
+    // bootstrap's operators and the genesis committee (each boundary writes
+    // its own committee).
+    let elected: Vec<String> = blockchain::committee::top_by_stake(&v1_validators)
+        .into_iter()
+        .map(|member| member.address)
+        .collect();
+    storage.put(
+        &executor::bootstrap_protected_key(),
+        &hex::encode(bcs::to_bytes(&executor::protected_list(
+            bootstrap_state.as_ref(),
+            &elected,
+        ))?),
+    )?;
 
     // === Initialize Epoch (the reward-period counter) ===
     #[derive(serde::Serialize)]
@@ -1592,19 +1659,15 @@ pub fn build_genesis(
     storage.put(&epoch_key, &hex::encode(epoch_bytes))?;
 
     // === G5 P-1, CL-2: the chain parameters, and the clock at height 0 ===
-    // Consensus time starts at 0; the launch time (if given) is the timestamp
-    // the first block's growth is measured from.
+    // Consensus time starts at 0; the launch time is the timestamp the first
+    // block's growth is measured from.
     storage.put(
         &system_resource_key("0x1::chain::Params"),
         &hex::encode(bcs::to_bytes(&chain_params)?),
     )?;
     storage.put(
         &system_resource_key("0x1::chain::Clock"),
-        &hex::encode(bcs::to_bytes(&(
-            0u64,
-            0u64,
-            file.genesis_time.unwrap_or(0),
-        ))?),
+        &hex::encode(bcs::to_bytes(&(0u64, 0u64, genesis_time))?),
     )?;
 
     // === Initialize Governance ===
@@ -1675,24 +1738,14 @@ pub fn build_genesis(
     let dr_bytes = bcs::to_bytes(&device_registry)?;
     storage.put(&dr_key, &hex::encode(dr_bytes))?;
 
-    // Initialize OracleConfig
-    // We add the Genesis Validator (0x1) as the first trusted feeder
-    let mut feeders = Vec::new();
-    // Since genesis_addr is 0x1 (system), we use it.
-    // But wait, the genesis_validators loop uses 32-byte addresses derived from keys.
-    // It does NOT use 0x1.
-    // 0x1 is the "System Logic" address.
-    // The validator addresses are "9b47...".
-    // So we should add the first validator to the feeder list.
-    if let Some((first_addr, _)) = genesis_validators.first() {
-        feeders.push(parse_move_addr(first_addr)?);
-    }
-    // Also add 0x1 itself if needed (but 0x1 usually doesn't sign transactions).
-    // Let's stick to the physical validators.
-
+    // Initialize OracleConfig. B314: with no feeder. Validator #1 was the one
+    // feeder at threshold 1, so its node key alone verified devices and
+    // minted their DePIN reward each epoch (up to 10,000 devices). Feeders
+    // are added only by a 0x1 signer (`add_feeder`), which no key produces:
+    // DePIN rewards stay off until an oracle of independent feeders exists.
     let oracle_config = OracleConfig {
-        feeders,
-        threshold: 1, // Start with 1/1
+        feeders: Vec::new(),
+        threshold: 1,
         active_proofs: vec![],
     };
     let oc_key = system_resource_key("0x1::universal_mining::OracleConfig");
@@ -1722,16 +1775,16 @@ pub fn build_genesis(
 
     // === Initialize wBTC Bridge Config ===
     // wbtc::mint asserts exists<BridgeConfig>(@0x1) before it mints, and
-    // wbtc::initialize needs a 0x1 signer that no keypair can produce. Without
-    // this seed the bridge can never mint, which kills wBTC -- the chain's only
-    // non-AIN coin type, and therefore the only asset a DEX pool can pair AIN
-    // against. Seeded here for the same reason the DEX PoolRegistry is.
+    // wbtc::initialize needs a 0x1 signer that no keypair can produce, so the
+    // resource is seeded here, as the DEX PoolRegistry is.
     //
-    // The authority comes from genesis.json (validator #1), never from an env
-    // var: every node runs this function independently, so an env-sourced value
-    // would seed a different authority per node and fork the state root -- the
-    // same hazard SEC-#13 closed for the epoch interval. Rotate it afterwards
-    // with wbtc::update_authority.
+    // B314: its authority is `NO_KEY_ADDRESS`, so nothing mints wBTC (nor
+    // rotates the authority) until a bridge that verifies BTC deposits on
+    // chain is installed by a protocol upgrade. It was validator #1: one
+    // node key, on an internet-facing host, minted any amount and drained
+    // the AIN/wBTC pool, with no BTC behind it and no way to redeem. Never an
+    // env var either: every node runs this function, so an env-sourced value
+    // would fork the state root (SEC-#13's hazard).
     #[derive(serde::Serialize)]
     struct BridgeConfig {
         authority: AccountAddress,
@@ -1739,16 +1792,14 @@ pub fn build_genesis(
         total_burned: u128,
     }
 
-    if let Some((first_addr, _)) = genesis_validators.first() {
-        let bridge_config = BridgeConfig {
-            authority: parse_move_addr(first_addr)?,
-            total_minted: 0,
-            total_burned: 0,
-        };
-        let bridge_key = system_resource_key("0x1::wbtc::BridgeConfig");
-        let bridge_bytes = bcs::to_bytes(&bridge_config)?;
-        storage.put(&bridge_key, &hex::encode(bridge_bytes))?;
-    }
+    let bridge_config = BridgeConfig {
+        authority: NO_KEY_ADDRESS,
+        total_minted: 0,
+        total_burned: 0,
+    };
+    let bridge_key = system_resource_key("0x1::wbtc::BridgeConfig");
+    let bridge_bytes = bcs::to_bytes(&bridge_config)?;
+    storage.put(&bridge_key, &hex::encode(bridge_bytes))?;
 
     // (B135: token_factory has no global registry to seed: each creator's
     // tokens live at the creator's address, made by its first create_token.)
@@ -1801,6 +1852,7 @@ mod tests {
         let one = move_core_types::account_address::AccountAddress::ONE;
         for tag in [
             "0x1::staking::ValidatorSet",
+            "0x1::staking::SupplyStats",
             "0x1::epoch::Epoch",
             "0x1::governance::GovernanceState",
             "0x1::universal_mining::DeviceRegistry",
@@ -1999,7 +2051,7 @@ mod tests {
 
     #[test]
     fn test_fresh_genesis_rejects_empty_stdlib_dir() {
-        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        let _guard = genesis_env_lock();
         let db = temp_db("empty_stdlib");
         let empty_stdlib = temp_dir("empty_stdlib");
         let genesis_key = SigningKey::from_bytes(&[20u8; 32]);
@@ -2022,7 +2074,7 @@ mod tests {
 
     #[test]
     fn test_fresh_genesis_reopen_and_corrupt_marker_fail_fast() {
-        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        let _guard = genesis_env_lock();
         let db = temp_db("integrity");
         let genesis_key = SigningKey::from_bytes(&[21u8; 32]);
         let genesis_addr = crypto::derive_address(genesis_key.verifying_key().as_bytes()).unwrap();
@@ -2043,11 +2095,39 @@ mod tests {
         );
     }
 
+    /// B414 witness: genesis writes `0x1::staking::SupplyStats` with nothing
+    /// burned, so a burn in the first blocks (before the first fee burn or
+    /// payout) is credited to the emission anchor; and a stored genesis
+    /// without it is refused at reopen.
+    #[test]
+    fn genesis_writes_the_burn_ledger_and_reopen_requires_it() {
+        let built = build_genesis(&s3_genesis_file(), &stdlib()).unwrap();
+        let stats = built
+            .writes
+            .get(&system_resource_key("0x1::staking::SupplyStats"))
+            .expect("genesis writes SupplyStats");
+        let burned: u128 = bcs::from_bytes(&hex::decode(stats).unwrap()).unwrap();
+        assert_eq!(burned, 0, "nothing is burned at genesis");
+
+        let _guard = genesis_env_lock();
+        let db = temp_db("b414_supply_stats");
+        let key = SigningKey::from_bytes(&[28u8; 32]);
+        let addr = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
+        let pubkey = hex::encode(key.verifying_key().as_bytes());
+        init_genesis(&db, &addr, &pubkey).expect("fresh genesis initializes");
+        init_genesis(&db, &addr, &pubkey).expect("valid genesis reopens");
+        let _seed = db.seeding();
+        db.delete(&system_resource_key("0x1::staking::SupplyStats"))
+            .unwrap();
+        let err = init_genesis(&db, &addr, &pubkey).expect_err("no burn ledger");
+        assert!(err.to_string().contains("SupplyStats"), "{err}");
+    }
+
     /// G5 S4c: V3 is deleted. A database whose vertex format is missing or
     /// not V4 is refused at boot, even with the current version string.
     #[test]
     fn a_database_without_the_v4_vertex_format_is_refused_at_boot() {
-        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        let _guard = genesis_env_lock();
         let key = SigningKey::from_bytes(&[27u8; 32]);
         let addr = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
         let pubkey = hex::encode(key.verifying_key().as_bytes());
@@ -2070,7 +2150,7 @@ mod tests {
     /// refused at boot.
     #[test]
     fn test_genesis_reopen_rejects_an_epoch_that_disagrees_with_the_interval() {
-        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        let _guard = genesis_env_lock();
         let db = temp_db("params_epoch_mismatch");
         let key = SigningKey::from_bytes(&[26u8; 32]);
         let addr = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
@@ -2096,7 +2176,7 @@ mod tests {
 
     #[test]
     fn test_genesis_reopen_rejects_corrupt_module_bytes() {
-        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        let _guard = genesis_env_lock();
         let db = temp_db("corrupt_module_bytes");
         let genesis_key = SigningKey::from_bytes(&[25u8; 32]);
         let genesis_addr = crypto::derive_address(genesis_key.verifying_key().as_bytes()).unwrap();
@@ -2121,7 +2201,7 @@ mod tests {
 
     #[test]
     fn test_genesis_reopen_rejects_stdlib_hash_mismatch() {
-        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        let _guard = genesis_env_lock();
         let db = temp_db("stdlib_hash_mismatch");
         let genesis_key = SigningKey::from_bytes(&[26u8; 32]);
         let genesis_addr = crypto::derive_address(genesis_key.verifying_key().as_bytes()).unwrap();
@@ -2142,7 +2222,7 @@ mod tests {
 
     #[test]
     fn test_genesis_reopen_rejects_module_key_id_mismatch() {
-        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        let _guard = genesis_env_lock();
         let db = temp_db("module_key_id_mismatch");
         let genesis_key = SigningKey::from_bytes(&[27u8; 32]);
         let genesis_addr = crypto::derive_address(genesis_key.verifying_key().as_bytes()).unwrap();
@@ -2173,7 +2253,21 @@ mod tests {
 
     use std::sync::Mutex as StdMutex;
     /// Serializes tests that mutate the process-global AINCORE_GENESIS_PATH env.
+    /// Take it only through `genesis_env_lock`.
     static GENESIS_ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    /// Takes `GENESIS_ENV_LOCK`, also after a test panicked holding it. The
+    /// lock guards no data, only the order of the tests that touch the
+    /// process environment, so a poisoned lock is safe to take: one test's
+    /// real failure shows as that one failure, not as a `PoisonError` in
+    /// every genesis test after it. A holder that panicked may have left the
+    /// genesis-hash pin set, so a poisoned lock clears it.
+    fn genesis_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        GENESIS_ENV_LOCK.lock().unwrap_or_else(|poisoned| {
+            std::env::remove_var("AINCORE_EXPECTED_GENESIS_HASH");
+            poisoned.into_inner()
+        })
+    }
 
     /// BCS mirror of the staking ValidatorSet WITH the new BLS fields, for tests
     /// that decode the freshly-written genesis resource (proves field-order lockstep).
@@ -2226,6 +2320,10 @@ mod tests {
             .expect("slow-path ValidatorSet BCS decode must succeed on fresh genesis")
     }
 
+    /// B383: the launch time every test genesis.json pins (a file without
+    /// one is refused). Long past, so no test runs in its launch window.
+    const TEST_GENESIS_TIME: u64 = 1_700_000_000;
+
     /// Write a genesis.json with a single validator (optionally carrying BLS keys)
     /// and return its path. Caller holds GENESIS_ENV_LOCK.
     fn write_genesis_json(
@@ -2244,8 +2342,8 @@ mod tests {
             _ => String::new(),
         };
         let json = format!(
-            "{{\"chain_id\":\"AINCORE-MAINNET-1\",\"validators\":[{{\"address\":\"{}\",\"public_key\":\"{}\",\"stake\":\"1000000000000000000000\"{}}}],\"treasury_reserve\":\"0\",\"epoch_duration\":10,\"epoch_block_interval\":100,\"reward_period_blocks\":20,\"max_block_interval_secs\":14,\"stdlib_hash\":\"{}\"}}",
-            addr, pubkey, bls_fields, test_stdlib_hash()
+            "{{\"chain_id\":\"AINCORE-MAINNET-1\",\"validators\":[{{\"address\":\"{}\",\"public_key\":\"{}\",\"stake\":\"1000000000000000000000\"{}}}],\"treasury_reserve\":\"0\",\"epoch_duration\":10,\"epoch_block_interval\":100,\"reward_period_blocks\":20,\"max_block_interval_secs\":14,\"genesis_time\":{},\"stdlib_hash\":\"{}\"}}",
+            addr, pubkey, bls_fields, TEST_GENESIS_TIME, test_stdlib_hash()
         );
         fs::write(&path, json).expect("write genesis.json");
         path
@@ -2271,7 +2369,9 @@ mod tests {
             addr,
             pubkey,
             Some(&hex::encode(bls.pubkey_raw(&seed))),
-            Some(&hex::encode(bls.prove_possession_raw(&seed))),
+            Some(&hex::encode(
+                bls.prove_possession_raw(&seed, &hex::decode(pubkey).unwrap()),
+            )),
         )
     }
 
@@ -2309,7 +2409,7 @@ mod tests {
 
     #[test]
     fn test_genesis_loads_bls_keys() {
-        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        let _guard = genesis_env_lock();
         let validator_key = SigningKey::from_bytes(&[41u8; 32]);
         let addr = crypto::derive_address(validator_key.verifying_key().as_bytes()).unwrap();
         let pubkey = hex::encode(validator_key.verifying_key().as_bytes());
@@ -2318,7 +2418,7 @@ mod tests {
         let bls = crypto::bls::BLSEngine::consensus();
         let bls_seed = [42u8; 32];
         let bls_pk = bls.pubkey_raw(&bls_seed);
-        let bls_pop = bls.prove_possession_raw(&bls_seed);
+        let bls_pop = bls.prove_possession_raw(&bls_seed, validator_key.verifying_key().as_bytes());
 
         let path = write_genesis_json(
             "loads_bls",
@@ -2342,7 +2442,11 @@ mod tests {
         assert_eq!(v.bls_public_key.len(), 48);
         assert_eq!(v.bls_pop.len(), 96);
         assert!(bls
-            .verify_possession(&v.bls_public_key, &v.bls_pop)
+            .verify_possession(
+                &v.bls_public_key,
+                &v.bls_pop,
+                validator_key.verifying_key().as_bytes()
+            )
             .unwrap());
     }
 
@@ -2350,7 +2454,7 @@ mod tests {
     /// genesis committee's stake; the executor rewrites it at every boundary.
     #[test]
     fn the_genesis_opens_epoch_zeros_churn_allowance() {
-        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        let _guard = genesis_env_lock();
         let validator_key = SigningKey::from_bytes(&[44u8; 32]);
         let addr = crypto::derive_address(validator_key.verifying_key().as_bytes()).unwrap();
         let pubkey = hex::encode(validator_key.verifying_key().as_bytes());
@@ -2361,7 +2465,10 @@ mod tests {
             &addr,
             &pubkey,
             Some(&hex::encode(bls.pubkey_raw(&bls_seed))),
-            Some(&hex::encode(bls.prove_possession_raw(&bls_seed))),
+            Some(&hex::encode(bls.prove_possession_raw(
+                &bls_seed,
+                validator_key.verifying_key().as_bytes(),
+            ))),
         );
         let db = temp_db("churn");
         initialize_genesis_from(&db, &stdlib_path(), &path).expect("genesis initializes");
@@ -2385,7 +2492,9 @@ mod tests {
             public_key: hex::encode(key.verifying_key().as_bytes()),
             stake: (stake_ain * 1_000_000_000_000_000_000).to_string(),
             bls_public_key: Some(hex::encode(bls.pubkey_raw(&bls_seed))),
-            bls_pop: Some(hex::encode(bls.prove_possession_raw(&bls_seed))),
+            bls_pop: Some(hex::encode(
+                bls.prove_possession_raw(&bls_seed, key.verifying_key().as_bytes()),
+            )),
         }
     }
 
@@ -2448,8 +2557,12 @@ mod tests {
             &hex::decode(&built.writes[&executor::bootstrap_protected_key()]).unwrap(),
         )
         .unwrap();
-        assert_eq!(protected, executor::bootstrap_protected_of(&state));
-        assert_eq!(protected.validators.len(), 4);
+        let elected: Vec<String> = committee.iter().map(|m| m.address.clone()).collect();
+        assert_eq!(protected, executor::protected_list(Some(&state), &elected));
+        assert!(executor::bootstrap_protected_of(&state)
+            .validators
+            .iter()
+            .all(|v| protected.validators.contains(v)));
         assert_eq!(built.writes["sys:total_supply"], (500 * AIN).to_string());
         let account_store = &built.writes[&coin_store_key(parse_move_addr(&account).unwrap())];
         assert_eq!(
@@ -2540,14 +2653,16 @@ mod tests {
 
     #[test]
     fn test_genesis_rejects_bad_pop() {
-        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        let _guard = genesis_env_lock();
         let validator_key = SigningKey::from_bytes(&[43u8; 32]);
         let addr = crypto::derive_address(validator_key.verifying_key().as_bytes()).unwrap();
         let pubkey = hex::encode(validator_key.verifying_key().as_bytes());
 
         let bls = crypto::bls::BLSEngine::consensus();
         let pk = bls.pubkey_raw(&[44u8; 32]);
-        let bad_pop = bls.prove_possession_raw(&[200u8; 32]); // PoP from a DIFFERENT seed
+        // PoP from a DIFFERENT seed (for this validator's key: B354).
+        let bad_pop =
+            bls.prove_possession_raw(&[200u8; 32], validator_key.verifying_key().as_bytes());
 
         let path = write_genesis_json(
             "bad_pop",
@@ -2568,7 +2683,7 @@ mod tests {
 
     #[test]
     fn test_validator_set_v1_roundtrip() {
-        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        let _guard = genesis_env_lock();
         let validator_key = SigningKey::from_bytes(&[45u8; 32]);
         let addr = crypto::derive_address(validator_key.verifying_key().as_bytes()).unwrap();
         let pubkey = hex::encode(validator_key.verifying_key().as_bytes());
@@ -2577,7 +2692,7 @@ mod tests {
         let bls = crypto::bls::BLSEngine::consensus();
         let bls_seed = [70u8; 32];
         let bls_pk = bls.pubkey_raw(&bls_seed);
-        let bls_pop = bls.prove_possession_raw(&bls_seed);
+        let bls_pop = bls.prove_possession_raw(&bls_seed, validator_key.verifying_key().as_bytes());
 
         let path = write_genesis_json(
             "v1_roundtrip",
@@ -2606,7 +2721,9 @@ mod tests {
         let pop = hex::decode(&v.bls_pop).unwrap();
         assert_eq!(pk, bls_pk);
         assert_eq!(pop, bls_pop);
-        assert!(bls.verify_possession(&pk, &pop).unwrap());
+        assert!(bls
+            .verify_possession(&pk, &pop, validator_key.verifying_key().as_bytes())
+            .unwrap());
 
         // Feed the v1 set into a real build_qc/verify_qc to prove the shape works.
         let vote = consensus::qc::FinalityVote {
@@ -2647,7 +2764,7 @@ mod tests {
 
     #[test]
     fn test_fresh_genesis_then_executor_accepts_bcs_transfer_path() {
-        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        let _guard = genesis_env_lock();
         let db = temp_db("transfer");
         let genesis_key = SigningKey::from_bytes(&[22u8; 32]);
         let genesis_addr = crypto::derive_address(genesis_key.verifying_key().as_bytes()).unwrap();
@@ -2726,31 +2843,64 @@ mod tests {
             .value
     }
 
-    #[derive(serde::Deserialize)]
+    #[derive(serde::Deserialize, serde::Serialize)]
     struct DecodedBridgeConfig {
         authority: AccountAddress,
         total_minted: u128,
         total_burned: u128,
     }
 
-    /// AincoreCoin and WBTC are the only two coin types this chain defines, so
-    /// WBTC is the only asset a DEX pool can pair AIN against. wbtc::mint refuses
-    /// to run unless BridgeConfig lives at @0x1, and wbtc::initialize requires a
-    /// 0x1 signer that no keypair can produce -- so if genesis does not seed the
-    /// resource, wBTC is unmintable for the life of the chain and no pool can ever
-    /// hold liquidity. Mint through the real executor path here, not just a read:
-    /// a correct-looking resource that the VM cannot decode would still be dead.
-    #[test]
-    fn test_fresh_genesis_enables_wbtc_mint() {
-        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
-        let db = temp_db("wbtc_mint");
-        let authority_key = SigningKey::from_bytes(&[31u8; 32]);
-        let authority = crypto::derive_address(authority_key.verifying_key().as_bytes()).unwrap();
-        let authority_pubkey = hex::encode(authority_key.verifying_key().as_bytes());
+    /// B314: genesis leaves wBTC's mint to no key (`NO_KEY_ADDRESS`); a
+    /// bridge installed by a protocol upgrade would name its authority. A
+    /// test that needs wBTC names `authority` in its stead, or every mint it
+    /// sends aborts (charged) and mints nothing.
+    fn install_test_bridge_authority(db: &StateDB, authority: &str) {
+        let _seed = db.seeding();
+        let config = DecodedBridgeConfig {
+            authority: parse_move_addr(authority).unwrap(),
+            total_minted: 0,
+            total_burned: 0,
+        };
+        db.put(
+            &system_resource_key("0x1::wbtc::BridgeConfig"),
+            &hex::encode(bcs::to_bytes(&config).unwrap()),
+        )
+        .unwrap();
+    }
 
-        // Pin the validator set to this key: the seeded bridge authority is
-        // genesis validator #1, and the test has to hold that key to sign a mint.
-        let path = single_validator_genesis(&authority, &authority_pubkey);
+    /// B325 witness: a database of the previous genesis version (testnet V4,
+    /// v6) is refused on reopen; it reopened when the stdlib's hash matched.
+    #[test]
+    fn a_database_of_the_previous_genesis_version_is_refused() {
+        let _guard = genesis_env_lock();
+        let db = temp_db("b325_version");
+        let key = SigningKey::from_bytes(&[33u8; 32]);
+        let address = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
+        let path = single_validator_genesis(&address, &hex::encode(key.verifying_key().as_bytes()));
+        initialize_genesis_from(&db, &stdlib_path(), &path).expect("fresh genesis initializes");
+        initialize_genesis_from(&db, &stdlib_path(), &path).expect("it reopens");
+        assert_ne!(GENESIS_VERSION, "g1-certified-dag-v6");
+        db.put("genesis_version", "g1-certified-dag-v6").unwrap();
+        let err = initialize_genesis_from(&db, &stdlib_path(), &path).unwrap_err();
+        assert!(
+            err.to_string().contains("Genesis version mismatch"),
+            "{err}"
+        );
+    }
+
+    /// B314 witness: genesis seeds wBTC's BridgeConfig (wbtc::initialize needs
+    /// a 0x1 signer no key produces) with an authority no key signs for, so
+    /// no key mints, validator #1's included; and the DePIN oracle has no
+    /// feeder. Validator #1's node key alone minted any amount of wBTC (and
+    /// fed the oracle at threshold 1).
+    #[test]
+    fn no_key_mints_wbtc_on_a_fresh_genesis() {
+        let _guard = genesis_env_lock();
+        let db = temp_db("wbtc_mint");
+        let validator_key = SigningKey::from_bytes(&[31u8; 32]);
+        let validator = crypto::derive_address(validator_key.verifying_key().as_bytes()).unwrap();
+        let validator_pubkey = hex::encode(validator_key.verifying_key().as_bytes());
+        let path = single_validator_genesis(&validator, &validator_pubkey);
         let res = initialize_genesis_from(&db, &stdlib_path(), &path);
         res.expect("fresh genesis initializes");
 
@@ -2760,53 +2910,63 @@ mod tests {
             .expect("genesis seeds wbtc::BridgeConfig");
         let cfg: DecodedBridgeConfig = bcs::from_bytes(&hex::decode(raw).expect("hex"))
             .expect("BridgeConfig decodes in Move field order");
-        assert_eq!(cfg.authority, parse_move_addr(&authority).unwrap());
+        assert_eq!(cfg.authority, NO_KEY_ADDRESS);
         assert_eq!(cfg.total_minted, 0);
         assert_eq!(cfg.total_burned, 0);
+        assert!(
+            db.get("sys:config:federation_addr").unwrap().is_none(),
+            "the unread federation row is written again"
+        );
+        let raw = db
+            .get(&system_resource_key("0x1::universal_mining::OracleConfig"))
+            .expect("storage read")
+            .expect("genesis seeds universal_mining::OracleConfig");
+        #[derive(serde::Deserialize)]
+        struct Oracle {
+            feeders: Vec<AccountAddress>,
+            threshold: u64,
+            // Empty at genesis: any element type reads its zero length.
+            active_proofs: Vec<u8>,
+        }
+        let oracle: Oracle =
+            bcs::from_bytes(&hex::decode(raw).expect("hex")).expect("OracleConfig decodes");
+        assert!(
+            oracle.feeders.is_empty(),
+            "the oracle has a feeder: {:?}",
+            oracle.feeders
+        );
+        assert_eq!((oracle.threshold, oracle.active_proofs.len()), (1, 0));
 
         let holder_key = SigningKey::from_bytes(&[32u8; 32]);
         let holder = create_account(&db, &holder_key);
         set_coin_store(&db, &holder, 10_000_000);
-        create_account(&db, &authority_key);
-        set_coin_store(&db, &authority, 10_000_000);
-
+        create_account(&db, &validator_key);
+        set_coin_store(&db, &validator, 10_000_000);
         let executor = Executor::new(db.clone());
-
-        // The signer slot is supplied as an explicit address argument, the same
-        // way transfer_payload passes `sender` for coin::transfer(from: &signer).
         let register = entry_payload(
             "wbtc",
             "register",
             vec![],
             vec![bcs::to_bytes(&parse_move_addr(&holder).unwrap()).unwrap()],
         );
-        let (updates, _) = executor
-            .execute_transaction(&estimated_tx(&executor, &holder_key, &holder, &register, 0))
-            .expect("holder registers a WBTC store");
-        apply_updates(&db, updates);
-
+        send(&db, &executor, &holder_key, &holder, &register, 0);
+        // The validator's key mints nothing (the gas is fixed: an estimate
+        // of an aborting call is refused).
         let mint = entry_payload(
             "wbtc",
             "mint",
             vec![],
             vec![
-                bcs::to_bytes(&parse_move_addr(&authority).unwrap()).unwrap(),
+                bcs::to_bytes(&parse_move_addr(&validator).unwrap()).unwrap(),
                 bcs::to_bytes(&parse_move_addr(&holder).unwrap()).unwrap(),
                 bcs::to_bytes(&5_000u128).unwrap(),
             ],
         );
-        let (updates, _) = executor
-            .execute_transaction(&estimated_tx(
-                &executor,
-                &authority_key,
-                &authority,
-                &mint,
-                0,
-            ))
-            .expect("bridge authority mints wBTC through the seeded BridgeConfig");
-        apply_updates(&db, updates);
-
-        assert_eq!(wbtc_balance(&db, &holder), 5_000);
+        let tx = signed_tx(&validator_key, &validator, &mint, 0, 200_000, 1);
+        if let Some((updates, _)) = executor.execute_transaction(&tx) {
+            apply_updates(&db, updates);
+        }
+        assert_eq!(wbtc_balance(&db, &holder), 0, "validator #1 minted wBTC");
     }
 
     // ===== DEX: first on-chain exercise of 0x1::dex =====
@@ -2940,7 +3100,7 @@ mod tests {
     /// formulas, so a wrong constant or a swapped operand cannot pass.
     #[test]
     fn test_dex_pool_lifecycle_on_fresh_genesis() {
-        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        let _guard = genesis_env_lock();
         let db = temp_db("dex_lifecycle");
         let authority_key = SigningKey::from_bytes(&[51u8; 32]);
         let authority = crypto::derive_address(authority_key.verifying_key().as_bytes()).unwrap();
@@ -2962,6 +3122,7 @@ mod tests {
         set_coin_store(&db, &trader, 50_000_000);
         set_coin_store(&db, &authority, 10_000_000);
 
+        install_test_bridge_authority(&db, &authority);
         let executor = Executor::new(db.clone());
 
         // Both sides need a WBTC store before they can hold any.
@@ -3089,7 +3250,7 @@ mod tests {
     /// that a second register does not wipe the balance already sitting there.
     #[test]
     fn test_coin_register_is_idempotent_and_preserves_balance() {
-        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        let _guard = genesis_env_lock();
         let db = temp_db("register_idempotent");
         let authority_key = SigningKey::from_bytes(&[71u8; 32]);
         let authority = crypto::derive_address(authority_key.verifying_key().as_bytes()).unwrap();
@@ -3104,6 +3265,9 @@ mod tests {
         set_coin_store(&db, &holder, 10_000_000);
         create_account(&db, &authority_key);
         set_coin_store(&db, &authority, 10_000_000);
+        // B314: no key mints wBTC on a fresh genesis; without a stand-in
+        // authority the mint below aborts and the store under test stays 0.
+        install_test_bridge_authority(&db, &authority);
 
         let executor = Executor::new(db.clone());
         let reg = entry_payload(
@@ -3148,7 +3312,7 @@ mod tests {
     /// actually protects" case the DEX UI depends on.
     #[test]
     fn test_dex_swap_respects_min_out_and_refunds_nothing_but_gas() {
-        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        let _guard = genesis_env_lock();
         let db = temp_db("dex_minout");
         let authority_key = SigningKey::from_bytes(&[61u8; 32]);
         let authority = crypto::derive_address(authority_key.verifying_key().as_bytes()).unwrap();
@@ -3166,6 +3330,9 @@ mod tests {
         set_coin_store(&db, &lp, 50_000_000);
         set_coin_store(&db, &trader, 50_000_000);
         set_coin_store(&db, &authority, 10_000_000);
+        // B314: without a stand-in authority the seed mint aborts, the pool
+        // stays empty and the swap below aborts for that instead.
+        install_test_bridge_authority(&db, &authority);
 
         let executor = Executor::new(db.clone());
         for (key, addr) in [(&lp_key, &lp), (&trader_key, &trader)] {
@@ -3188,6 +3355,7 @@ mod tests {
             ],
         );
         send(&db, &executor, &authority_key, &authority, &seed, 0);
+        assert_eq!(wbtc_balance(&db, &lp), 4_000_000, "the seed mint");
 
         let create = entry_payload(
             "dex",
@@ -3211,6 +3379,11 @@ mod tests {
         send(&db, &executor, &lp_key, &lp, &add, 2);
 
         let before = read_pool(&db, &lp);
+        assert_eq!(
+            (before.coin_x.value, before.coin_y.value),
+            (1_000_000, 4_000_000),
+            "vacuous: the pool holds no liquidity"
+        );
         let trader_ain_before = coin_balance(&db, &trader);
 
         // Demand far more output than the curve can give.
@@ -3303,7 +3476,7 @@ mod tests {
     #[test]
     fn a_creators_full_registry_refuses_only_that_creator() {
         const AIN: u128 = 1_000_000_000_000_000_000;
-        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        let _guard = genesis_env_lock();
         let db = temp_db("b135_tokens");
         let authority_key = SigningKey::from_bytes(&[71u8; 32]);
         let authority = crypto::derive_address(authority_key.verifying_key().as_bytes()).unwrap();
@@ -3476,7 +3649,7 @@ mod tests {
     /// With the pin env unset, genesis init + reopen behave exactly as before.
     #[test]
     fn test_genesis_pin_unset_is_noop() {
-        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        let _guard = genesis_env_lock();
         std::env::remove_var("AINCORE_EXPECTED_GENESIS_HASH");
         let db = temp_db("pin_unset");
         let key = SigningKey::from_bytes(&[31u8; 32]);
@@ -3491,7 +3664,7 @@ mod tests {
     /// honest node computes the same pin).
     #[test]
     fn test_genesis_identity_hash_is_deterministic() {
-        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        let _guard = genesis_env_lock();
         std::env::remove_var("AINCORE_EXPECTED_GENESIS_HASH");
         let key = SigningKey::from_bytes(&[32u8; 32]);
         let addr = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
@@ -3508,7 +3681,7 @@ mod tests {
     fn test_format_policy_proposal_binds_actual_genesis_without_migration() {
         use blockchain::identity_v2::policy::{GenesisFormatProof, VerifiedFormatPolicy};
 
-        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        let _guard = genesis_env_lock();
         std::env::remove_var("AINCORE_EXPECTED_GENESIS_HASH");
         let db = temp_db("format_policy_proposal");
         let key = SigningKey::from_bytes(&[33u8; 32]);
@@ -3567,7 +3740,7 @@ mod tests {
     /// genesis and must not move when the live set changes.
     #[test]
     fn test_genesis_identity_is_frozen_against_validator_set_changes() {
-        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        let _guard = genesis_env_lock();
         std::env::remove_var("AINCORE_EXPECTED_GENESIS_HASH");
         let key = SigningKey::from_bytes(&[77u8; 32]);
         let addr = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
@@ -3627,7 +3800,7 @@ mod tests {
     /// vertices unverifiable.
     #[test]
     fn test_genesis_identity_mismatch_refuses_boot() {
-        let _guard = GENESIS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = genesis_env_lock();
         std::env::remove_var("AINCORE_EXPECTED_GENESIS_HASH");
         let key = SigningKey::from_bytes(&[78u8; 32]);
         let addr = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
@@ -3653,7 +3826,7 @@ mod tests {
     /// default).
     #[test]
     fn test_genesis_writes_epoch_block_interval_pin() {
-        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        let _guard = genesis_env_lock();
         std::env::remove_var("AINCORE_EXPECTED_GENESIS_HASH");
         let db = temp_db("ebi_genesis_pin");
         let key = SigningKey::from_bytes(&[40u8; 32]);
@@ -3689,7 +3862,7 @@ mod tests {
     /// A matching pin allows boot (reopen path).
     #[test]
     fn test_genesis_pin_match_boots() {
-        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        let _guard = genesis_env_lock();
         std::env::remove_var("AINCORE_EXPECTED_GENESIS_HASH");
         let db = temp_db("pin_match");
         let key = SigningKey::from_bytes(&[33u8; 32]);
@@ -3708,7 +3881,7 @@ mod tests {
     /// A wrong pin refuses to boot a FRESH datadir (the silent-wrong-chain case).
     #[test]
     fn test_genesis_pin_mismatch_refuses_fresh_boot() {
-        let _guard = GENESIS_ENV_LOCK.lock().unwrap();
+        let _guard = genesis_env_lock();
         let db = temp_db("pin_mismatch");
         let key = SigningKey::from_bytes(&[34u8; 32]);
         let addr = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
@@ -3734,13 +3907,34 @@ mod tests {
     /// the certified-DAG engine.
     #[test]
     fn genesis_is_v4_and_binds_its_launch_time() {
-        let _guard = GENESIS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = genesis_env_lock();
         std::env::remove_var("AINCORE_EXPECTED_GENESIS_HASH");
         let file = s3_genesis_file();
         let db = temp_db("s11_v4");
         initialize_genesis_from(&db, &stdlib_path(), &write_file("s11_a", &file)).unwrap();
         assert!(consensus::v4::is_v4_chain(&db), "genesis is not V4");
-        assert!(db.get(GENESIS_TIME_KEY).unwrap().is_none());
+        assert_eq!(
+            db.get(GENESIS_TIME_KEY).unwrap(),
+            Some(TEST_GENESIS_TIME.to_string())
+        );
+        // B374 witness: the genesis committee is protected from the first
+        // block (a chain without bootstrap protected nobody until its first
+        // boundary).
+        let protected: executor::BootstrapProtected = bcs::from_bytes(
+            &hex::decode(
+                db.get(&executor::bootstrap_protected_key())
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let committee: Vec<consensus::qc::ValidatorInfo> =
+            serde_json::from_str(&db.get("sys:validator_set:v1").unwrap().unwrap()).unwrap();
+        assert!(!committee.is_empty());
+        assert!(committee.iter().all(|m| protected
+            .validators
+            .contains(&parse_move_addr(&m.address).unwrap())));
         let mut timed = file.clone();
         timed.genesis_time = Some(1_790_000_000);
         let db2 = temp_db("s11_v4_timed");
@@ -3803,6 +3997,36 @@ mod tests {
         build_genesis(&least, &stdlib()).expect("the shortest epoch genesis takes");
     }
 
+    /// B383 witness: a genesis without `genesis_time` is refused, by the
+    /// builder and so by `check_genesis_json` (what genesis-tool runs before
+    /// it writes), with a message naming the field. It was taken, wrote no
+    /// `sys:genesis_time`, and no validator could ever take its first guard
+    /// origin: the launch was dead. A time of 0 is refused as well.
+    #[test]
+    fn a_genesis_without_a_launch_time_is_refused() {
+        let base = s3_genesis_file();
+        assert_eq!(base.genesis_time, Some(TEST_GENESIS_TIME));
+        let mut untimed = base.clone();
+        untimed.genesis_time = None;
+        let err = build_genesis(&untimed, &stdlib()).expect_err("no launch time");
+        assert!(err.to_string().contains("must pin genesis_time"), "{err}");
+        // The field left out of the file, as an old genesis.json has it.
+        let mut json = serde_json::to_value(&base).unwrap();
+        json.as_object_mut().unwrap().remove("genesis_time");
+        let err = check_genesis_json(&json.to_string(), &stdlib_path())
+            .expect_err("a file without genesis_time");
+        assert!(err.to_string().contains("must pin genesis_time"), "{err}");
+        let mut zero = base.clone();
+        zero.genesis_time = Some(0);
+        let err = build_genesis(&zero, &stdlib()).expect_err("a launch in 1970");
+        assert!(err.to_string().contains("genesis_time"), "{err}");
+        let built = build_genesis(&base, &stdlib()).expect("a timed genesis takes");
+        assert_eq!(
+            built.writes.get(GENESIS_TIME_KEY).map(String::as_str),
+            Some("1700000000")
+        );
+    }
+
     fn write_file(name: &str, file: &GenesisFile) -> PathBuf {
         let path = temp_dir(&format!("s3_{name}")).join("genesis.json");
         fs::write(&path, serde_json::to_string(file).unwrap()).unwrap();
@@ -3830,7 +4054,11 @@ mod tests {
             bcs::from_bytes(&hex::decode(hex).unwrap()).unwrap()
         };
         assert_eq!(stored(&built), ChainParams::DEFAULT);
-        assert_eq!(clock(&built), (0, 0, 0), "height 0, consensus time 0");
+        assert_eq!(
+            clock(&built),
+            (0, 0, TEST_GENESIS_TIME),
+            "height 0, consensus time 0, measured from the launch time"
+        );
 
         // One valid change per field; each is stored and moves the identity.
         type Edit = fn(&mut GenesisFile);
@@ -4004,7 +4232,7 @@ mod tests {
     /// block transaction.
     #[test]
     fn genesis_is_committed_as_state_tree_version_zero() {
-        let _guard = GENESIS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = genesis_env_lock();
         std::env::remove_var("AINCORE_EXPECTED_GENESIS_HASH");
         let file = s3_genesis_file();
         let path = write_file("v0", &file);
@@ -4070,7 +4298,11 @@ mod tests {
     }
 
     /// G5 review: a genesis committee in which two validators share a BLS
-    /// key is refused, as at every later boundary.
+    /// key is refused, as at every later boundary. B354: a proof of
+    /// possession signs its owner's Ed25519 key, so the second validator
+    /// carries the shared key with a valid proof for its own Ed25519 key (the
+    /// first validator's proof fails PoP verification before the committee
+    /// is checked, and never reached the shared-key refusal).
     #[test]
     fn a_genesis_committee_with_a_shared_bls_key_is_refused() {
         let mut file = s3_genesis_file();
@@ -4078,9 +4310,23 @@ mod tests {
         let key = SigningKey::from_bytes(&[51u8; 32]);
         second.address = crypto::derive_address(key.verifying_key().as_bytes()).unwrap();
         second.public_key = hex::encode(key.verifying_key().as_bytes());
+        let seed = consensus::qc::derive_validator_bls_seed(&TEST_NODE_IDENTITY);
+        let bls = crypto::bls::BLSEngine::consensus();
+        assert_eq!(
+            second.bls_public_key,
+            Some(hex::encode(bls.pubkey_raw(&seed))),
+            "the first validator's BLS key, shared"
+        );
+        second.bls_pop = Some(hex::encode(
+            bls.prove_possession_raw(&seed, key.verifying_key().as_bytes()),
+        ));
         file.validators.push(second);
         let err = build_genesis(&file, &stdlib()).expect_err("a shared BLS key");
-        assert!(err.to_string().contains("genesis committee"), "{err}");
+        assert!(
+            err.to_string().contains("genesis committee")
+                && err.to_string().contains("its BLS key is another member's"),
+            "{err}"
+        );
     }
 
     /// FX-7: the burn rate, tip agreement and burn counter are genesis state,
@@ -4095,10 +4341,10 @@ mod tests {
         assert_eq!(get("sys:config:require_exec_roots"), None, "FX-15: removed");
         let mut custom = s3_genesis_file();
         custom.burn_percentage = Some(0);
-        custom.tip_agreement_n = Some(3);
+        custom.tip_agreement_n = Some(1);
         let built = build_genesis(&custom, &stdlib()).unwrap();
         assert_eq!(built.writes["sys:config:burn_percentage"], "0");
-        assert_eq!(built.writes["sys:config:tip_agreement_n"], "3");
+        assert_eq!(built.writes["sys:config:tip_agreement_n"], "1");
         for (burn, tip) in [(Some(101), None), (None, Some(0))] {
             let mut bad = s3_genesis_file();
             bad.burn_percentage = burn;
@@ -4107,11 +4353,30 @@ mod tests {
         }
     }
 
+    /// B446 witness: a genesis `tip_agreement_n` other than 1 is refused.
+    /// Every chain genesis makes is V4, whose sync runs no tip-agreement gate
+    /// (each synced block needs its own QC); any N >= 1 was taken, and where
+    /// the gate ran, one above the member sessions a node reaches stopped
+    /// its sync for good.
+    #[test]
+    fn genesis_refuses_a_tip_agreement_other_than_one() {
+        for n in [2, 3, u64::MAX] {
+            let mut file = s3_genesis_file();
+            file.tip_agreement_n = Some(n);
+            let err = build_genesis(&file, &stdlib()).expect_err("an N above 1");
+            assert!(err.to_string().contains("tip_agreement_n"), "{err}");
+        }
+        let mut file = s3_genesis_file();
+        file.tip_agreement_n = Some(1);
+        let built = build_genesis(&file, &stdlib()).expect("control: N = 1");
+        assert_eq!(built.writes["sys:config:tip_agreement_n"], "1");
+    }
+
     /// G3 SN-1b (review L4): genesis never runs on a datadir that carries a
     /// restore marker.
     #[test]
     fn genesis_refuses_a_datadir_with_an_unfinished_restore() {
-        let _guard = GENESIS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = genesis_env_lock();
         std::env::remove_var("AINCORE_EXPECTED_GENESIS_HASH");
         let db = temp_db("unfinished_restore");
         db.put(storage::RESTORE_MARKER, "{\"height\":10}").unwrap();
@@ -4132,7 +4397,7 @@ mod tests {
     /// would refuse existing nodes.
     #[test]
     fn a_reopen_needs_neither_genesis_json_nor_the_stdlib() {
-        let _guard = GENESIS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = genesis_env_lock();
         std::env::remove_var("AINCORE_EXPECTED_GENESIS_HASH");
         let file = s3_genesis_file();
         let db = temp_db("s3_reopen_bare");
@@ -4153,7 +4418,7 @@ mod tests {
     /// version 0.
     #[test]
     fn genesis_on_a_database_that_holds_state_is_refused() {
-        let _guard = GENESIS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = genesis_env_lock();
         std::env::remove_var("AINCORE_EXPECTED_GENESIS_HASH");
         let db = temp_db("s3_dirty");
         let _seed = db.seeding();
@@ -4172,7 +4437,7 @@ mod tests {
     /// directory and with another environment, is byte-identical.
     #[test]
     fn genesis_is_identical_across_processes_cwds_and_environments() {
-        let _guard = GENESIS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = genesis_env_lock();
         std::env::remove_var("AINCORE_EXPECTED_GENESIS_HASH");
         let path = write_file("dt3", &s3_genesis_file());
         let db = temp_db("s3_dt3_here");
@@ -4245,7 +4510,7 @@ mod tests {
     /// and every later boot would fail.
     #[test]
     fn a_crash_after_the_genesis_transaction_leaves_a_complete_genesis() {
-        let _guard = GENESIS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = genesis_env_lock();
         std::env::remove_var("AINCORE_EXPECTED_GENESIS_HASH");
         let path = write_file("crash", &s3_genesis_file());
         let dir = temp_dir("s3_crash_db");

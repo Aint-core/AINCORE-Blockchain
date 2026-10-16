@@ -44,6 +44,8 @@
         "v4::tests::a_twin_flood_leaves_every_next_vertex_citing_one_digest_per_author",
         "v4::tests::v4_cert_conflict_halts_ordering",
         "v4::tests::a_resyncing_wiped_validator_is_not_rearmed_in_an_epoch_it_signed_in",
+        "v4::tests::a_wiped_validator_booting_an_hour_behind_is_not_rearmed_in_an_epoch_it_signed_in",
+        "v4::tests::the_first_boot_proof_is_kept",
         "ordering::tests::the_descending_walk_is_walk_history_at_every_floor",
         "qc_producer::tests::persistence::a_qc_over_another_state_root_is_never_stored",
         "tests::tests::v4_node_tests::v4_nodes_rotate_epochs_on_the_qc_of_each_boundary_block",
@@ -59,6 +61,7 @@
       ],
       "excluded_ignored": {
         "ordering::tests::probe_corpus_arm_distribution": "Measurement of scheduler corpus distribution, not a safety assertion.",
+        "tests::tests::v4_node_tests::b6_storage_per_empty_block_by_key_family": "Measures logical storage growth by key family on an empty-block cluster; prints measurements without asserting a release threshold. Not evidence that storage growth is bounded.",
         "ordering::tests::probe_is_h3_masked_by_the_b3b4_halt": "Ordering experiment with synthetic inputs, not the production ingress path.",
         "ordering::tests::probe_c1_decision_experiment": "Experimental C1 decision model, not a production release witness.",
         "ordering::tests::probe_validate_c1_legal_universe": "Validation of the experimental C1 corpus, not production execution.",
@@ -68,6 +71,16 @@
     },
     "executor": {
       "required": [
+        "deps::tests::a_layout_multiplying_chain_is_refused",
+        "deps::tests::a_layout_building_too_many_nodes_is_refused",
+        "deps::tests::an_entry_function_returning_a_value_is_refused",
+        "tests::state_gas_tests::a_transaction_pays_for_the_state_bytes_it_adds",
+        "tests::state_gas_tests::an_estimate_counts_payer_history_once_when_the_payload_changes_it",
+        "tests::state_gas_tests::a_call_pays_for_the_modules_it_loads",
+        "tests::state_gas_tests::a_block_over_the_state_target_raises_the_byte_gas",
+        "tests::state_gas_tests::move_execution_is_capped_apart_from_the_writes",
+        "tests::b464_emission_pays_each_member_by_its_participation",
+        "tests::b464_a_member_out_that_leaves_and_joins_again_starts_afresh",
         "tests::block_execution_writes_state_only_inside_the_block_transaction",
         "tests::test_height_executes_exactly_once_and_only_in_order",
         "tests::test_g5_governance_refuses_every_action_but_signalling",
@@ -144,7 +157,9 @@
         "tests::rc2_lists_every_flat_key_the_tree_disagrees_with",
         "tests::forged_or_foreign_chunks_are_refused"
       ],
-      "excluded_ignored": {}
+      "excluded_ignored": {
+        "tests::measure_tree_bytes_per_key": "Measures JMT row bytes for gas calibration over a 20,000-key tree; prints measurements without asserting a release threshold. Gas calibration still needs independent validation."
+      }
     },
     "storage": {
       "required": [
@@ -154,6 +169,13 @@
     },
     "vm_move": {
       "required": [
+        "tests::tests::every_session_runs_on_the_vm_stack",
+        "tests::tests::a_foreign_pool_worker_hands_its_sessions_off",
+        "gas::tests::a_value_at_the_depth_bound_fits_the_vm_stack",
+        "gas::tests::a_first_access_pays_for_nested_layout_roots",
+        "gas::tests::a_native_pays_for_type_layouts_even_without_values",
+        "gas::tests::a_natives_reference_argument_costs_what_it_refers_to",
+        "gas::tests::a_loaded_resource_costs_by_its_size",
         "move_unit_tests::stdlib_move_unit_tests_pass_on_the_production_vm",
         "move_unit_tests::the_move_test_runner_reports_wrong_outcomes",
         "move_unit_tests::committed_stdlib_bytecode_matches_its_sources",

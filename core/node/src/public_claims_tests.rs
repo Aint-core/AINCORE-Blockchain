@@ -1,6 +1,8 @@
 //! G5 DOC-1: the public documents make no claim the code contradicts. A lib
 //! test, so the release gate (which runs `--lib`) runs it. Each phrase is one
-//! a review found false against the code (G5 review, 2026-10-01).
+//! a review found false against the code (G5 review, 2026-10-01; the genesis
+//! family, 2026-10-13: genesis mints exactly the stakes and balances
+//! genesis.json lists; bootstrap weight is the one part with no coins).
 
 /// (phrase, why it is false). Matched case-insensitively.
 const FALSE_CLAIMS: &[(&str, &str)] = &[
@@ -27,6 +29,35 @@ const FALSE_CLAIMS: &[(&str, &str)] = &[
     (
         "no pre-mine",
         "genesis mints the validators' stake and any genesis accounts",
+    ),
+    (
+        "tidak ada pre-mine",
+        "genesis mints the validators' stake and any genesis accounts",
+    ),
+    (
+        "genesis mints nothing",
+        "genesis mints the validators' stake and any genesis accounts",
+    ),
+    (
+        "cadangan treasury",
+        "B7 deleted the treasury: genesis refuses a nonzero treasury_reserve",
+    ),
+    (
+        "stake + treasury",
+        "B7 deleted the treasury: genesis refuses a nonzero treasury_reserve",
+    ),
+    ("treasury.move", "B7 deleted the treasury module"),
+    (
+        "genesis validator lock",
+        "nothing locks genesis stake; B314 deleted the unread federation row",
+    ),
+    (
+        "capped at 1/50",
+        "the 1/50 clip is gone: a share is weight over max(W, s_min) (BW-7)",
+    ),
+    (
+        "dibatasi 1/50",
+        "the 1/50 clip is gone: a share is weight over max(W, s_min) (BW-7)",
     ),
     ("1-2 detik", "the V4 block time is not measured yet"),
     ("1-2s", "finality time is not measured yet"),

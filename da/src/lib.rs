@@ -32,7 +32,9 @@
 //! served, so one uniformly random index is served with probability below 1/2,
 //! and `s` independent samples all succeed with probability below `2^-s`
 //! (Al-Bassam, Sonnino, Buterin, "Fraud and Data Availability Proofs", FC 2019,
-//! the one-dimensional case). The client must pick the indices itself.
+//! the one-dimensional case). The client must pick the indices itself, and
+//! check each answer against the index it drew ([`verify_sample`] takes it,
+//! B455): a server holding one shard could answer every draw with it.
 //!
 //! # What it does not prove
 //!
@@ -132,6 +134,15 @@ impl Extended {
         hex::encode(self.root)
     }
 
+    /// B319: the proofs of every shard, the shards dropped (a server serves
+    /// data shards from the body it holds).
+    pub fn into_proofs(self) -> ShardProofs {
+        ShardProofs {
+            layout: self.layout,
+            leaves: self.leaves,
+        }
+    }
+
     /// Shard `index` with its inclusion proof, or `None` past the last shard.
     pub fn sample(&self, index: u64) -> Option<Sample> {
         let i = usize::try_from(index)
@@ -146,6 +157,33 @@ impl Extended {
                 .map(hex::encode)
                 .collect(),
         })
+    }
+}
+
+/// B319: a body's shard proofs without its shards: what a server keeps to
+/// serve a block's data shards from the body itself.
+pub struct ShardProofs {
+    layout: Layout,
+    leaves: Vec<Hash>,
+}
+
+impl ShardProofs {
+    pub fn layout(&self) -> Layout {
+        self.layout
+    }
+
+    /// The inclusion proof of shard `index` (sibling hashes from the leaf
+    /// up, hex), or `None` past the last shard.
+    pub fn proof(&self, index: u64) -> Option<Vec<String>> {
+        let i = usize::try_from(index)
+            .ok()
+            .filter(|i| *i < self.leaves.len())?;
+        Some(
+            inclusion_path(i, &self.leaves)
+                .iter()
+                .map(hex::encode)
+                .collect(),
+        )
     }
 }
 
@@ -181,6 +219,8 @@ pub fn da_root(body: &[u8]) -> String {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sample {
     pub body_len: u64,
+    /// The shard's index as the server states it (B455: a client checks it
+    /// against the index it drew).
     pub index: u64,
     /// The shard's bytes, hex.
     pub shard: String,
@@ -192,6 +232,8 @@ pub struct Sample {
 pub enum SampleError {
     /// The root is not 32 bytes of hex.
     BadRoot,
+    /// B455: a sample of another index than the one drawn.
+    WrongIndex,
     /// The index is past the last shard of a body of this length.
     IndexOutOfRange,
     /// The shard is not hex, or not the layout's shard size.
@@ -202,15 +244,24 @@ pub enum SampleError {
     RootMismatch,
 }
 
-/// Check one sample against a DA root. Total: hostile input is refused, never
-/// a panic or an allocation larger than the sample itself.
+/// Check one sample, the answer to a request for shard `index`, against a DA
+/// root. Total: hostile input is refused, never a panic or an allocation
+/// larger than the sample itself.
+///
+/// B455: `index` is the one the client drew, never the sample's own. The
+/// sample states its index, and a genuine sample of another index verified:
+/// a server holding one shard answered every draw with it, and a body nobody
+/// could recover passed every sample.
 ///
 /// Returns the number of shards of the body the root commits to (B62): a
 /// client picks its indices from that range only. A count a server reports
 /// beside the sample (`aincore_getDaStatus`) is a hint, and one smaller than
 /// this lets a withholding server serve every index the client draws.
-pub fn verify_sample(da_root: &str, sample: &Sample) -> Result<u64, SampleError> {
+pub fn verify_sample(da_root: &str, index: u64, sample: &Sample) -> Result<u64, SampleError> {
     let expected = decode_hash(da_root).ok_or(SampleError::BadRoot)?;
+    if sample.index != index {
+        return Err(SampleError::WrongIndex);
+    }
     let layout = Layout::of(sample.body_len);
     let total = layout.total_shards();
     if sample.index >= total {
@@ -282,16 +333,38 @@ fn encode_columns(rs: &ReedSolomon, shards: &mut [Vec<u8>]) {
         rs.encode(&mut range)
             .expect("every range has 2k pieces of one width");
     };
-    if ranges.len() == 1 {
-        ranges.into_iter().for_each(encode);
-        return;
-    }
+    let helpers = ranges.len().saturating_sub(1);
+    run_jobs(ranges, helpers, encode);
+}
+
+/// B337: run `jobs` on this thread and up to `helpers` others, each taking
+/// the next job until none is left. A thread the OS refuses (a thread limit,
+/// memory) only means one helper fewer: `Scope::spawn` panicked, and the
+/// panic hook (B77) aborted the node in the middle of a block.
+fn run_jobs<J: Send>(jobs: Vec<J>, helpers: usize, run: impl Fn(J) + Sync) {
+    let queue = Mutex::new(jobs);
+    let worker = || loop {
+        let Some(job) = queue.lock().unwrap_or_else(|e| e.into_inner()).pop() else {
+            break;
+        };
+        run(job);
+    };
     std::thread::scope(|scope| {
-        for range in ranges {
-            scope.spawn(move || encode(range));
+        for _ in 0..helpers {
+            if std::thread::Builder::new()
+                .spawn_scoped(scope, worker)
+                .is_err()
+            {
+                break;
+            }
         }
+        worker();
     });
 }
+
+/// One thread's share of `hash_leaves`: the index of its first shard, its
+/// shards, and where their leaves go.
+type LeafJob<'a> = (usize, &'a [Vec<u8>], &'a mut [Hash]);
 
 /// Leaf hashes, on as many threads as the encode used.
 fn hash_leaves(shards: &[Vec<u8>]) -> Vec<Hash> {
@@ -301,24 +374,20 @@ fn hash_leaves(shards: &[Vec<u8>]) -> Vec<Hash> {
     if total < MIN_COLUMNS_PER_THREAD * shards.len() || per == shards.len() {
         return shards.iter().enumerate().map(hash).collect();
     }
-    std::thread::scope(|scope| {
-        let parts: Vec<_> = shards
-            .chunks(per)
-            .enumerate()
-            .map(|(c, part)| {
-                scope.spawn(move || {
-                    part.iter()
-                        .enumerate()
-                        .map(|(i, shard)| hash((c * per + i, shard)))
-                        .collect::<Vec<Hash>>()
-                })
-            })
-            .collect();
-        parts
-            .into_iter()
-            .flat_map(|part| part.join().expect("leaf hashing does not panic"))
-            .collect()
-    })
+    let mut leaves: Vec<Hash> = vec![[0; 32]; shards.len()];
+    let jobs: Vec<LeafJob> = shards
+        .chunks(per)
+        .zip(leaves.chunks_mut(per))
+        .enumerate()
+        .map(|(c, (part, out))| (c * per, part, out))
+        .collect();
+    let helpers = jobs.len().saturating_sub(1);
+    run_jobs(jobs, helpers, |(base, part, out)| {
+        for (i, (shard, leaf)) in part.iter().zip(out.iter_mut()).enumerate() {
+            *leaf = hash((base + i, shard));
+        }
+    });
+    leaves
 }
 
 /// One codec per data-shard count, built once: building one inverts a

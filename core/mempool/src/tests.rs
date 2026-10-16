@@ -186,8 +186,11 @@ fn test_rejects_duplicate_pending_sender_nonce() {
     assert_eq!(mempool.pending_txs.len(), 1);
 }
 
+/// B313: a sender:sequence on loan to a vertex takes no second transaction
+/// (it was let in once the first was drained, the loan keeping the first
+/// held); back from its loan, the first still guards its sequence.
 #[test]
-fn test_pending_nonce_released_when_tx_drained() {
+fn test_pending_nonce_held_while_tx_on_loan() {
     let mut mempool = Mempool::new();
     let payload_a = hex::encode(
         bcs::to_bytes(&vm_move::TransactionPayload::PublishModule(vec![vec![1]])).unwrap(),
@@ -202,10 +205,95 @@ fn test_pending_nonce_released_when_tx_drained() {
     let drained = mempool.get_pending_transactions(1);
     assert_eq!(drained.len(), 1);
 
-    mempool
+    let err = mempool
+        .add_transaction(make_test_tx_with_payload(5, payload_b.clone()))
+        .expect_err("a second transaction at a sequence on loan");
+    assert!(err.contains("on loan"), "{err}");
+    mempool.return_unshipped(&drained);
+    let err = mempool
         .add_transaction(make_test_tx_with_payload(5, payload_b))
-        .expect("nonce can be re-submitted after pending tx is drained for execution");
+        .expect_err("back from its loan, the first still guards its sequence");
+    assert!(err.contains("Duplicate pending nonce"), "{err}");
     assert_eq!(mempool.pending_txs.len(), 1);
+}
+
+/// B453 witness: a transaction at a sequence on loan to a vertex is refused
+/// for now (a forwarder keeps it and asks again), and once the one on loan
+/// comes back unrun it replaces it. The refusal was for good, so members
+/// over a third of the stake holding the original on loan made a forwarder
+/// drop the replacement after the RPC had answered "sent". A replacement
+/// under the price bump stays refused for good.
+#[test]
+fn a_sequence_on_loan_is_refused_for_now() {
+    fn admit(mp: &mut Mempool, raw: &str) -> Result<String, Refusal> {
+        let checked = Mempool::check_admissible(raw).expect("a valid transaction");
+        mp.add_checked(raw.to_string(), checked)
+    }
+    let payload = |b: u8| {
+        hex::encode(
+            bcs::to_bytes(&vm_move::TransactionPayload::PublishModule(vec![vec![b]])).unwrap(),
+        )
+    };
+    let mut mp = Mempool::new();
+    let original = make_test_tx_with_payload(5, payload(1));
+    mp.add_transaction(original.clone()).expect("admit");
+    assert_eq!(
+        mp.get_pending_transactions_at(1, 100),
+        vec![original],
+        "vacuous: the original is not on loan"
+    );
+    let bump = make_test_tx_with_payload_and_gas(5, payload(2), 1000, 2);
+    let refusal = admit(&mut mp, &bump).expect_err("on loan");
+    assert!(refusal.reason.contains("on loan"), "{refusal}");
+    assert!(refusal.for_now, "refused for good: {refusal}");
+
+    // No block settled the original: back from its loan.
+    assert_eq!(mp.requeue_stale_at(30, 130), 1);
+    let cheap = make_test_tx_with_payload_and_gas(5, payload(3), 1000, 1);
+    let refusal = admit(&mut mp, &cheap).expect_err("underpriced");
+    assert!(refusal.reason.contains("must pay"), "{refusal}");
+    assert!(!refusal.for_now, "an underpriced replacement: {refusal}");
+    admit(&mut mp, &bump).expect("asked again");
+    assert_eq!(mp.get_all_pending(), vec![bump]);
+}
+
+/// B476 witness: an original on loan to this node's forwarder is in no
+/// vertex: a replacement paying the price bump takes its place at once (one
+/// under the bump stays refused for good), while one on loan to a vertex is
+/// refused for now (B453). The forwarder's loan was refused as a vertex's,
+/// and re-queued and loaned again in one lock hold, so through an observer
+/// no replacement got in.
+#[test]
+fn a_forwarders_loan_is_replaced_by_a_fee_bump() {
+    let payload = |b: u8| {
+        hex::encode(
+            bcs::to_bytes(&vm_move::TransactionPayload::PublishModule(vec![vec![b]])).unwrap(),
+        )
+    };
+    let mut mp = Mempool::new();
+    let original = make_test_tx_with_payload(6, payload(1));
+    mp.add_transaction(original.clone()).expect("admit");
+    assert_eq!(
+        mp.loan_for_forwarding_at(1, 100),
+        vec![original.clone()],
+        "vacuous: the original is not on loan"
+    );
+    let cheap = make_test_tx_with_payload_and_gas(6, payload(3), 1000, 1);
+    let err = mp.add_transaction(cheap).unwrap_err();
+    assert!(err.contains("must pay"), "{err}");
+    let bump = make_test_tx_with_payload_and_gas(6, payload(2), 1000, 2);
+    mp.add_transaction(bump.clone())
+        .expect("a fee bump of an original being forwarded");
+    assert!(
+        !mp.any_pending(|t| t == original.as_str()),
+        "the original stayed beside its replacement"
+    );
+    assert_eq!(mp.get_all_pending(), vec![bump.clone()]);
+    // On loan to a vertex, the replacement is refused for now (B453).
+    assert_eq!(mp.get_pending_transactions_at(1, 200), vec![bump]);
+    let again = make_test_tx_with_payload_and_gas(6, payload(4), 1000, 3);
+    let err = mp.add_transaction(again).unwrap_err();
+    assert!(err.contains("on loan"), "{err}");
 }
 
 #[test]
@@ -224,6 +312,30 @@ fn test_mempool_limit() {
 
     // Should be rejected, size stays same
     assert_eq!(mempool.pending_txs.len(), MAX_PENDING_TXS);
+}
+
+/// B368 witness: the dedup cache is bounded by its order's own length. An
+/// identity forgotten (a replaced, evicted or expired transaction) left its
+/// entry in the order for good, and the order was popped only while the set
+/// was full, so free replacements grew it without end. An identity seen
+/// again outlives its stale entry.
+#[test]
+fn forgotten_identities_leave_the_dedup_order_bounded() {
+    let mut seen = SeenTxs::new(4);
+    for i in 0..100 {
+        let id = format!("replaced{i}");
+        seen.insert(id.clone());
+        seen.forget(&id);
+    }
+    assert!(seen.order.len() <= 4, "{} entries", seen.order.len());
+    seen.insert("again".into());
+    seen.forget("again");
+    seen.insert("again".into());
+    seen.insert("b".into());
+    seen.insert("c".into());
+    seen.insert("d".into());
+    assert!(seen.contains("again"), "a stale entry forgot it");
+    assert_eq!(seen.len(), 4);
 }
 
 #[test]
@@ -1285,13 +1397,15 @@ mod fee_market_admission {
             admitted
         };
         // Parked bodies (behind a nonce gap) fill the bytes; a ready 90 KiB
-        // newcomer takes several of them, in one scan.
+        // newcomer takes several of them, in one scan. Five senders: each
+        // holds at most `MAX_NONCE_AHEAD - 1` parked, and four of those no
+        // longer filled the bytes.
         let db = temp_db("b231_one_scan");
         let mut mp = Mempool::with_storage(Arc::clone(&db));
-        for seed in 81..=85 {
+        for seed in 81..=86 {
             fund(&db, &big_tx(seed, 0, 1).1, 1_000_000_000_000_000_000_000);
         }
-        let parked: usize = (81..=84)
+        let parked: usize = (81..=85)
             .map(|seed| fill(&mut mp, seed, 1, 10 * 1024))
             .sum();
         assert!(
@@ -1299,7 +1413,7 @@ mod fee_market_admission {
             "vacuous: the bytes are not full ({parked} parked)"
         );
         let (len, before) = (mp.len(), scans());
-        mp.add_transaction(big_tx(85, 0, 45 * 1024).0)
+        mp.add_transaction(big_tx(86, 0, 45 * 1024).0)
             .expect("a ready transaction evicts parked ones");
         let evicted = len + 1 - mp.len();
         assert!(evicted >= 2, "vacuous: {evicted} evicted");
@@ -1534,6 +1648,140 @@ mod fee_market_admission {
         assert!(mp.any_pending(|t| t == last.as_str()));
     }
 
+    /// B313 witness: behind a head on loan, a second transaction at the
+    /// head's sequence is refused and the run behind the head is offered
+    /// whole. The second was admitted, selection parked the run from it on,
+    /// and the eviction scan counted that run ready, so the sender's queue
+    /// was never evicted while its newcomers evicted other senders'.
+    #[test]
+    fn a_sequence_on_loan_takes_no_second_transaction() {
+        let db = temp_db("b313_loan");
+        let mut mp = Mempool::with_storage(Arc::clone(&db));
+        let (head, sender) = priced_tx(141, 0, 1, 9);
+        fund(&db, &sender, 1_000_000_000_000_000_000_000);
+        mp.add_transaction(head.clone()).expect("the head");
+        assert_eq!(
+            mp.get_pending_transactions(1),
+            vec![head],
+            "vacuous: the head is not on loan"
+        );
+        let err = mp
+            .add_transaction(priced_tx(141, 0, 2, 20).0)
+            .expect_err("a second transaction at the head's sequence");
+        assert!(err.contains("on loan"), "{err}");
+        for seq in 1..=3 {
+            mp.add_transaction(priced_tx(141, seq, 1, 9).0)
+                .expect("the run");
+        }
+        assert_eq!(
+            mp.get_pending_transactions(10).len(),
+            3,
+            "the run behind the loan was not offered"
+        );
+    }
+
+    /// B313 witness: behind a head stamped unpaid (its paymaster fell short
+    /// in the last selection, which offered nothing of the run past it), a
+    /// newcomer its sender pays for itself is not ready: a full pool refuses
+    /// it and evicts nothing. It counted as ready and evicted the sender's
+    /// own stamped run for a transaction selection would not offer.
+    #[test]
+    fn a_newcomer_behind_an_unpaid_head_evicts_nothing() {
+        let db = temp_db("b313_unpaid");
+        let mut mp = Mempool::with_storage(Arc::clone(&db));
+        let (_, sender, paymaster) = sponsored_tx(161, 0, 9, 162);
+        fund(&db, &sender, 1_000_000_000_000_000_000_000);
+        fund(&db, &paymaster, 1_000_000_000_000_000_000_000);
+        let mut run = Vec::new();
+        for seq in 0..5 {
+            let (tx, _, _) = sponsored_tx(161, seq, 9, 162);
+            mp.add_transaction(tx.clone()).expect("the sponsored run");
+            run.push(tx);
+        }
+        fund(&db, &paymaster, 1);
+        assert!(
+            mp.get_pending_transactions_at(10, 5_000).is_empty(),
+            "vacuous: the unpaid head was offered"
+        );
+        assert_eq!(
+            mp.held
+                .values()
+                .filter(|h| h.unpaid_since.is_some())
+                .count(),
+            5,
+            "vacuous: the run was not stamped unpaid"
+        );
+        let mut seed = 170u8;
+        'fill: loop {
+            fund(
+                &db,
+                &priced_tx(seed, 0, 1, 9).1,
+                1_000_000_000_000_000_000_000,
+            );
+            for seq in 0..MAX_NONCE_AHEAD - 1 {
+                if mp.len() >= MAX_PENDING_TXS {
+                    break 'fill;
+                }
+                mp.add_transaction(priced_tx(seed, seq, 1, 9).0)
+                    .expect("room");
+            }
+            seed += 1;
+        }
+        let held = mp.len();
+        let refused = mp.add_transaction(signed_tx(161, 5, 100_000, 9).0);
+        assert!(
+            refused.is_err(),
+            "a newcomer behind an unpaid head was admitted"
+        );
+        assert_eq!(mp.len(), held, "something was evicted for it");
+        let last = executor::admission::canonicalize(run.last().unwrap()).unwrap();
+        assert!(mp.any_pending(|t| t == last.as_str()));
+    }
+
+    /// B313 witness: selection offers a sender's ready run only, the run
+    /// `ready_run_end` reads: it stops at a gap and at a waiting one priced
+    /// under the base fee, with all after it (selection kept a run rule of
+    /// its own, B297's class; taking every number held, it offered blocks
+    /// what they would skip for nothing).
+    #[test]
+    fn selection_takes_only_a_senders_ready_run() {
+        let db = temp_db("b313_select");
+        let mut mp = Mempool::with_storage(Arc::clone(&db));
+        let (a0, a) = priced_tx(151, 0, 1, 9);
+        let (b0, b) = priced_tx(152, 0, 1, 9);
+        fund(&db, &a, 1_000_000_000_000_000_000_000);
+        fund(&db, &b, 1_000_000_000_000_000_000_000);
+        let (a1, _) = priced_tx(151, 1, 1, 9);
+        let (a3, _) = priced_tx(151, 3, 1, 9);
+        let (b1, _) = priced_tx(152, 1, 1, 1);
+        let (b2, _) = priced_tx(152, 2, 1, 9);
+        for tx in [&a0, &a1, &a3, &b0, &b1, &b2] {
+            mp.add_transaction(tx.clone()).expect("admitted");
+        }
+        {
+            let _seed = db.seeding();
+            db.put(executor::BASE_FEE_KEY, "5").unwrap();
+        }
+        let mut offered = mp.get_pending_transactions_at(10, 5_000);
+        offered.sort();
+        let mut ready = vec![a0, a1, b0];
+        ready.sort();
+        assert_eq!(
+            offered, ready,
+            "past a gap (a3) or an underpriced one (b1, and b2 behind it)"
+        );
+        assert!(
+            mp.get_pending_transactions_at(10, 5_001).is_empty(),
+            "a parked one was offered on the next pass"
+        );
+        // The gap filled: the run continues through it (a3 was parked, not
+        // dropped).
+        let (a2, _) = priced_tx(151, 2, 1, 9);
+        mp.add_transaction(a2.clone()).expect("the gap");
+        assert_eq!(mp.get_pending_transactions_at(10, 5_002), vec![a2, a3]);
+        assert!(mp.any_pending(|t| t == b2.as_str()), "b2 left the pool");
+    }
+
     /// B245 witness: a replacement's victims never include the transaction
     /// it replaces (counted out of the bytes held already): credited twice,
     /// the pool ended up over `MAX_PENDING_BYTES`.
@@ -1690,6 +1938,182 @@ mod fee_market_admission {
         assert!(mp.get_pending_transactions(10).is_empty());
         assert_eq!(mp.len(), 0, "the dead transaction is gone");
     }
+
+    /// B462 witness: a ready transaction its payer falls short of only by
+    /// its own parked ones (never offered, so never charged) evicts them,
+    /// the furthest ahead first, and never another payer's; one they cannot
+    /// make whole evicts none, and a parked newcomer evicts none. The parked
+    /// ones held the balance, and only where they were held: a member
+    /// holding one an observer never saw refused for now every ready one of
+    /// its payer the observer forwarded, for free, and those held the
+    /// observer's pool full to their TTL.
+    #[test]
+    fn a_payers_parked_transactions_never_hold_its_balance_from_a_ready_one() {
+        let db = temp_db("b462_payer_parked");
+        let mut mp = Mempool::with_storage(Arc::clone(&db));
+        let cost = |tx: &str| executor_gas(tx) as u128; // priced 1
+        let (parked, sender) = big_tx(172, 50, 1);
+        fund(&db, &sender, cost(&parked) * 3 / 2);
+        mp.add_transaction(parked.clone())
+            .expect("parked behind a gap, covered");
+        // Another payer's parked one, further ahead: first in eviction order.
+        let (other, other_sender) = big_tx(173, 90, 1);
+        fund(&db, &other_sender, 1_000_000_000_000_000_000);
+        mp.add_transaction(other.clone()).expect("another payer's");
+        let (large, _) = big_tx(172, 0, 10 * 1024);
+        assert!(cost(&large) > cost(&parked) * 3 / 2, "vacuous: covered");
+        let err = mp.add_transaction(large).unwrap_err();
+        assert!(err.contains("Insufficient balance"), "{err}");
+        let (behind, _) = big_tx(172, 60, 1);
+        let checked = Mempool::check_admissible(&behind).expect("a valid transaction");
+        let refusal = mp.add_checked(behind, checked).unwrap_err();
+        assert!(
+            refusal.for_now && refusal.reason.contains("Insufficient balance"),
+            "a parked newcomer: {refusal}"
+        );
+        assert!(
+            mp.any_pending(|t| t == parked.as_str()),
+            "evicted for a newcomer that cannot run or that it could not make whole"
+        );
+        let (ready, _) = big_tx(172, 0, 1);
+        mp.add_transaction(ready.clone())
+            .expect("refused for its payer's parked transaction");
+        assert!(
+            !mp.any_pending(|t| t == parked.as_str()),
+            "the parked one kept its payer's balance"
+        );
+        assert!(
+            mp.any_pending(|t| t == other.as_str()),
+            "another payer's parked transaction was evicted"
+        );
+        assert_eq!(mp.get_pending_transactions_at(10, 1_000), vec![ready]);
+    }
+
+    /// B462 witness: the parked transactions a ready one's payer evicts make
+    /// room for it too, by bytes and by count: a pool full of ready ones
+    /// admits it and evicts nothing else (counted as held, they left it
+    /// refused for want of room).
+    #[test]
+    fn a_payers_parked_transactions_make_room_for_its_ready_one() {
+        let cost = |tx: &str| executor_gas(tx) as u128; // priced 1
+        // By bytes: ready bodies up to the bytes (each admitted only while
+        // it fits: one refused would evict the parked one), and the payer's
+        // parked body, larger than the ready one, which is larger than any
+        // room a body left.
+        let db = temp_db("b462_payer_bytes");
+        let mut mp = Mempool::with_storage(Arc::clone(&db));
+        let (parked, payer) = big_tx(191, 50, 48 * 1024);
+        fund(&db, &payer, cost(&parked) * 3 / 2);
+        mp.add_transaction(parked.clone())
+            .expect("parked behind a gap");
+        fund(&db, &big_tx(192, 0, 1).1, 1_000_000_000_000_000_000_000);
+        for seq in 0..MAX_NONCE_AHEAD - 1 {
+            let (body, _) = big_tx(192, seq, 45 * 1024);
+            if mp.held_bytes() + body.len() > MAX_PENDING_BYTES {
+                break;
+            }
+            mp.add_transaction(body).expect("room");
+        }
+        let (ready, _) = big_tx(191, 0, 46 * 1024);
+        assert!(
+            mp.held_bytes() + ready.len() > MAX_PENDING_BYTES,
+            "vacuous: room left"
+        );
+        let len = mp.len();
+        mp.add_transaction(ready)
+            .expect("its payer's parked body made no room");
+        assert!(!mp.any_pending(|t| t == parked.as_str()));
+        assert_eq!(mp.len(), len, "something else was evicted");
+        // By count: ready transactions to the cap, and the payer's one parked.
+        let db = temp_db("b462_payer_count");
+        let mut mp = Mempool::with_storage(Arc::clone(&db));
+        let (parked, payer) = signed_tx(193, 50, 100_000, 1);
+        fund(&db, &payer, cost(&parked) * 3 / 2);
+        mp.add_transaction(parked.clone())
+            .expect("parked behind a gap");
+        let mut seed = 194u8;
+        'fill: loop {
+            fund(
+                &db,
+                &signed_tx(seed, 0, 100_000, 1).1,
+                1_000_000_000_000_000_000_000,
+            );
+            for seq in 0..MAX_NONCE_AHEAD - 1 {
+                if mp.len() >= MAX_PENDING_TXS {
+                    break 'fill;
+                }
+                mp.add_transaction(signed_tx(seed, seq, 100_000, 1).0)
+                    .expect("room");
+            }
+            seed += 1;
+        }
+        let (ready, _) = signed_tx(193, 0, 100_000, 1);
+        mp.add_transaction(ready)
+            .expect("its payer's parked transaction made no room");
+        assert!(!mp.any_pending(|t| t == parked.as_str()));
+        assert_eq!(mp.len(), MAX_PENDING_TXS, "something else was evicted");
+    }
+
+    /// B462 witness: what members over a third of the stake refused for
+    /// now, deferred by the forwarder (`defer`), ends its sender's ready run
+    /// for the eviction scan and a newcomer's readiness, on loan or queued:
+    /// a ready transaction evicts it, the furthest ahead first, from a pool
+    /// full by its bytes, as parked ones are, and a newcomer behind it is
+    /// not ready and evicts nothing. Selection still offers it (the members
+    /// are asked again), and once cleared it holds its room again. On loan
+    /// and never evicted, such transactions held an observer's pool full to
+    /// their TTL.
+    #[test]
+    fn a_deferred_transaction_is_evicted_like_a_parked_one() {
+        let db = temp_db("b462_deferred");
+        let mut mp = Mempool::with_storage(Arc::clone(&db));
+        for seed in 181..=184 {
+            fund(&db, &big_tx(seed, 0, 1).1, 1_000_000_000_000_000_000_000);
+        }
+        let mut filled = Vec::new();
+        for seq in 0..MAX_NONCE_AHEAD - 1 {
+            let (tx, _) = big_tx(181, seq, 45 * 1024);
+            if mp.add_transaction(tx.clone()).is_err() {
+                break;
+            }
+            filled.push(tx);
+        }
+        let loaned = mp.loan_for_forwarding_at(MAX_PENDING_TXS, 1_000);
+        assert_eq!(loaned.len(), filled.len(), "vacuous: not all on loan");
+        // A KiB more than a filler, so none fits the room one left.
+        let newcomer = |seed: u8| big_tx(seed, 0, 46 * 1024).0;
+        let refused = mp.add_transaction(newcomer(182)).unwrap_err();
+        assert!(refused.contains("bytes held"), "vacuous: {refused}");
+        mp.defer(&loaned, &[]);
+        let before = mp.held.len();
+        let (behind, _) = big_tx(181, filled.len() as u64, 46 * 1024);
+        assert!(
+            mp.add_transaction(behind).is_err(),
+            "a newcomer behind a deferred run was admitted"
+        );
+        assert_eq!(mp.held.len(), before, "evicted for a newcomer behind them");
+        mp.add_transaction(newcomer(182))
+            .expect("refused for room held by deferred transactions on loan");
+        let last = filled.last().expect("vacuous: nothing filled");
+        assert!(
+            !mp.any_pending(|t| t == last.as_str()),
+            "the furthest ahead was not evicted first"
+        );
+        assert!(mp.any_pending(|t| t == filled[0].as_str()));
+        // Back in the queue: still deferred, and still offered.
+        mp.requeue_stale_uncapped_at(30, 1_030);
+        mp.add_transaction(newcomer(183))
+            .expect("refused for room held by deferred transactions queued");
+        let again = mp.loan_for_forwarding_at(MAX_PENDING_TXS, 1_030);
+        assert!(
+            again.contains(&filled[0]),
+            "a deferred transaction was not offered: its members were never asked again"
+        );
+        // Taken by the members: no longer deferred.
+        mp.defer(&[], &again);
+        let refused = mp.add_transaction(newcomer(184)).unwrap_err();
+        assert!(refused.contains("bytes held"), "a cleared one stayed deferred: {refused}");
+    }
 }
 
 /// Orphan-loss fix: a pulled transaction that never executes must come BACK,
@@ -1746,6 +2170,65 @@ fn loans_age_in_the_callers_clock() {
     assert_eq!(mp.requeue_stale_at(30, 129), 0);
     assert_eq!(mp.requeue_stale_at(30, 130), 1);
     assert_eq!(mp.get_pending_transactions_at(10, 130), vec![tx]);
+}
+
+/// B452 witness: a transaction dropped at its requeue cap (three loans no
+/// block settled) leaves with its dedup identity, so the same bytes are
+/// admitted again; `return_refused`'s cap likewise. It kept the identity,
+/// and the sender's resubmission was refused as a duplicate for the next
+/// `MAX_SEEN_TXS` admissions, though nothing had run it.
+#[test]
+fn a_transaction_dropped_at_its_requeue_cap_may_be_submitted_again() {
+    let tx = make_test_tx(0);
+    let mut mp = Mempool::new();
+    mp.add_transaction(tx.clone()).expect("admit");
+    let mut now = 100;
+    for _ in 0..MAX_REQUEUE_ATTEMPTS {
+        assert_eq!(mp.get_pending_transactions_at(10, now), vec![tx.clone()]);
+        now += 30;
+        mp.requeue_stale_at(30, now);
+    }
+    assert!(!mp.any_pending(|p| *p == tx), "vacuous: kept past its cap");
+    mp.add_transaction(tx.clone())
+        .expect("the same bytes again");
+
+    let mut mp = Mempool::new();
+    mp.add_transaction(tx.clone()).expect("admit");
+    for _ in 0..MAX_REQUEUE_ATTEMPTS {
+        let loaned = mp.get_pending_transactions(10);
+        assert_eq!(loaned, vec![tx.clone()]);
+        mp.return_refused(&loaned);
+    }
+    assert!(!mp.any_pending(|p| *p == tx), "vacuous: kept past its cap");
+    mp.add_transaction(tx).expect("the same bytes again");
+}
+
+/// B452 witness: what a forwarder drops without its having run (its TTL,
+/// or refusals from members over a third of the stake), on loan or queued,
+/// leaves with its dedup identity, and the same bytes are admitted again;
+/// an executed one keeps it. The forwarder dropped through `mark_executed`,
+/// which kept it.
+#[test]
+fn a_transaction_dropped_unexecuted_may_be_submitted_again() {
+    let (loaned, queued, executed) = (
+        make_test_tx_distinct_sender(110),
+        make_test_tx_distinct_sender(111),
+        make_test_tx_distinct_sender(112),
+    );
+    let mut mp = Mempool::new();
+    mp.add_transaction(loaned.clone()).expect("admit");
+    assert_eq!(mp.get_pending_transactions(1), vec![loaned.clone()]);
+    mp.add_transaction(queued.clone()).expect("admit");
+    mp.add_transaction(executed.clone()).expect("admit");
+    mp.drop_unexecuted(&[loaned.clone(), queued.clone()]);
+    mp.mark_executed(std::slice::from_ref(&executed));
+    assert!(mp.is_empty(), "the queued ones were not dropped");
+    assert!(!mp.any_pending(|p| *p == loaned), "the loan stayed");
+    for tx in [loaned, queued] {
+        mp.add_transaction(tx).expect("the same bytes again");
+    }
+    let err = mp.add_transaction(executed).unwrap_err();
+    assert!(err.contains("Duplicate transaction"), "{err}");
 }
 
 /// The block builder trims transactions that do not fit the vertex byte budget.

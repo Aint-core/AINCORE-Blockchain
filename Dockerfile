@@ -1,5 +1,7 @@
-# Build Stage
-FROM rust:latest as builder
+# Build Stage. B351: a pinned toolchain (the one the release is tested with)
+# and the lock file's dependency versions (`--locked`): `rust:latest` and an
+# unlocked build made each image a different build of the node.
+FROM rust:1.95-bookworm AS builder
 
 WORKDIR /usr/src/aincore
 
@@ -9,29 +11,33 @@ RUN apt-get update && apt-get install -y pkg-config libssl-dev protobuf-compiler
 # Copy entire workspace
 COPY . .
 
-# Compile Move Stdlib
-RUN cargo run --release --bin move_compiler_tool -- --sources core/vm_move/stdlib/sources/*.move --output core/vm_move/stdlib/bytecode
+# B351: the stdlib bytecode is the repository's, the one genesis.json pins
+# (`stdlib_hash`); it is not compiled again here (a compiler that emitted
+# other bytes made the node refuse the genesis).
 
-# Build the node binary (release mode)
-RUN cargo build --release --bin node
-# Build the indexer binary
-RUN cargo build --release --bin indexer
+# Build the node and the indexer (release mode)
+RUN cargo build --release --locked --bin node --bin indexer
 
 # Runtime Stage
 FROM debian:trixie-slim
 
-WORKDIR /root/.aincore
-
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y ca-certificates libssl3 && rm -rf /var/lib/apt/lists/*
+
+# B351: the node runs as an unprivileged user, not root. A mounted data
+# directory must be writable by it: `sudo chown -R 10001 <host dir>`.
+RUN useradd --uid 10001 --create-home --home-dir /home/aincore aincore
+WORKDIR /home/aincore/.aincore
 
 # Copy the compiled binary from the builder stage
 COPY --from=builder /usr/src/aincore/target/release/node /usr/local/bin/node
 COPY --from=builder /usr/src/aincore/target/release/indexer /usr/local/bin/indexer
 
-# Copy the compiled Move Stdlib bytecode
-RUN mkdir -p /root/.aincore/vm_move/stdlib/bytecode
-COPY --from=builder /usr/src/aincore/core/vm_move/stdlib/bytecode /root/.aincore/vm_move/stdlib/bytecode
+# The Move stdlib bytecode genesis pins, where the node looks for it
+# (`vm_move/stdlib/bytecode` under its working directory).
+COPY --from=builder --chown=aincore:aincore /usr/src/aincore/core/vm_move/stdlib/bytecode /home/aincore/.aincore/vm_move/stdlib/bytecode
+RUN mkdir -p /home/aincore/.aincore/data && chown -R aincore:aincore /home/aincore
+USER aincore
 
 # No genesis is baked in: the repository's genesis.json predates the current
 # format and is refused (no stdlib_hash, a treasury reserve, no pinned

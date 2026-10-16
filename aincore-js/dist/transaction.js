@@ -1,7 +1,19 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.Transaction = void 0;
+exports.Transaction = exports.BYTE_GAS = void 0;
+exports.tokenIdOf = tokenIdOf;
+const crypto_1 = require("crypto");
+const address_1 = require("./address");
 const bcs_1 = require("./bcs");
+/**
+ * A token_factory token's id: its symbol's bytes followed by its creator's
+ * 32 address bytes, as hex (the form the token methods take). The id holds
+ * raw address bytes, so it is not text: passing it as a UTF-8 string, as
+ * these methods once did, sent different bytes.
+ */
+function tokenIdOf(symbol, creator) {
+    return (0, bcs_1.bytesToHex)(new TextEncoder().encode(symbol)) + (0, address_1.toHexAddress)(creator);
+}
 // ============================================================
 // Helper: Build a standard 0x1 entry function call
 // ============================================================
@@ -19,12 +31,16 @@ function systemCall(moduleName, functionName, tyArgs, args) {
 // ============================================================
 // Transaction Class
 // ============================================================
+/** B14: gas per byte of the signed transaction JSON, as the node charges it. */
+exports.BYTE_GAS = 400;
 class Transaction {
     constructor() {
         this.sender = '';
         this.inputObjects = [];
         this.payload = '';
-        this.gasLimit = 10000;
+        this.gasLimit = 0;
+        this.executionGas = 10000;
+        // At least the node's base fee (B15): `Number(await connection.getGasPrice())`.
         this.gasPrice = 1;
         this.sequenceNumber = 0;
         this.publicKey = '';
@@ -96,7 +112,13 @@ class Transaction {
      * Register as a validator
      * Calls: 0x1::staking::join_validator_set(account, stake_amount, public_key)
      */
-    static createRegisterValidator(sender, stakeAmount, sequenceNumber = 0) {
+    /// 0x1::staking::join_validator_set takes FIVE args: account, stake,
+    /// public_key, bls_public_key, bls_pop. The old helper sent only three and
+    /// the node rejected every call with NUMBER_OF_ARGUMENTS_MISMATCH. The BLS
+    /// proof-of-possession cannot be produced by this SDK (no BLS12-381 signing),
+    /// so blsPublicKey (48 bytes) and blsPop (96 bytes) must be obtained
+    /// out-of-band from the node keygen and passed in; there is no safe default.
+    static createRegisterValidator(sender, stakeAmount, blsPublicKey, blsPop, sequenceNumber = 0) {
         const tx = new Transaction();
         tx.sender = sender.address;
         const pkBytes = (0, bcs_1.hexToBytes)(sender.publicKey);
@@ -104,6 +126,8 @@ class Transaction {
             (0, bcs_1.bcsAddress)(sender.address),
             (0, bcs_1.bcsU128)(stakeAmount),
             (0, bcs_1.bcsVectorU8)(pkBytes),
+            (0, bcs_1.bcsVectorU8)(blsPublicKey),
+            (0, bcs_1.bcsVectorU8)(blsPop),
         ]);
         tx.sequenceNumber = sequenceNumber;
         return tx;
@@ -212,7 +236,7 @@ class Transaction {
         return tx;
     }
     /**
-     * Mint tokens (only token creator can mint)
+     * Mint tokens (only token creator can mint). `tokenId` is hex (`tokenIdOf`).
      * Calls: 0x1::token_factory::mint(admin, token_id, to, amount)
      */
     static mintToken(sender, tokenId, to, amount, sequenceNumber = 0) {
@@ -220,7 +244,7 @@ class Transaction {
         tx.sender = sender.address;
         tx.payload = systemCall('token_factory', 'mint', [], [
             (0, bcs_1.bcsAddress)(sender.address),
-            (0, bcs_1.bcsVectorU8)(new TextEncoder().encode(tokenId)),
+            (0, bcs_1.bcsVectorU8)((0, bcs_1.hexToBytes)(tokenId)),
             (0, bcs_1.bcsAddress)(to),
             (0, bcs_1.bcsU128)(amount),
         ]);
@@ -228,22 +252,25 @@ class Transaction {
         return tx;
     }
     /**
-     * Burn tokens
-     * Calls: 0x1::token_factory::burn(holder, token_id, amount)
+     * Burn tokens. `creator` names the token's registry (B135); `tokenId` is
+     * hex (`tokenIdOf`).
+     * Calls: 0x1::token_factory::burn(holder, creator, token_id, amount)
      */
-    static burnToken(sender, tokenId, amount, sequenceNumber = 0) {
+    static burnToken(sender, creator, tokenId, amount, sequenceNumber = 0) {
         const tx = new Transaction();
         tx.sender = sender.address;
         tx.payload = systemCall('token_factory', 'burn', [], [
             (0, bcs_1.bcsAddress)(sender.address),
-            (0, bcs_1.bcsVectorU8)(new TextEncoder().encode(tokenId)),
+            (0, bcs_1.bcsAddress)((0, address_1.toHexAddress)(creator)),
+            (0, bcs_1.bcsVectorU8)((0, bcs_1.hexToBytes)(tokenId)),
             (0, bcs_1.bcsU128)(amount),
         ]);
         tx.sequenceNumber = sequenceNumber;
         return tx;
     }
     /**
-     * Transfer tokens to another address
+     * Transfer tokens to another address (which must have registered the
+     * token, `registerToken`). `tokenId` is hex (`tokenIdOf`).
      * Calls: 0x1::token_factory::transfer(from, token_id, to, amount)
      */
     static transferToken(sender, tokenId, to, amount, sequenceNumber = 0) {
@@ -251,9 +278,25 @@ class Transaction {
         tx.sender = sender.address;
         tx.payload = systemCall('token_factory', 'transfer', [], [
             (0, bcs_1.bcsAddress)(sender.address),
-            (0, bcs_1.bcsVectorU8)(new TextEncoder().encode(tokenId)),
+            (0, bcs_1.bcsVectorU8)((0, bcs_1.hexToBytes)(tokenId)),
             (0, bcs_1.bcsAddress)(to),
             (0, bcs_1.bcsU128)(amount),
+        ]);
+        tx.sequenceNumber = sequenceNumber;
+        return tx;
+    }
+    /**
+     * Register a token in the sender's wallet (made if missing), so it can
+     * receive it (B135: a wallet takes only tokens its owner registered).
+     * `tokenId` is hex (`tokenIdOf`).
+     * Calls: 0x1::token_factory::register(account, token_id)
+     */
+    static registerToken(sender, tokenId, sequenceNumber = 0) {
+        const tx = new Transaction();
+        tx.sender = sender.address;
+        tx.payload = systemCall('token_factory', 'register', [], [
+            (0, bcs_1.bcsAddress)(sender.address),
+            (0, bcs_1.bcsVectorU8)((0, bcs_1.hexToBytes)(tokenId)),
         ]);
         tx.sequenceNumber = sequenceNumber;
         return tx;
@@ -369,22 +412,25 @@ class Transaction {
         return tx;
     }
     /**
-     * Vote on a governance proposal
-     * Calls: 0x1::governance::vote(voter, proposal_id, approve)
+     * Vote on a governance proposal with `amount` quanta of AIN, locked
+     * until its voting ends (B71); `claimVoteTokens` takes it back after.
+     * Calls: 0x1::governance::vote(voter, proposal_id, approve, amount)
      */
-    static vote(sender, proposalId, approve, sequenceNumber = 0) {
+    static vote(sender, proposalId, approve, amount, sequenceNumber = 0) {
         const tx = new Transaction();
         tx.sender = sender.address;
         tx.payload = systemCall('governance', 'vote', [], [
             (0, bcs_1.bcsAddress)(sender.address),
             (0, bcs_1.bcsU64)(BigInt(proposalId)),
             (0, bcs_1.bcsBool)(approve),
+            (0, bcs_1.bcsU128)(amount),
         ]);
         tx.sequenceNumber = sequenceNumber;
         return tx;
     }
     /**
-     * Execute a passed governance proposal (after timelock)
+     * Resolve a passed governance proposal once its voting has ended (a
+     * signal: it records the outcome).
      * Calls: 0x1::governance::execute_proposal(executor, proposal_id)
      */
     static executeProposal(sender, proposalId, sequenceNumber = 0) {
@@ -393,6 +439,20 @@ class Transaction {
         tx.payload = systemCall('governance', 'execute_proposal', [], [
             (0, bcs_1.bcsAddress)(sender.address),
             (0, bcs_1.bcsU64)(BigInt(proposalId)),
+        ]);
+        tx.sequenceNumber = sequenceNumber;
+        return tx;
+    }
+    /**
+     * Take back the AIN of every vote whose proposal's voting has ended,
+     * whatever the outcome (B71).
+     * Calls: 0x1::governance::claim_vote_tokens(voter)
+     */
+    static claimVoteTokens(sender, sequenceNumber = 0) {
+        const tx = new Transaction();
+        tx.sender = sender.address;
+        tx.payload = systemCall('governance', 'claim_vote_tokens', [], [
+            (0, bcs_1.bcsAddress)(sender.address),
         ]);
         tx.sequenceNumber = sequenceNumber;
         return tx;
@@ -414,29 +474,100 @@ class Transaction {
         if (!this.chainId) {
             throw new Error('CRITICAL: Chain ID must be explicitly set to prevent replay attacks');
         }
-        // Include sender, chain ID, and sequence number in signature payload
-        const message = `${this.chainId}:${this.sender}:${this.payload}:${this.sequenceNumber}`;
-        this.signature = signer.sign(Buffer.from(message));
+        // Must match the node byte for byte. Both the mempool gate
+        // (core/mempool/src/lib.rs) and the executor's re-verify
+        // (core/executor/src/lib.rs) rebuild:
+        //   chain_id:sender:payload:sequence_number:gas_limit:gas_price:input_objects
+        // where input_objects is Rust's Vec<String>::join(","), so an empty list
+        // yields the empty string and the message ends with a bare trailing colon.
+        //
+        // This used to sign only the first four fields. Everything built on it
+        // produced signatures the node rejects, because gas_limit, gas_price and
+        // input_objects are bound into the signature (F4) -- leaving them out is
+        // both a malleability hole and, in practice, a total submit failure.
+        // B14: the limit covers the signed JSON's own bytes. Measure it with
+        // placeholders of the final sizes (the key, an Ed25519 signature and,
+        // when a paymaster is set first, its signature), gas_limit 0, and 20
+        // bytes of slack for the limit's own digits.
         this.publicKey = signer.publicKey;
+        this.gasLimit = 0;
+        this.signature = '0'.repeat(128);
+        const pending = this.paymaster !== undefined && this.paymasterSignature === undefined;
+        if (pending)
+            this.paymasterSignature = '0'.repeat(128);
+        const unsized = Buffer.byteLength(this.toString());
+        if (pending)
+            this.paymasterSignature = undefined;
+        this.gasLimit = this.executionGas + exports.BYTE_GAS * (unsized + 20);
+        this.signature = signer.sign(Buffer.from(this.signingMessage()));
     }
     /**
-     * Set Paymaster details
+     * B65: the transaction as `aincore_estimateGas` takes it before signing:
+     * the sender's key, zero signatures of the final length, gas_limit 0.
      */
-    setPaymaster(paymasterAddress, signature) {
-        this.paymaster = paymasterAddress;
+    estimateDraft(publicKey) {
+        const draft = JSON.parse(this.toString());
+        draft.public_key = publicKey;
+        draft.signature = '0'.repeat(128);
+        draft.gas_limit = 0;
+        if (this.paymaster !== undefined && this.paymasterSignature === undefined) {
+            draft.paymaster_signature = '0'.repeat(128);
+        }
+        return draft;
+    }
+    /**
+     * The seven fields the sender signs (F4), as the node rebuilds them, and
+     * for a sponsored transaction an eighth, the paymaster's public key
+     * (B73: a relay could otherwise strip the paymaster and make the sender
+     * pay). Name the paymaster with `setPaymasterKey` before `sign`.
+     */
+    signingMessage() {
+        const fields = [
+            this.chainId,
+            this.sender,
+            this.payload,
+            this.sequenceNumber,
+            this.gasLimit,
+            this.gasPrice,
+            this.inputObjects.join(','),
+        ];
+        // B106: the same condition as `toString`, so an empty paymaster is
+        // neither signed nor sent.
+        if (this.paymaster)
+            fields.push(this.paymaster);
+        return fields.join(':');
+    }
+    /**
+     * Set Paymaster details: the paymaster's PUBLIC KEY (hex) and its
+     * signature. The node pays gas from the address derived from that key
+     * (B13).
+     */
+    setPaymaster(paymasterPublicKey, signature) {
+        this.paymaster = paymasterPublicKey;
         this.paymasterSignature = signature;
     }
     /**
-     * Sign the transaction as a Paymaster (Hardened payload)
-     * Payload: PAYMASTER_AUTH:{chain_id}:{sender}:{payload}:{gas_limit}:{sequence_number}
+     * Sign the transaction as a Paymaster. The signed bytes are
+     * SHA-256("PAYMASTER_AUTH_V2:" + the sender's signing message), so the
+     * paymaster binds every field the sender does, the gas price included
+     * (`executor::admission::paymaster_message`, B28).
      */
+    /**
+     * Name the paymaster before the sender signs, so `sign` counts its
+     * signature's bytes in the gas limit; `signAsPaymaster` signs after.
+     */
+    setPaymasterKey(paymasterPublicKey) {
+        this.paymaster = paymasterPublicKey;
+        this.paymasterSignature = undefined;
+    }
     signAsPaymaster(paymasterKeypair) {
         if (!this.chainId) {
             throw new Error('CRITICAL: Chain ID must be explicitly set to prevent replay attacks');
         }
-        const message = `PAYMASTER_AUTH:${this.chainId}:${this.sender}:${this.payload}:${this.gasLimit}:${this.sequenceNumber}`;
-        const signature = paymasterKeypair.sign(Buffer.from(message));
-        this.setPaymaster(paymasterKeypair.address, signature);
+        const message = `PAYMASTER_AUTH_V2:${this.signingMessage()}`;
+        const digest = (0, crypto_1.createHash)('sha256').update(message).digest();
+        const signature = paymasterKeypair.sign(digest);
+        this.setPaymaster(paymasterKeypair.publicKey, signature);
     }
     /**
      * Convert to JSON string for API

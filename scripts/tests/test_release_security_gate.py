@@ -63,6 +63,36 @@ class GateTests(unittest.TestCase):
         policy["packages"]["executor"]["excluded_ignored"]["tests::gone"] = "not there"
         self.assertFalse(gate.evaluate(policy, self.fake)["passed"])
 
+    def test_missing_stack_witness_is_not_masked_by_passing_vm_tests(self):
+        name = "gas::tests::a_value_at_the_depth_bound_fits_the_vm_stack"
+        self.assertIn(name, self.manifest["packages"]["vm_move"]["required"])
+        policy = copy.deepcopy(self.manifest)
+        # Model the NAS run: other VM tests pass, but this witness is absent.
+        self.manifest["packages"]["vm_move"]["required"].remove(name)
+        report = gate.evaluate(policy, self.fake)
+        self.assertFalse(report["passed"])
+        self.assertTrue(any("missing required tests" in error and name in error
+                            for error in report["errors"]))
+        self.assertTrue(any(w["package"] == "vm_move" and w["passed"]
+                            for w in report["witnesses"]))
+
+    def test_zero_match_stack_witness_fails_even_when_inventory_lists_it(self):
+        name = "gas::tests::a_value_at_the_depth_bound_fits_the_vm_stack"
+        self.assertIn(name, self.manifest["packages"]["vm_move"]["required"])
+
+        def zero_match(command):
+            record = self.fake(command)
+            if "--list" not in command and name in command:
+                record["stdout"] = (
+                    "test result: ok. 0 passed; 0 failed; 0 ignored; 9 filtered out;\n"
+                )
+            return record
+
+        report = gate.evaluate(self.manifest, zero_match)
+        self.assertFalse(report["passed"])
+        self.assertEqual(len(report["errors"]), 1)
+        self.assertIn(name, report["errors"][0])
+
     def test_zero_tests_ignored_failure_and_timeout_never_pass(self):
         name = "tests::witness"
         for stdout, code, timed_out in (

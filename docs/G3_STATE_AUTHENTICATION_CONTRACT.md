@@ -380,6 +380,21 @@ tree is tiny.
     version (`tree_cache.rs:316-323` does not do this).
   - **Pinned versions** (SN-4) are exempt until `T_restore_max` expires.
   - Archive mode keeps everything.
+  - **`R_state` (B460):** the floor is at least `latest − HISTORY_VERSIONS` (1,000
+    versions, `state_commit::HISTORY_VERSIONS`), whatever the block retention. Each
+    changed key leaves ~6 KB of rows (its old value row, its leaf and the stale internal
+    nodes on its path) at the 40 GB design state, so a block at the gas target leaves
+    ~9 MB, ~0.9 TB over a 100,000-block window. Production trees keep history briefly:
+    geth keeps 128 blocks of trie and its full nodes serve no older proof; Aptos's state
+    Merkle pruner keeps 1,000,000 versions. 1,000 blocks (~1.9 h) covers a late QC's
+    root check (RC-3) and a proof at a recent height (PF-3). A snapshot restore names a
+    pinned version (SN-4), which pruning keeps apart from the window.
+  - **History is paid for (B460):** every changed key pays `HISTORY_GAS_PER_KEY` (70,000:
+    7 rows at 10,000 gas, the gas target over the 10,000 rows the default pruner removes
+    per block) plus 5 gas per byte of its old value (the value row, in hex, held 1,100
+    blocks at the body's price of disk). A block at the gas target therefore leaves no
+    more rows than the pruner removes, and its history holds no more disk than its body
+    would (`executor::state_gas`).
 - **GC-2:** Pruning is node-local and never changes a root. S keys are deleted only by
   protocol rules inside CM.
 - **GC-3:** The TA-3 log is never pruned.
@@ -774,7 +789,9 @@ counters, never values.
   same `AINCORE_STORAGE_MODE` / `AINCORE_BLOCK_RETENTION` policy (`archive` never prunes).
   - It runs every 100 blocks (`STATE_PRUNE_EVERY`), bounded to a fixed number of rows
     per call.
-  - Proofs are served exactly as long as blocks are.
+  - Proofs are served for the last `HISTORY_VERSIONS` (1,000) versions and at the pins,
+    not as long as blocks are (B460: `prune` raises the floor to at least
+    `latest − HISTORY_VERSIONS`).
   - Pins come from `state_commit::pin_schedule(tip, keep, epoch_interval)` (SN-4). They
     are epoch boundaries spaced about a quarter window apart over the last two windows.
     The interval is the genesis pin `sys:config:epoch_block_interval`.
@@ -813,9 +830,9 @@ counters, never values.
 - **Witnesses C1′ and C2′, database halves:** an edited flat state key fails RC-2 and names
   the key. A foreign root fails RC-3. So does a QC signed outside the committee, or filed
   under another height. A produced QC over another root is never stored.
-- **Open parameters (founder decision):** the retention window and `T_restore_max`. The
-  defaults follow block retention: 100,000 blocks in full mode and 1,000 in observer mode,
-  with pins kept for two windows.
+- **Open parameters (founder decision):** `T_restore_max`. Pins follow block retention:
+  100,000 blocks in full mode and 1,000 in observer mode, with pins kept for two windows.
+  `R_state` is decided (B460): 1,000 versions, see GC-1.
 
 **S6 status (branch `g3/activation`).** S6a is the library half, S6b the node wiring. There
 were four independent reviews. The findings of the first three are fixed; review 4's
@@ -941,6 +958,9 @@ HIGH is fixed and its MEDIUMs are listed under Open (the review work stopped the
   - Settings: `AINCORE_STATE_SYNC_CHECKPOINT`, `AINCORE_STATE_SYNC_PEERS=ip:port,...` and
     `AINCORE_EXPECTED_GENESIS_HASH`. `AINCORE_STATE_SYNC_REPLACE=1` replaces an older
     chain.
+  - B460: the checkpoint names a pinned version (`pin_schedule`). A server keeps any
+    other version only `HISTORY_VERSIONS` (1,000) blocks, so a restore from one that
+    does not finish in that time is refused part-way (PF-3) and must start again.
   - The restore runs before genesis handling.
   - Nothing is restored on a datadir already restored from the checkpoint, or past it on
     the checkpoint's chain, so on a restored node the settings may stay set. The block at
@@ -1035,8 +1055,10 @@ HIGH is fixed and its MEDIUMs are listed under Open (the review work stopped the
 
 ## Open questions and founder decisions
 
-1. **Retention:** `R_state`, block retention, and `T_restore_max` for pinned versions. These
-   set how long a node can be offline before it needs a snapshot, and the disk cost.
+1. **Retention:** block retention, and `T_restore_max` for pinned versions. These set how
+   long a node can be offline before it needs a snapshot, and the disk cost. `R_state` is
+   decided (B460, GC-1): 1,000 versions, so a restore checkpoint must name a pinned version
+   unless the restore finishes within ~1.9 h of it.
 2. **Checkpoints (TA-0/TA-4):** who signs and publishes them. For a permissioned launch this
    is the operator; later it can be the validator set.
 3. **Governance module upgrades:** remove the path (FX-3; recommended, and in line with the

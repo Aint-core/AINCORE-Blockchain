@@ -81,7 +81,8 @@ pub fn validate_committee(proposed: &[ValidatorInfo]) -> Result<Vec<ValidatorInf
             ));
         }
         let pop_ok = match (hex::decode(&m.bls_public_key), hex::decode(&m.bls_pop)) {
-            (Ok(pk), Ok(pop)) => bls.verify_possession(&pk, &pop).unwrap_or(false),
+            (Ok(pk), Ok(pop)) => hex::decode(&m.ed25519_public_key)
+                .is_ok_and(|owner| bls.verify_possession(&pk, &pop, &owner).unwrap_or(false)),
             _ => false,
         };
         if !pop_ok {
@@ -194,7 +195,7 @@ mod tests {
             stake,
             ed25519_public_key: hex::encode(ed),
             bls_public_key: hex::encode(bls.pubkey_raw(&bls_seed)),
-            bls_pop: hex::encode(bls.prove_possession_raw(&bls_seed)),
+            bls_pop: hex::encode(bls.prove_possession_raw(&bls_seed, &ed)),
         }
     }
 

@@ -33,6 +33,17 @@ const DST_CONSENSUS: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_NUL_AINCOR
 /// vice-versa) and is what closes the rogue-public-key attack at registration.
 const DST_POP: &[u8] = b"BLS_POP_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_AINCORE_V1";
 
+/// B354: what a proof of possession signs: the BLS key's compressed bytes,
+/// then its owner's Ed25519 key, length-prefixed.
+pub fn pop_message(public_key: &[u8], owner: &[u8]) -> Vec<u8> {
+    let mut message = Vec::with_capacity(public_key.len() + 8 + owner.len() + 24);
+    message.extend_from_slice(public_key);
+    message.extend_from_slice(b"AINCORE_POP_OWNER_V1");
+    message.extend_from_slice(&(owner.len() as u64).to_le_bytes());
+    message.extend_from_slice(owner);
+    message
+}
+
 /// BLS errors
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BLSError {
@@ -123,32 +134,44 @@ impl BLSEngine {
         sk.sk_to_pk().compress().to_vec()
     }
 
-    /// Produce a proof-of-possession from raw 32-byte secret material.
-    pub fn prove_possession_raw(&self, sk_bytes: &[u8; 32]) -> Vec<u8> {
+    /// Produce a proof-of-possession from raw 32-byte secret material, for
+    /// the validator whose Ed25519 key is `owner` (B354).
+    pub fn prove_possession_raw(&self, sk_bytes: &[u8; 32], owner: &[u8]) -> Vec<u8> {
         let sk = self.keygen(sk_bytes);
-        self.prove_possession(&sk)
+        self.prove_possession(&sk, owner)
     }
 
-    /// Produce a proof-of-possession for a BLS key.
+    /// Produce a proof-of-possession for a BLS key, held by the validator
+    /// whose Ed25519 key is `owner`.
     ///
-    /// The PoP is a signature over the public key's OWN compressed bytes, under
-    /// the dedicated `DST_POP` (NOT the consensus DST). A verifier accepting this
-    /// PoP at registration is guaranteed the registrant holds the secret key for
-    /// the claimed public key — which is exactly what prevents the rogue-key
-    /// attack on `fast_aggregate_verify`. Independent of `self.dst`, so it behaves
+    /// The PoP is a signature over the public key's OWN compressed bytes and
+    /// (B354) its owner (`pop_message`), under the dedicated `DST_POP` (NOT the
+    /// consensus DST). A verifier accepting this PoP at registration is
+    /// guaranteed the registrant holds the secret key for the claimed public
+    /// key — which is exactly what prevents the rogue-key attack on
+    /// `fast_aggregate_verify`. Independent of `self.dst`, so it behaves
     /// identically regardless of which engine instance produced it.
-    pub fn prove_possession(&self, sk: &blst::min_pk::SecretKey) -> Vec<u8> {
+    pub fn prove_possession(&self, sk: &blst::min_pk::SecretKey, owner: &[u8]) -> Vec<u8> {
         let pk_bytes = sk.sk_to_pk().compress();
-        let sig = sk.sign(&pk_bytes, DST_POP, &[]);
+        let sig = sk.sign(&pop_message(&pk_bytes, owner), DST_POP, &[]);
         sig.compress().to_vec()
     }
 
-    /// Verify a proof-of-possession for a claimed BLS public key.
+    /// Verify a proof-of-possession for a claimed BLS public key, registered
+    /// by the validator whose Ed25519 key is `owner`.
     ///
     /// Returns Ok(true) only if `pop` is a valid signature over `public_key`'s
-    /// own bytes under `DST_POP`. Registration MUST call this and reject any
-    /// validator BLS key whose PoP does not verify.
-    pub fn verify_possession(&self, public_key: &[u8], pop: &[u8]) -> Result<bool, BLSError> {
+    /// own bytes and `owner` under `DST_POP`. Registration MUST call this and
+    /// reject any validator BLS key whose PoP does not verify. B354: a PoP
+    /// that signed the key alone was public once its validator registered, so
+    /// anyone could register the key (and PoP) first under its own account,
+    /// and the owner's join failed for a duplicate BLS key, for good.
+    pub fn verify_possession(
+        &self,
+        public_key: &[u8],
+        pop: &[u8],
+        owner: &[u8],
+    ) -> Result<bool, BLSError> {
         let pk = blst::min_pk::PublicKey::uncompress(public_key)
             .map_err(|e| BLSError::InvalidPublicKey(format!("{:?}", e)))?;
         pk.validate()
@@ -159,8 +182,16 @@ impl BLSEngine {
         sig.validate(false)
             .map_err(|e| BLSError::InvalidSignature(format!("Subgroup check failed: {:?}", e)))?;
 
-        // The PoP message is the public key's own compressed bytes, under DST_POP.
-        let result = sig.verify(false, public_key, DST_POP, &[], &pk, false);
+        // The PoP message is the public key's own compressed bytes and its
+        // owner, under DST_POP.
+        let result = sig.verify(
+            false,
+            &pop_message(public_key, owner),
+            DST_POP,
+            &[],
+            &pk,
+            false,
+        );
         Ok(matches!(result, blst::BLST_ERROR::BLST_SUCCESS))
     }
 
@@ -468,6 +499,140 @@ mod tests {
         (sk, pk.compress().to_vec())
     }
 
+    /// B454 witness: blst is built `portable`, so its machine code does not
+    /// depend on the build host. Without it a host with ADX compiles mulx in
+    /// unconditionally, and that binary would die with SIGILL on a CPU
+    /// without ADX (the NAS's Celeron N5095) at its first BLS operation, the
+    /// boot's key derivation. Latent: no deployment yet runs a binary built
+    /// on another host, but release.yml builds the x86 one on a GitHub
+    /// runner, which has ADX. No run-time check sees the feature: the
+    /// manifest is read.
+    #[test]
+    fn blst_is_built_portable() {
+        let manifest = include_str!("../../Cargo.toml");
+        let blst = manifest
+            .lines()
+            .find(|line| line.starts_with("blst ="))
+            .expect("the crate depends on blst");
+        assert!(blst.contains("features = [\"portable\"]"), "{blst}");
+    }
+
+    /// B454 gate: one verdict on every CPU. blst's field arithmetic is
+    /// assembly that differs by CPU (mulx where ADX exists, mulq where not,
+    /// armv8 on the Pi), and attacker-chosen bytes reach it in block
+    /// execution (a join's proof of possession, conflict evidence) and in
+    /// every certificate. The verdicts are pinned, and a release runs this
+    /// test on each CPU class of the fleet.
+    #[test]
+    fn bls_verdicts_on_edge_inputs_are_pinned_for_every_cpu() {
+        let bls = BLSEngine::consensus();
+        let refused = |verdict: Result<bool, BLSError>| !matches!(verdict, Ok(true));
+        let message = b"b454 corpus";
+        let owner = [7u8; 32];
+        let keys: Vec<(blst::min_pk::SecretKey, Vec<u8>)> = (1..=8).map(make_keypair).collect();
+        let pks: Vec<Vec<u8>> = keys.iter().map(|(_, pk)| pk.clone()).collect();
+        let sigs: Vec<Vec<u8>> = keys.iter().map(|(sk, _)| bls.sign(message, sk)).collect();
+
+        // Honest inputs verify: the refusals below are not vacuous.
+        for ((sk, pk), sig) in keys.iter().zip(&sigs) {
+            assert_eq!(bls.verify(message, sig, pk), Ok(true));
+            let pop = bls.prove_possession(sk, &owner);
+            assert_eq!(bls.verify_possession(pk, &pop, &owner), Ok(true));
+        }
+        let agg = bls.aggregate_signatures(&sigs).unwrap();
+        assert_eq!(bls.fast_aggregate_verify(message, &pks, &agg), Ok(true));
+
+        // Each byte's low bit, and each flag bit of the first byte
+        // (compressed, infinity, sign), flipped.
+        let flips = |bytes: &[u8]| -> Vec<Vec<u8>> {
+            let flip = |i: usize, mask: u8| {
+                let mut bad = bytes.to_vec();
+                bad[i] ^= mask;
+                bad
+            };
+            let low_bits = (0..bytes.len()).map(|i| flip(i, 1));
+            let flags = [0x80u8, 0x40, 0x20].into_iter().map(|flag| flip(0, flag));
+            low_bits.chain(flags).collect()
+        };
+        let (sk, pk) = &keys[0];
+        let sig = &sigs[0];
+        let pop = bls.prove_possession(sk, &owner);
+        for bad in flips(sig) {
+            let verdict = bls.verify(message, &bad, pk);
+            assert!(refused(verdict), "{}", hex::encode(&bad[..]));
+        }
+        for bad in flips(pk) {
+            let verdict = bls.verify(message, sig, &bad);
+            assert!(refused(verdict), "{}", hex::encode(&bad[..]));
+        }
+        for bad in flips(&pop) {
+            let verdict = bls.verify_possession(pk, &bad, &owner);
+            assert!(refused(verdict), "{}", hex::encode(&bad[..]));
+        }
+        let missing_one = bls.fast_aggregate_verify(message, &pks[1..], &agg);
+        assert!(refused(missing_one));
+
+        // Encodings: x = p (the field modulus) and x = 2^381 - 1, neither
+        // reduced; the point at infinity, alone and with a stray bit; and
+        // x = 1..16, off the curve or off the subgroup.
+        let p = [
+            "1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf",
+            "6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaaab",
+        ]
+        .concat();
+        let p = hex::decode(p).unwrap();
+        let g1 = |x: &[u8]| {
+            let mut point = x.to_vec();
+            point[0] |= 0x80;
+            point
+        };
+        let g2 = |x_c1: &[u8]| {
+            let mut point = g1(x_c1);
+            point.extend_from_slice(&[0; 48]);
+            point
+        };
+        let mut all_ones = [0xffu8; 48];
+        all_ones[0] = 0x1f;
+        for x in [&p[..], &all_ones[..]] {
+            assert!(refused(bls.verify(message, sig, &g1(x))));
+            assert!(refused(bls.verify(message, &g2(x), pk)));
+        }
+        let mut infinity = [0u8; 48];
+        infinity[0] = 0xc0;
+        let mut stray = infinity;
+        stray[47] = 1;
+        let mut infinity_sig = [0u8; 96];
+        infinity_sig[0] = 0xc0;
+        let mut stray_sig = infinity_sig;
+        stray_sig[95] = 1;
+        assert!(refused(bls.verify(message, sig, &infinity)));
+        assert!(refused(bls.verify(message, sig, &stray)));
+        assert!(refused(bls.verify(message, &infinity_sig, pk)));
+        assert!(refused(bls.verify(message, &stray_sig, pk)));
+        let infinite_pop = bls.verify_possession(&infinity, &infinity_sig, &owner);
+        assert!(refused(infinite_pop));
+        for x in 1u8..=16 {
+            let mut small = [0u8; 48];
+            small[47] = x;
+            assert!(refused(bls.verify(message, sig, &g1(&small))), "G1 x = {x}");
+            let mut small = [0u8; 96];
+            small[0] = 0x80;
+            small[95] = x;
+            assert!(refused(bls.verify(message, &small, pk)), "G2 x = {x}");
+        }
+
+        // A key and its negation (the sign bit flipped) sum to infinity:
+        // under the infinite signature the pairing equation holds for every
+        // message, and it is refused.
+        let mut negated = pk.clone();
+        negated[0] ^= 0x20;
+        let cancelling = [pk.clone(), negated];
+        for aggregate in [&infinity_sig[..], &sig[..]] {
+            let verdict = bls.fast_aggregate_verify(message, &cancelling, aggregate);
+            assert!(refused(verdict), "{}", hex::encode(aggregate));
+        }
+    }
+
     #[test]
     fn test_sign_and_verify() {
         let bls = BLSEngine::default();
@@ -502,16 +667,24 @@ mod tests {
         let (_sk_b, pk_b) = make_keypair(22);
 
         // Honest PoP for key A verifies against key A.
-        let pop_a = bls.prove_possession(&sk_a);
+        let owner = [5u8; 32];
+        let pop_a = bls.prove_possession(&sk_a, &owner);
         assert!(
-            bls.verify_possession(&pk_a, &pop_a).unwrap(),
+            bls.verify_possession(&pk_a, &pop_a, &owner).unwrap(),
             "honest proof-of-possession must verify"
         );
 
         // A's PoP must NOT verify for a different key B (can't claim another's key).
         assert!(
-            !bls.verify_possession(&pk_b, &pop_a).unwrap(),
+            !bls.verify_possession(&pk_b, &pop_a, &owner).unwrap(),
             "PoP for key A must not verify against key B"
+        );
+
+        // B354 witness: nor for another owner (a copied key and PoP registered
+        // first under another account blocked its owner's join for good).
+        assert!(
+            !bls.verify_possession(&pk_a, &pop_a, &[6u8; 32]).unwrap(),
+            "PoP for owner 5 must not verify for owner 6"
         );
 
         // A tampered PoP must fail (flip a byte in the body, keep it decodable).
@@ -519,7 +692,7 @@ mod tests {
         let last = bad.len() - 1;
         bad[last] ^= 0x01;
         // Either decode/subgroup error (Err) or a clean false — both are rejection.
-        let tampered_ok = bls.verify_possession(&pk_a, &bad).unwrap_or(false);
+        let tampered_ok = bls.verify_possession(&pk_a, &bad, &owner).unwrap_or(false);
         assert!(!tampered_ok, "tampered PoP must not verify");
     }
 
@@ -534,13 +707,13 @@ mod tests {
         // A consensus-DST signature over the pubkey bytes is NOT a valid PoP.
         let consensus_sig_over_pk = bls.sign(&pk_a, &sk_a);
         assert!(
-            !bls.verify_possession(&pk_a, &consensus_sig_over_pk)
+            !bls.verify_possession(&pk_a, &consensus_sig_over_pk, &[5u8; 32])
                 .unwrap_or(false),
             "a consensus-DST signature must NOT be accepted as a proof-of-possession"
         );
 
         // Conversely, a PoP is NOT a valid consensus signature over the pubkey.
-        let pop_a = bls.prove_possession(&sk_a);
+        let pop_a = bls.prove_possession(&sk_a, &[5u8; 32]);
         assert!(
             !bls.verify(&pk_a, &pop_a, &pk_a).unwrap_or(false),
             "a PoP must NOT be accepted as a consensus signature"

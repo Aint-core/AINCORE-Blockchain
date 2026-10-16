@@ -454,6 +454,16 @@ impl CertCollector {
         self.certificate.as_ref()
     }
 
+    /// B359: the staked members whose attestation of this body is not
+    /// counted yet (PR-4 sends the body again to these only).
+    pub fn missing(&self) -> impl Iterator<Item = &str> {
+        self.committee
+            .iter()
+            .enumerate()
+            .filter(|(idx, v)| v.stake > 0 && !self.ours.contains_key(idx))
+            .map(|(_, v)| v.address.as_str())
+    }
+
     /// Signers seen attesting two different digests for this slot, each pair
     /// fully verified: accountable evidence for `ATTEST_EQUIV`.
     pub fn equivocations(&self) -> &[(VertexAttestation, VertexAttestation)] {

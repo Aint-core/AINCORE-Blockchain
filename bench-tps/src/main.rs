@@ -96,6 +96,16 @@ struct Args {
     /// Re-read balances afterwards to report landed-vs-submitted
     #[arg(long, default_value_t = false)]
     verify: bool,
+
+    /// B381: refuse to sign at a gas price above this (quanta a gas); the
+    /// node's price is otherwise shown with the most the run can pay in
+    /// fees, and confirmed
+    #[arg(long)]
+    max_gas_price: Option<u128>,
+
+    /// B381: sign without asking to confirm the fees (for scripts)
+    #[arg(long)]
+    assume_yes: bool,
 }
 
 /// A signing identity plus the address the chain knows it by.
@@ -175,6 +185,21 @@ fn signed_tx(
     execution: u64,
     gas_price: u128,
 ) -> String {
+    let mut tx = unsigned_tx(acct, chain_id, payload, seq, execution, gas_price);
+    let message = executor::admission::signing_message(&tx);
+    tx.signature = hex::encode(acct.key.sign(message.as_bytes()).to_bytes());
+    serde_json::to_string(&tx).expect("a transaction serializes")
+}
+
+/// The transaction `signed_tx` signs, its gas limit set and not yet signed.
+fn unsigned_tx(
+    acct: &Account,
+    chain_id: &str,
+    payload: &str,
+    seq: u64,
+    execution: u64,
+    gas_price: u128,
+) -> executor::Transaction {
     let mut tx = executor::Transaction {
         chain_id: chain_id.to_string(),
         sender: acct.address.clone(),
@@ -194,9 +219,68 @@ fn signed_tx(
         .expect("a transaction serializes")
         .len();
     tx.gas_limit = executor::admission::gas_limit_covering(unsized_len, execution);
-    let message = executor::admission::signing_message(&tx);
-    tx.signature = hex::encode(acct.key.sign(message.as_bytes()).to_bytes());
-    serde_json::to_string(&tx).expect("a transaction serializes")
+    tx
+}
+
+/// B381: the largest gas limit any transfer of this run carries. A
+/// transfer's JSON differs only in its sequence number's digits (addresses,
+/// keys and the BCS amount are fixed length), so the longest one, at
+/// `u64::MAX`, bounds them all.
+fn transfer_gas_bound(acct: &Account, chain_id: &str, execution: u64, gas_price: u128) -> u64 {
+    let payload = transfer_payload(&acct.address, &acct.address, u128::MAX);
+    unsigned_tx(acct, chain_id, &payload, u64::MAX, execution, gas_price).gas_limit
+}
+
+/// B381: the most a run can pay in fees, in quanta: per transaction, for
+/// the funding transfers the funder signs, and for the load transfers the
+/// funded accounts sign (paid out of the AIN the funder sent them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FeeBound {
+    per_tx: u128,
+    funding: u128,
+    load: u128,
+}
+
+/// B381: gas limit x price x the number of transactions signed.
+fn fee_bound(gas_limit: u64, gas_price: u128, funding_txs: usize, load_txs: usize) -> FeeBound {
+    let per_tx = u128::from(gas_limit).saturating_mul(gas_price);
+    FeeBound {
+        per_tx,
+        funding: per_tx.saturating_mul(funding_txs as u128),
+        load: per_tx.saturating_mul(load_txs as u128),
+    }
+}
+
+/// B381: what the funder must hold: the AIN it sends plus the most its own
+/// transfers can pay in fees; `None` past u128 (refused, never wrapped).
+fn funder_needs(fund_amount: u128, accounts: usize, fees: &FeeBound) -> Option<u128> {
+    fund_amount
+        .checked_mul(accounts as u128)?
+        .checked_add(fees.funding)
+}
+
+/// B381: the node's base fee is the RPC's word; a price above
+/// `--max-gas-price` is refused before anything is signed.
+fn check_price(gas_price: u128, max_gas_price: Option<u128>) -> Result<(), String> {
+    match max_gas_price {
+        Some(max) if gas_price > max => Err(format!(
+            "the node's gas price, {gas_price}, is above --max-gas-price {max}: refusing to sign"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// B381: a yes to the fee's question (the CLI's B362 rule).
+fn confirmed(answer: &str) -> bool {
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// B381: ask on stdin; anything but a yes, or no answer, is a no.
+fn ask(question: &str) -> bool {
+    print!("{question} [y/N] ");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer).is_ok() && confirmed(&answer)
 }
 
 /// The node's base fee (B15), the lowest price a transaction may offer.
@@ -397,15 +481,60 @@ async fn main() {
         "Funder bal. : {} base units",
         funder_balance.to_string().bold()
     );
-    let required = args.fund_amount * args.accounts as u128;
+
+    // B381: every transfer was signed at the node's price with no bound, and
+    // the fees were neither shown nor counted in the balance check. Now the
+    // price is bounded by --max-gas-price, the most the run can pay is shown
+    // and confirmed, and the funder must hold its own fees too.
+    // B15: every transaction offers the node's base fee.
+    let price = base_fee(&client, &args.rpc).await;
+    if let Err(e) = check_price(price, args.max_gas_price) {
+        eprintln!("{} {e}", "❌".red());
+        std::process::exit(1);
+    }
+    let gas_bound = transfer_gas_bound(&funder, &chain_id, args.gas_limit, price);
+    let load_txs = args.accounts.saturating_mul(args.per_account);
+    let fees = fee_bound(gas_bound, price, args.accounts, load_txs);
+    println!("Gas price   : {price} quanta per gas (the node's base fee)");
+    println!(
+        "Fees, most  : {} a transaction ({gas_bound} gas at {price})",
+        fees.per_tx
+    );
+    println!(
+        "              funding: {} transfers signed by the funder, at most {}",
+        args.accounts, fees.funding
+    );
+    println!(
+        "              load:    {load_txs} transfers signed by the funded accounts, at most {} \
+         (paid out of the AIN funded)",
+        fees.load
+    );
+    let Some(required) = funder_needs(args.fund_amount, args.accounts, &fees) else {
+        eprintln!(
+            "{} --fund-amount x --accounts plus the funding fees is past u128",
+            "❌".red()
+        );
+        std::process::exit(1);
+    };
     if funder_balance < required {
         eprintln!(
-            "{} funder holds {} but needs {} to fund {} accounts — reduce --accounts or --fund-amount",
+            "{} funder holds {} but needs {} to fund {} accounts (fees included) — reduce --accounts or --fund-amount",
             "❌".red(),
             funder_balance,
             required,
             args.accounts
         );
+        std::process::exit(1);
+    }
+    if !args.assume_yes
+        && !ask(&format!(
+            "Send {} base units to {} new accounts, paying at most {} in fees?",
+            args.fund_amount.saturating_mul(args.accounts as u128),
+            args.accounts,
+            fees.funding.saturating_add(fees.load)
+        ))
+    {
+        eprintln!("{} not submitted", "❌".red());
         std::process::exit(1);
     }
 
@@ -429,9 +558,6 @@ async fn main() {
             .unwrap()
             .progress_chars("#>-"),
     );
-    // B15: every transaction offers the node's base fee.
-    let price = base_fee(&client, &args.rpc).await;
-    println!("base fee: {price} quanta per gas");
     let mut funded = 0usize;
     let mut limited = 0usize;
     for acct in &accounts {
@@ -710,6 +836,45 @@ mod tests {
         assert!(signing_chain(named, "AINCORE-MAINNET-1").is_err());
         assert!(signing_chain(None, "AINCORE-MAINNET-1").is_err());
         assert!(signing_chain(Some(" ".into()), "AINCORE-MAINNET-1").is_err());
+    }
+
+    /// B381 witness: the funder's fees are bounded, shown and counted: a
+    /// node price above --max-gas-price is refused, the bound is gas limit x
+    /// price x transactions, the balance check includes the funding fees,
+    /// and only a yes signs (every transfer was signed at the node's price,
+    /// unbounded and unshown).
+    #[test]
+    fn the_fees_are_bounded_counted_and_confirmed() {
+        assert!(check_price(100, Some(100)).is_ok());
+        assert!(
+            check_price(101, Some(100)).is_err(),
+            "a price past the bound"
+        );
+        assert!(check_price(u128::MAX, None).is_ok(), "no bound named");
+
+        let fees = fee_bound(1_000, 7, 20, 500);
+        assert_eq!(
+            fees,
+            FeeBound {
+                per_tx: 7_000,
+                funding: 140_000,
+                load: 3_500_000,
+            }
+        );
+        assert_eq!(funder_needs(5, 20, &fees), Some(100 + 140_000));
+        assert_eq!(funder_needs(u128::MAX, 2, &fees), None, "never wrapped");
+        let saturated = fee_bound(u64::MAX, u128::MAX, 2, 2);
+        assert_eq!(funder_needs(1, 1, &saturated), None);
+
+        let acct = Account::from_key(SigningKey::from_bytes(&[9u8; 32]));
+        let bound = transfer_gas_bound(&acct, "AINCORE-TESTNET-V4", 1_000_000, 7);
+        let payload = transfer_payload(&acct.address, &acct.address, 1);
+        let real = unsigned_tx(&acct, "AINCORE-TESTNET-V4", &payload, 3, 1_000_000, 7);
+        assert!(real.gas_limit <= bound, "{} > {bound}", real.gas_limit);
+        assert!(bound > 1_000_000, "the byte gas is in the bound");
+
+        assert!(confirmed("y\n") && confirmed(" YES "));
+        assert!(!confirmed("") && !confirmed("n") && !confirmed("yes please"));
     }
 
     /// B268 witness: the sequence number is read from the node's nonce

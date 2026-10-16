@@ -47,6 +47,17 @@ impl Wallet {
         }
     }
 
+    /// B350: an Ed25519 wallet from its secret in hex (a decrypted keystore).
+    pub fn from_ed25519_hex(secret: &str) -> Result<Self> {
+        let bytes: [u8; 32] = hex::decode(secret.trim())
+            .context("the keystore's key is not hex")?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("the keystore's key is not 32 bytes"))?;
+        Ok(Self {
+            key: Key::Ed25519(Box::new(SigningKey::from_bytes(&bytes))),
+        })
+    }
+
     pub fn load_or_create(path: &Path) -> Result<Self> {
         if path.exists() {
             let bytes = fs::read(path).context("Failed to read keyfile")?;
@@ -78,7 +89,8 @@ impl Wallet {
                 .unwrap_or(false);
             if !allow_plain {
                 anyhow::bail!(
-                    "Plaintext wallet.key auto-create disabled in secure mode. Use `aincore-cli keys generate --out-dir <dir>` or set AINCORE_ALLOW_PLAINTEXT_WALLET=1 for local dev."
+                    "no key file at {} (plaintext keys are not made in secure mode): make an encrypted keystore with `aincore-cli keys generate` and sign with `--keystore <file>`, or set AINCORE_ALLOW_PLAINTEXT_WALLET=1 for local dev",
+                    path.display()
                 );
             }
             let wallet = Self::new();

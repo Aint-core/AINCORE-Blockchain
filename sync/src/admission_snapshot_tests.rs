@@ -219,6 +219,55 @@ fn missing_parent_between_precheck_and_execution_must_not_commit() {
     assert_preserved(sync, expected, path);
 }
 
+/// B443 witness: admission reads the stored parent's header alone
+/// (`header_of`), as the import's precheck does (B433). It parsed the whole
+/// parent (up to 512 MiB parted) for every block imported, under the writer
+/// gate. A parent row whose body does not parse, under the parent's own
+/// header, still admits its child.
+#[test]
+fn admission_reads_the_parents_header_alone() {
+    let (sync, parent, path) = fixture("parent_header_alone");
+    assert_eq!(sync.process_blocks(vec![parent.clone()], 0), 1);
+    let executor = executor::Executor::new(sync.storage.clone());
+    let mut block = Block::new_with_roots_at(
+        2,
+        2,
+        parent.header.hash.clone(),
+        vec![],
+        parent.header.proposer_id.clone(),
+        empty_block_root(&sync, 2, 24),
+        executor.receipts_root_for_block(&[]),
+        24,
+        vec!["bc".repeat(32)],
+        vec!["c1".repeat(32)],
+        "bc".repeat(32),
+        vec![],
+    );
+    authenticate_block(&sync, &mut block);
+    drop(executor);
+    let row = serde_json::to_string(&parent).unwrap().replacen(
+        "\"transactions\":[]",
+        "\"transactions\":0",
+        1,
+    );
+    assert!(
+        serde_json::from_str::<Block>(&row).is_err(),
+        "vacuous: the parent's body still parses"
+    );
+    assert_eq!(
+        blockchain::header_of(&row).map(|header| header.hash),
+        Some(parent.header.hash.clone())
+    );
+    sync.storage.save_block_json(1, &row).unwrap();
+    assert_eq!(
+        sync.process_blocks(vec![block], 1),
+        2,
+        "admission parsed the parent's whole body"
+    );
+    let after = rows(&sync.storage);
+    assert_preserved(sync, after, path);
+}
+
 #[test]
 fn held_qc_arriving_after_precheck_is_rechecked() {
     let (mut sync, block, path) = fixture("new_qc");

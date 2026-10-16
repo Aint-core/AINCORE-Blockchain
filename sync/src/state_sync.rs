@@ -158,6 +158,16 @@ pub struct AnchorRequest {
 pub struct AnchorResponse {
     pub block: Option<Block>,
     pub quorum_certificate: Option<QuorumCertificate>,
+    /// B397: the block, when no answer can hold it: its header and proposer's
+    /// signature, its body fetched in shards (`SYNC_SHARD`). `None` from
+    /// older servers.
+    #[serde(default)]
+    pub oversized: Option<crate::OversizedBlock>,
+    /// B418: `BUSY` when the server cannot take the request now (its
+    /// snapshot budget or serving slots are spent), which the client waits
+    /// out within its deadline. `None` from older servers.
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -210,7 +220,7 @@ pub struct ValueResponse {
 pub(crate) const BUSY: &str = "busy";
 const NOT_SERVED: &str = "snapshots not served here";
 /// The units a value part costs: a request and its bytes.
-const PART_UNITS: usize = 1 + VALUE_PART_BYTES / UNIT_BYTES as usize;
+pub(crate) const PART_UNITS: usize = 1 + VALUE_PART_BYTES / UNIT_BYTES as usize;
 /// The values kept for serving parts: at most this many, and this many
 /// bytes in all.
 const VALUE_CACHE_ENTRIES: usize = 4;
@@ -468,7 +478,7 @@ impl Admission<'_> {
     /// Charge `bytes` sent or read, on top of what was granted, but never
     /// more than one second's worth for a client: a bucket in debt waits a
     /// second at most, so one costly request cannot lock a client out.
-    fn charge(&self, bytes: u64) {
+    pub(crate) fn charge(&self, bytes: u64) {
         let units = (bytes.div_ceil(UNIT_BYTES) as f64).min(STATE_SERVE_UNITS_PER_SEC_PER_CLIENT);
         let mut st = self.budget.lock();
         if self.from_kept {
@@ -520,27 +530,72 @@ impl Drop for Admission<'_> {
 }
 
 impl ChainSync {
-    /// Serve the block and QC at a height, straight from storage.
+    /// `serve_state_anchor_as` for an in-process caller.
+    pub fn handle_state_anchor(&self, req: AnchorRequest) -> AnchorResponse {
+        self.serve_state_anchor_as(req, None, false)
+    }
+
+    /// Serve the block and QC at a height, straight from storage, to `peer`.
     /// B299: answered only by a node that serves snapshots, for a version
     /// it retains (what a restore anchors on), and a block a batch could not
     /// hold is not parsed for it. Every node read, parsed and re-serialized
     /// any height's block for anyone, a missed instance of B275's class.
-    pub fn handle_state_anchor(&self, req: AnchorRequest) -> AnchorResponse {
-        let none = AnchorResponse {
-            block: None,
-            quorum_certificate: None,
-        };
+    /// B324: a block known to be served in parts is not read, and any other
+    /// read is admitted on the snapshot budget and charged its bytes (it read
+    /// a whole block, up to 512 MiB, for about one token); one found too
+    /// large for a batch is known from then on.
+    /// B397: such a block is named with its QC (`AnchorResponse::oversized`),
+    /// and its body served in shards. It was answered with nothing, so no
+    /// node could restore at a checkpoint whose block was over a batch.
+    pub fn serve_state_anchor_as(
+        &self,
+        req: AnchorRequest,
+        peer: Option<&str>,
+        kept: bool,
+    ) -> AnchorResponse {
         if !self.serves_snapshots || self.state_servable(req.height).is_err() {
-            return none;
+            return AnchorResponse::default();
         }
-        let read = |key: String| self.storage.get(&key).ok().flatten();
-        AnchorResponse {
-            block: read(format!("block_{}", req.height))
-                .filter(|json| json.len() <= self.batch_bytes)
-                .and_then(|json| serde_json::from_str(&json).ok()),
-            quorum_certificate: read(format!("consensus:qc:{}", req.height))
-                .and_then(|json| serde_json::from_str(&json).ok()),
-        }
+        // B470: known only while this node may still hold it.
+        let known = self.known_oversized(req.height, true);
+        // A block known to be parted is not read: only its QC is.
+        let units = if known.is_some() { 1 } else { PART_UNITS };
+        // B418: a refusal for budget or slots is busy, not an empty answer
+        // (which the client counts against `max_failures`, ~4.5 minutes).
+        let Some(admission) = self.state_budget.admit_all(peer, units, kept) else {
+            return AnchorResponse {
+                error: Some(BUSY.into()),
+                ..Default::default()
+            };
+        };
+        blocking(|| {
+            let read = |key: String| self.storage.get(&key).ok().flatten();
+            let qc = read(format!("consensus:qc:{}", req.height));
+            admission.charge(qc.as_ref().map_or(0, |json| json.len() as u64));
+            let quorum_certificate = qc.and_then(|json| serde_json::from_str(&json).ok());
+            if let Some(big) = known {
+                return AnchorResponse {
+                    block: None,
+                    quorum_certificate,
+                    oversized: Some(big),
+                    error: None,
+                };
+            }
+            let block = read(format!("block_{}", req.height));
+            admission.charge(block.as_ref().map_or(0, |json| json.len() as u64));
+            let (block, oversized) = match block {
+                Some(json) if json.len() > self.batch_bytes => {
+                    (None, self.learn_oversized(req.height, json))
+                }
+                json => (json.and_then(|json| serde_json::from_str(&json).ok()), None),
+            };
+            AnchorResponse {
+                block,
+                quorum_certificate,
+                oversized,
+                error: None,
+            }
+        })
     }
 
     /// Judged under the retention this node prunes with, so it serves
@@ -569,6 +624,7 @@ impl ChainSync {
     /// read once, up to the first that does not fit. Charged a unit per leaf
     /// served and per `UNIT_BYTES` read (at most one second's worth), under
     /// the global and the client's budget; the reads off the shared workers.
+    /// B471: no more bytes are read than the grant pays for, but one leaf.
     /// `kept`: a kept client (B131, B178: a reserved peer).
     pub fn serve_state_chunk_as(
         &self,
@@ -603,6 +659,8 @@ impl ChainSync {
         blocking(|| {
             let mut budget = ChunkBudget::new(state_commit::MAX_RANGE_PROOF_BYTES);
             let (mut read, mut refused) = (0u64, false);
+            // B471: the bytes the grant pays for, at `UNIT_BYTES` a unit.
+            let readable = (admission.granted as u64).saturating_mul(UNIT_BYTES);
             // A value too large to travel inline is only measured: its bytes
             // are not held while the chunk is built.
             let mut entries = Vec::new();
@@ -614,6 +672,16 @@ impl ChainSync {
                 |key, value| {
                     let len = value.len() as u64;
                     read += len;
+                    // B471: the chunk ends before a leaf whose value takes
+                    // the bytes read past what the grant pays for (the first
+                    // leaf is always taken). Each value is read whole, a
+                    // parted one only measured, and a read is charged at
+                    // most one client-second (`Admission::charge`), so one
+                    // chunk read up to 512 MiB and one more leaf for 8 MiB's
+                    // charge: about 64 times the client's share of the disk.
+                    if !entries.is_empty() && read > readable {
+                        return false;
+                    }
                     refused = !budget.take(&key, len);
                     if !refused {
                         entries.push(WireEntry {
@@ -736,11 +804,14 @@ pub struct Patience {
     /// One request's limit over TCP.
     pub request_timeout: Duration,
     /// The slowest a peer may send a value's parts before it counts as not
-    /// answering: this many bytes a second, after `request_timeout`.
+    /// answering: this many bytes a second, after `request_timeout` (B463:
+    /// of the bytes its turn brought, over the whole turn, `Pace`).
     pub min_bytes_per_sec: u64,
     /// A turn that takes longer than this must deliver at least
     /// `MIN_TURN_UNITS_PER_SEC`, or its peer sits out turns: a peer that
     /// trickles valid chunks, or stalls before saying busy, loses its turns.
+    /// B463: and owes its time past what it delivered, a turn sat out for
+    /// each `slow_turn` of it (`PeerSet`).
     pub slow_turn: Duration,
     /// The whole restore's limit.
     pub deadline: Duration,
@@ -802,13 +873,26 @@ pub struct Restored {
 /// does the chain data and consensus view of the old chain. The signing
 /// guards and the proposal round stay (SN-6), and so do node-local rows and
 /// the transition log.
+/// B395: a restore is a guard loss (G1 RC-3): `consensus:guard_origin` and
+/// the resume point go, so the next boot abstains from a fresh resume point
+/// until an epoch that begins after it. The origin stayed while the V4
+/// producer guards (`consensus:vproposed*`, B282) went, so a node restored
+/// under a validator key the restored state does not record (SN-6 cannot
+/// see it) booted with continuous guards and none of its proposals. Those
+/// guards now stay, like the attestation and QC signing guards.
 fn cleared_by_restore(key: &[u8]) -> bool {
     match classify(key) {
         Some(KeyClass::State | KeyClass::Chain | KeyClass::Tree | KeyClass::Dead) => true,
         Some(KeyClass::Local) => {
             !(key.starts_with(b"consensus:qc_signing:")
                 || key.starts_with(b"consensus:vattest:")
+                || key.starts_with(b"consensus:vproposed:")
+                || key.starts_with(b"consensus:vproposed_high:")
                 || key == b"latest_proposed_round")
+        }
+        Some(KeyClass::Node) => {
+            key == b"consensus:guard_origin"
+                || key == consensus::v4::epoch::GUARD_RESUME_KEY.as_bytes()
         }
         _ => false,
     }
@@ -852,42 +936,355 @@ fn clear(storage: &Arc<StateDB>) -> Result<(), String> {
     }
 }
 
-/// The block and QC match the checkpoint, and each other, and the block is
-/// internally whole. The QC's signature and the block's proposer signature
-/// are checked after the restore.
-fn check_anchor(cp: &Checkpoint, block: &Block, qc: &QuorumCertificate) -> Result<(), String> {
-    let h = &block.header;
+#[cfg(test)]
+thread_local! {
+    /// B398 witness support: the bodies `check_anchor` checked against
+    /// their header (a Reed-Solomon extension each) on this thread.
+    static COMMITMENT_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The header and QC match the checkpoint, and each other, except for the
+/// anchor, which the body carries.
+fn check_anchor_header(
+    cp: &Checkpoint,
+    h: &blockchain::BlockHeader,
+    qc: &QuorumCertificate,
+) -> Result<(), String> {
     if h.height != cp.height
         || !h.hash.eq_ignore_ascii_case(&cp.block_hash)
         || !h.state_root.eq_ignore_ascii_case(&cp.state_root)
     {
         return Err("the block is not the checkpoint's".into());
     }
-    block
-        .check_commitments()
-        .map_err(|e| format!("the block's header does not commit to its body: {e}"))?;
     if qc.block_height != h.height
         || qc.block_hash != h.hash
         || qc.state_root != h.state_root
         || qc.receipts_root != h.receipts_root
         || qc.anchor_round != h.round
-        || qc.anchor_hash != block.anchor_hash
     {
         return Err("the QC is not for the checkpoint's block".into());
     }
     Ok(())
 }
 
-type Pair = (Block, QuorumCertificate);
+/// The block and QC match the checkpoint, and each other, and the block is
+/// internally whole. The QC's signature and the block's proposer signature
+/// are checked after the restore.
+/// B398: the cheap comparisons and the anchor binding (G0) first, the body's
+/// roots last. Only the DA root covers `anchor_hash`, and it ran first: a
+/// peer padding the anchor (and its QC's) cost a whole extension a round
+/// (B275's class).
+fn check_anchor(cp: &Checkpoint, block: &Block, qc: &QuorumCertificate) -> Result<(), String> {
+    check_anchor_header(cp, &block.header, qc)?;
+    if qc.anchor_hash != block.anchor_hash {
+        return Err("the QC is not for the checkpoint's block".into());
+    }
+    check_body(block)
+}
+
+/// `check_anchor`'s checks of the block alone: its anchor is bound (G0) and
+/// its header commits to its body.
+/// B401: a parted block's body runs them once, when its last shard proves,
+/// not once for each answer that names it.
+fn check_body(block: &Block) -> Result<(), String> {
+    if !block.anchor_is_bound() {
+        return Err(format!(
+            "the block's anchor {} is not its last committed vertex",
+            block.anchor_hash.chars().take(80).collect::<String>()
+        ));
+    }
+    #[cfg(test)]
+    COMMITMENT_CHECKS.with(|n| n.set(n.get() + 1));
+    block
+        .check_commitments()
+        .map_err(|e| format!("the block's header does not commit to its body: {e}"))
+}
+
+/// A candidate anchor: the checkpoint's block as one answer signed it, and
+/// that answer's QC. A pair stays together: the block stored is the one
+/// whose own QC verifies.
+/// B401: every pair's header and body are the checkpoint's (its hash pins
+/// the one, the header's roots the other), so the pairs share one copy
+/// (`body`), each with its own signature beside it, and the whole block is
+/// built only for the pair that verifies. Each pair held a whole copy, up to
+/// 512 MiB of text for a parted block, for the whole download: a copy for
+/// every answering peer, and one more.
+#[derive(Debug, Clone)]
+struct Pair {
+    /// The checkpoint's block. Its own signature is not this pair's.
+    body: Arc<Block>,
+    proposer_signature: String,
+    proposer_signer: String,
+    qc: QuorumCertificate,
+}
+
+impl Pair {
+    /// What this pair's signature covers (the header's hash), with no body.
+    fn signed_header(&self) -> Block {
+        Block {
+            header: self.body.header.clone(),
+            transactions: Vec::new(),
+            committed_vertices: Vec::new(),
+            committed_authors: Vec::new(),
+            anchor_hash: String::new(),
+            proposer_signature: self.proposer_signature.clone(),
+            proposer_signer: self.proposer_signer.clone(),
+            slash_evidence: Vec::new(),
+        }
+    }
+
+    /// The whole block under this pair's signature, and its QC. The body is
+    /// taken over when nothing else holds it, and copied otherwise.
+    fn into_block(self) -> (Block, QuorumCertificate) {
+        let body = Arc::try_unwrap(self.body).unwrap_or_else(|body| Block::clone(&body));
+        let block = Block {
+            proposer_signature: self.proposer_signature,
+            proposer_signer: self.proposer_signer,
+            ..body
+        };
+        (block, self.qc)
+    }
+}
+
+/// B401: the anchor block's body for the whole restore: the one shard fetch
+/// every peer's turn extends, round after round (a proved shard is valid
+/// whoever served it), then the one copy every pair shares. The fetch was
+/// one `fetch_anchor_body` call's own: an ask error, or a busy answer past
+/// one request timeout, threw away every shard it had proved.
+#[derive(Default)]
+struct AnchorBody {
+    fetch: Option<crate::ShardFetch>,
+    body: Option<Arc<Block>>,
+}
+
+impl AnchorBody {
+    /// The body every pair shares: the one held, else `block`'s, checked
+    /// whole (`check_body`). The fetch's shards go.
+    fn share(&mut self, block: Block) -> Arc<Block> {
+        self.fetch = None;
+        Arc::clone(self.body.get_or_insert_with(|| Arc::new(block)))
+    }
+}
+
+/// B401: how one peer's turn at the anchor body went.
+#[derive(Default)]
+struct BodyTurn {
+    /// It proved a shard.
+    proved: bool,
+    /// Its peer was still busy when the turn's time ran out.
+    busy: bool,
+    /// Why it ended before the body was whole.
+    why: Option<String>,
+}
+
+/// B397: an anchor block too large for one answer may be fetched: its
+/// header hashes to itself (so its DA root is the one the checkpoint's hash
+/// pins) and, with its QC, is the checkpoint's.
+fn check_named_anchor(
+    cp: &Checkpoint,
+    big: &crate::OversizedBlock,
+    qc: &QuorumCertificate,
+) -> Result<(), String> {
+    if big.height != cp.height {
+        return Err(format!(
+            "a parted block #{} named for #{}",
+            big.height, cp.height
+        ));
+    }
+    if blockchain::calculate_header_hash(&big.header) != big.header.hash {
+        return Err("a parted block's header that does not hash to its hash".into());
+    }
+    check_anchor_header(cp, &big.header, qc)
+}
+
+/// B397: the body of the anchor block `big` names, as its DA data shards
+/// from `peer` (`SYNC_SHARD`, the path a parted block takes in sync, B319),
+/// each verified under the header's DA root when its last piece arrives.
+/// The checkpoint's block hash pins that root, so no other body proves.
+/// B401: one turn of the restore's one fetch (`anchor`). A turn that ends
+/// short (no answer, a refusal, a peer too slow or still busy, a lie) keeps
+/// every shard proved for any peer's next turn, and its peer's unfinished
+/// shard unless the peer lied (B387). The body's own checks (`check_body`)
+/// run once, when its last shard proves. `Err` only when they fail: no other
+/// body proves under the checkpoint, so none can be fetched.
+async fn fetch_anchor_body<F, Fut>(
+    ask: &mut F,
+    peer: usize,
+    big: &crate::OversizedBlock,
+    patience: &Patience,
+    anchor: &mut AnchorBody,
+) -> Result<BodyTurn, String>
+where
+    F: FnMut(usize, String) -> Fut,
+    Fut: Future<Output = Result<String, String>>,
+{
+    let fetch = anchor
+        .fetch
+        .get_or_insert_with(|| crate::ShardFetch::new(big.clone()));
+    let mut turn = BodyTurn::default();
+    let Some(block) = shard_turn(ask, peer, fetch, patience, &mut turn).await else {
+        return Ok(turn);
+    };
+    let block = block
+        .and_then(|block| check_body(&block).map(|()| block))
+        .map_err(|e| format!("the checkpoint's block, as its shards prove it: {e}"))?;
+    anchor.share(block);
+    Ok(turn)
+}
+
+/// B401: `peer`'s turn at the shards `fetch` still misses. Busy answers are
+/// waited out while pieces keep coming: one per request timeout, and past
+/// the first request timeout at `min_bytes_per_sec` of the bytes received
+/// (not of the length claimed, which a liar could inflate). `Some` once
+/// every data shard is in: the body they make. `None`: the turn ended
+/// short, as `turn` says.
+async fn shard_turn<F, Fut>(
+    ask: &mut F,
+    peer: usize,
+    fetch: &mut crate::ShardFetch,
+    patience: &Patience,
+    turn: &mut BodyTurn,
+) -> Option<Result<Block, String>>
+where
+    F: FnMut(usize, String) -> Fut,
+    Fut: Future<Output = Result<String, String>>,
+{
+    let budget = crate::parted_body_budget(crate::MAX_PARTED_BLOCK_BYTES);
+    let key = peer.to_string();
+    let height = fetch.big.height;
+    let da_root = fetch.big.header.da_root.clone();
+    let started = Instant::now();
+    let mut received = 0u64;
+    let mut progress = Instant::now();
+    let mut busy = 0usize;
+    'shards: loop {
+        if let Some(block) = fetch.block() {
+            return Some(block);
+        }
+        // B401: this peer's unfinished shard from its last turn (B387), else
+        // (B415) a shard no other peer's unfinished one covers (B423: shard 0
+        // until a shard proves the length).
+        let (index, mut shard, mut claimed) = fetch.turn_shard(&key);
+        // Why the turn ends short, and whether the peer's unfinished shard
+        // is kept for its next turn (not after a lie).
+        let (why, keep): (String, bool) = loop {
+            let paced = patience.request_timeout
+                + Duration::from_secs(received / patience.min_bytes_per_sec.max(1));
+            if progress.elapsed() > patience.request_timeout || started.elapsed() > paced {
+                // B401: a peer still busy ends its turn, not the fetch.
+                turn.busy = busy > 0;
+                let why = if turn.busy {
+                    "busy past a request timeout"
+                } else {
+                    "shard pieces too slow"
+                };
+                break (why.into(), true);
+            }
+            let request = match serde_json::to_string(&crate::ShardRequest {
+                height,
+                index,
+                offset: shard.len() as u64,
+            }) {
+                Ok(request) => request,
+                Err(e) => break (e.to_string(), true),
+            };
+            let answer = match ask(peer, format!("{}{request}", crate::SHARD_REQ)).await {
+                Ok(answer) => answer,
+                Err(e) => break (e, true),
+            };
+            let Some(piece) = answer
+                .strip_prefix(crate::SHARD_RESP)
+                .and_then(|json| serde_json::from_str::<crate::ShardResponse>(json).ok())
+            else {
+                break ("a garbled shard piece".into(), false);
+            };
+            match piece.error.as_deref() {
+                Some(BUSY) => {
+                    busy += 1;
+                    tokio::time::sleep(patience.backoff(busy, 1).min(PART_BUSY_WAIT)).await;
+                    continue;
+                }
+                Some(e) => break (format!("a shard refused: {e}"), true),
+                None => {}
+            }
+            busy = 0;
+            progress = Instant::now();
+            // As `fetch_sharded_block` takes them: a piece of any length up
+            // to its shard's end, of a body no larger than a fetch holds and
+            // of the length a verified shard proved.
+            let layout = da::Layout::of(piece.body_len);
+            let due = layout.shard_size.saturating_sub(shard.len() as u64);
+            let data = hex::decode(&piece.data)
+                .ok()
+                .filter(|d| !d.is_empty() && d.len() as u64 <= due);
+            let fits = piece.index == index
+                && piece.offset == shard.len() as u64
+                && piece.body_len > 0
+                && piece.body_len <= budget
+                && index < layout.data_shards
+                && claimed.is_none_or(|len| len == piece.body_len);
+            let (true, Some(data)) = (fits, data) else {
+                break (
+                    format!(
+                        "a piece of shard {} at {} of a {}-byte body, where up to {due} bytes of shard {index} at {} were due",
+                        piece.index,
+                        piece.offset,
+                        piece.body_len,
+                        shard.len()
+                    ),
+                    false,
+                );
+            };
+            claimed = Some(piece.body_len);
+            received = received.saturating_add(data.len() as u64);
+            shard.extend_from_slice(&data);
+            if (shard.len() as u64) < layout.shard_size {
+                continue;
+            }
+            let sample = da::Sample {
+                body_len: piece.body_len,
+                index,
+                shard: hex::encode(&shard),
+                proof: piece.proof,
+            };
+            if let Err(e) = da::verify_sample(&da_root, index, &sample) {
+                break (
+                    format!(
+                        "data shard {index} does not prove under the checkpoint's DA root: {e:?}"
+                    ),
+                    false,
+                );
+            }
+            fetch.accept(layout, index, shard);
+            turn.proved = true;
+            continue 'shards;
+        };
+        if keep {
+            fetch.keep_partial(&key, index, shard, claimed);
+        }
+        turn.why = Some(why);
+        return None;
+    }
+}
 
 /// Every distinct (block, QC) pair the peers hold for the checkpoint, asked
 /// again, round after round, until one is found. A pair stays together: the
 /// block stored is the one whose own QC verifies.
+/// B397: an anchor block too large for one answer comes with its header,
+/// proposer's signature and QC; its body is fetched in shards.
+/// B401: the body is fetched once for the whole restore and held in
+/// `anchor`, which every pair shares. A round whose turns proved a shard, or
+/// found a peer still busy (B418: or a peer answering the anchor busy), is
+/// waited out within the restore's deadline (counted from `started`), not
+/// against `max_failures`: such a turn ended in an error, and its shards were
+/// lost with it.
 async fn fetch_anchor<F, Fut>(
     cp: &Checkpoint,
     peers: usize,
     ask: &mut F,
     patience: &Patience,
+    anchor: &mut AnchorBody,
+    started: Instant,
 ) -> Result<Vec<Pair>, String>
 where
     F: FnMut(usize, String) -> Fut,
@@ -895,41 +1292,131 @@ where
 {
     let request =
         serde_json::to_string(&AnchorRequest { height: cp.height }).map_err(|e| e.to_string())?;
-    for round in 0..patience.max_failures.max(1) {
+    let (mut failures, mut waits) = (0usize, 0usize);
+    loop {
         let mut pairs: Vec<Pair> = Vec::new();
-        let mut seen: Vec<String> = Vec::new();
+        // B401: the answers that name a parted block (peer, signature,
+        // signer, QC), a pair each once its body is whole, even when a later
+        // peer's turn completes it.
+        let mut named: Vec<(usize, String, String, QuorumCertificate)> = Vec::new();
+        let (mut proved, mut waited) = (false, false);
         for peer in 0..peers {
             let Ok(reply) = ask(peer, format!("{ANCHOR_REQ}{request}")).await else {
                 continue;
             };
-            let Some(anchor) = reply
+            let Some(answer) = reply
                 .strip_prefix(ANCHOR_RESP)
                 .and_then(|json| serde_json::from_str::<AnchorResponse>(json).ok())
             else {
                 continue;
             };
-            let (Some(block), Some(qc)) = (anchor.block, anchor.quorum_certificate) else {
-                continue;
-            };
-            if let Err(e) = check_anchor(cp, &block, &qc) {
-                eprintln!("⚠️ [STATE_SYNC] peer {peer}: {e}");
+            // B418: a peer busy now is waited out within the deadline, as a
+            // busy shard server is (B401): taken for no answer, a server's
+            // spent quota ended the restore after `max_failures` rounds.
+            if answer.error.as_deref() == Some(BUSY) {
+                waited = true;
                 continue;
             }
-            let id = serde_json::to_string(&(&block, &qc)).map_err(|e| e.to_string())?;
+            match (answer.block, answer.oversized, answer.quorum_certificate) {
+                (Some(block), _, Some(qc)) => {
+                    if let Err(e) = check_anchor(cp, &block, &qc) {
+                        // B466: cut, as every refusal of a peer's text.
+                        crate::log_line(format!(
+                            "⚠️ [STATE_SYNC] peer {peer}: {}",
+                            crate::loggable(&e)
+                        ));
+                        continue;
+                    }
+                    // B401: its body is the checkpoint's: the one held, if
+                    // any, is shared instead.
+                    let proposer_signature = block.proposer_signature.clone();
+                    let proposer_signer = block.proposer_signer.clone();
+                    pairs.push(Pair {
+                        body: anchor.share(block),
+                        proposer_signature,
+                        proposer_signer,
+                        qc,
+                    });
+                }
+                (None, Some(big), Some(qc)) => {
+                    if let Err(e) = check_named_anchor(cp, &big, &qc) {
+                        crate::log_line(format!(
+                            "⚠️ [STATE_SYNC] peer {peer}: {}",
+                            crate::loggable(&e)
+                        ));
+                        continue;
+                    }
+                    if anchor.body.is_none() {
+                        let turn =
+                            fetch_anchor_body(&mut *ask, peer, &big, patience, anchor).await?;
+                        proved |= turn.proved;
+                        waited |= turn.proved || turn.busy;
+                        // B466: a shard refusal carries the peer's own text.
+                        if let Some(why) = turn.why {
+                            crate::log_line(format!(
+                                "⚠️ [STATE_SYNC] peer {peer}: the anchor block's shards: {}",
+                                crate::loggable(&why)
+                            ));
+                        }
+                    }
+                    named.push((peer, big.proposer_signature, big.proposer_signer, qc));
+                }
+                _ => continue,
+            }
+        }
+        if let Some(body) = &anchor.body {
+            for (peer, proposer_signature, proposer_signer, qc) in named {
+                // The rest of `check_anchor`: the header and QC were checked
+                // with the name, the body once, when it was whole.
+                if qc.anchor_hash != body.anchor_hash {
+                    eprintln!(
+                        "⚠️ [STATE_SYNC] peer {peer}: the QC is not for the checkpoint's block"
+                    );
+                    continue;
+                }
+                pairs.push(Pair {
+                    body: Arc::clone(body),
+                    proposer_signature,
+                    proposer_signer,
+                    qc,
+                });
+            }
+        }
+        // B397: past the checks every pair holds the checkpoint's header and
+        // body (each root checked under the pinned hash), so a pair is its
+        // signature and QC: a block of up to 512 MiB was serialized to
+        // compare each answer.
+        let mut seen: Vec<String> = Vec::new();
+        let mut distinct: Vec<Pair> = Vec::new();
+        for pair in pairs {
+            let id =
+                serde_json::to_string(&(&pair.proposer_signature, &pair.proposer_signer, &pair.qc))
+                    .map_err(|e| e.to_string())?;
             if !seen.contains(&id) {
                 seen.push(id);
-                pairs.push((block, qc));
+                distinct.push(pair);
             }
         }
-        if !pairs.is_empty() {
-            return Ok(pairs);
+        if !distinct.is_empty() {
+            return Ok(distinct);
         }
-        tokio::time::sleep(patience.backoff(round + 1, 1)).await;
+        if proved {
+            failures = 0;
+        }
+        if waited && started.elapsed() <= patience.deadline {
+            waits += 1;
+            tokio::time::sleep(patience.backoff(waits, 1).min(PART_BUSY_WAIT)).await;
+            continue;
+        }
+        failures += 1;
+        if failures >= patience.max_failures.max(1) {
+            return Err(format!(
+                "no peer holds block {} and its QC as the checkpoint names them",
+                cp.height
+            ));
+        }
+        tokio::time::sleep(patience.backoff(failures, 1)).await;
     }
-    Err(format!(
-        "no peer holds block {} and its QC as the checkpoint names them",
-        cp.height
-    ))
 }
 
 fn short(value: &str) -> &str {
@@ -1006,6 +1493,10 @@ fn restored_committee(
 /// any epoch it retains, or in the active set. It cannot tell about a chain
 /// it has not seen: a key that joined after the checkpoint is not in a
 /// restored state (G1 RC-3 covers that case; see the contract).
+/// B395: on V4, C_E past epoch 0 is E's own record, which is no state: a
+/// restored state holds none, so only the genesis committee and the active
+/// set were seen. The executor's record of C_E (`recorded_committee`) is
+/// state, and is read too.
 pub fn recorded_validator(storage: &StateDB, key: &str) -> bool {
     let current = storage
         .get("consensus:epoch")
@@ -1013,27 +1504,38 @@ pub fn recorded_validator(storage: &StateDB, key: &str) -> bool {
         .flatten()
         .and_then(|e| e.parse::<u64>().ok())
         .unwrap_or(0);
+    let v4 = consensus::v4::is_v4_chain(storage);
+    let holds = |set: Option<Vec<consensus::qc::ValidatorInfo>>| {
+        set.is_some_and(|set| set.iter().any(|v| v.address == key))
+    };
     (0..=current).rev().take(64).any(|epoch| {
-        consensus::qc_producer::load_validator_set_for_epoch(storage, epoch)
-            .is_some_and(|set| set.iter().any(|v| v.address == key))
+        let set = consensus::qc_producer::load_validator_set_for_epoch(storage, epoch);
+        holds(set) || (v4 && holds(consensus::v4::epoch::recorded_committee(storage, epoch)))
     }) || storage
         .get_active_validators()
         .iter()
         .any(|(address, _)| address == key)
 }
 
-/// Whether `signer` may sign the checkpoint's block: a validator of the
-/// checkpoint epoch's committee, or of the restored active set.
+/// Whether `signer` may sign the checkpoint's block, by the rule sync checks
+/// a block's signer by (`ChainSync::eligible_proposers`): on V4 a member of
+/// the checkpoint epoch's committee C_E(h) (G1 DE-7); on V3 a validator of
+/// that committee or of the restored active set.
+/// B472: on V4 the restored active set was accepted too (up to 1,000 keys,
+/// against a committee of at most 256): a pair one of its keys outside C_E
+/// signed was stored, and the restored node could never serve its block to
+/// a block-syncing client, which refuses that signer.
 fn signed_by_a_validator(
     storage: &StateDB,
     committee: &[consensus::qc::ValidatorInfo],
     signer: &str,
 ) -> bool {
     committee.iter().any(|v| v.address == signer)
-        || storage
-            .get_active_validators()
-            .iter()
-            .any(|(address, _)| address == signer)
+        || (!consensus::v4::is_v4_chain(storage)
+            && storage
+                .get_active_validators()
+                .iter()
+                .any(|(address, _)| address == signer))
 }
 
 /// The first pair whose QC the committee signed under this chain id, and
@@ -1042,13 +1544,14 @@ fn signed_by_a_validator(
 fn verified_pair(
     storage: &StateDB,
     chain_id: &str,
+    genesis_identity: &str,
     epoch: u64,
     committee: &[consensus::qc::ValidatorInfo],
     pairs: &[Pair],
 ) -> Result<Pair, String> {
     let mut last_error = String::from("no QC");
-    for (block, qc) in pairs {
-        let signer = &block.proposer_signer;
+    for pair in pairs {
+        let (signer, qc) = (&pair.proposer_signer, &pair.qc);
         if !signed_by_a_validator(storage, committee, signer) {
             last_error = format!("block signer {signer} is not a validator");
             continue;
@@ -1057,17 +1560,24 @@ fn verified_pair(
             last_error = format!("QC epoch {} is not the restored epoch {epoch}", qc.epoch);
             continue;
         }
-        if let Err(e) = consensus::qc::verify_qc(qc, committee, chain_id) {
+        // B345: under the genesis the checkpoint names (boot installs the
+        // domain only after the restore).
+        if let Err(e) = consensus::qc::verify_qc_under(qc, committee, chain_id, genesis_identity) {
             last_error = format!("{e:?}");
             continue;
         }
-        match ChainSync::verify_proposer_signature_in(storage, block) {
-            Ok(()) => return Ok((block.clone(), qc.clone())),
+        // B401: the signature covers the header's hash, checked with no
+        // body: the whole block is built for the pair that verifies only.
+        match ChainSync::verify_proposer_signature_in(storage, &pair.signed_header()) {
+            Ok(()) => return Ok(pair.clone()),
             Err(e) => last_error = e,
         }
     }
+    // B466: the last refusal echoes what a peer sent (its signer, its QC's
+    // fields), and boot prints it.
     Err(format!(
-        "no QC for the checkpoint verifies under the restored committee: {last_error}"
+        "no QC for the checkpoint verifies under the restored committee: {}",
+        crate::loggable(&last_error)
     ))
 }
 
@@ -1164,15 +1674,24 @@ fn bootstrap_record(
     Ok(batch)
 }
 
+/// B395: what the restore marker keeps of a restore's first attempt, for
+/// every attempt that resumes it: the key it ran under, and whether it
+/// replaced a chain (whose rows its first clear deleted).
+struct FirstAttempt {
+    signer: Option<String>,
+    replaced: bool,
+}
+
 /// Refuse to overwrite a chain unless asked (`replace_existing`), and a
 /// replace of a chain where this node is a validator (SN-6), before anything
 /// is cleared. A fresh datadir, or one an interrupted restore marked, is
 /// always fine.
-fn check_datadir(storage: &StateDB, plan: &RestorePlan<'_>) -> Result<(), String> {
-    let marked = storage
-        .get(RESTORE_MARKER)
-        .map_err(|e| e.to_string())?
-        .is_some();
+/// B395: a resume of a restore that replaced a chain runs under the key its
+/// first attempt ran under. That chain's rows were cleared, so SN-6 had
+/// nothing left to check another key against: a resume under a validator
+/// key after a first attempt under a new key restored it.
+fn check_datadir(storage: &StateDB, plan: &RestorePlan<'_>) -> Result<FirstAttempt, String> {
+    let marker = storage.get(RESTORE_MARKER).map_err(|e| e.to_string())?;
     let holds_chain = storage
         .get("genesis_initialized")
         .map_err(|e| e.to_string())?
@@ -1181,16 +1700,69 @@ fn check_datadir(storage: &StateDB, plan: &RestorePlan<'_>) -> Result<(), String
             .get("latest_height")
             .map_err(|e| e.to_string())?
             .is_some();
-    if holds_chain && !marked && !plan.replace_existing {
+    if holds_chain && marker.is_none() && !plan.replace_existing {
         return Err(
             "this datadir already holds a chain; restoring replaces it, so it must be asked for"
                 .into(),
         );
     }
+    let first = match marker {
+        None => FirstAttempt {
+            signer: plan.local_signer.map(str::to_string),
+            replaced: holds_chain,
+        },
+        // A marker that does not say (an older node's) may have replaced one.
+        Some(raw) => {
+            let marker: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+            FirstAttempt {
+                signer: marker["signer"].as_str().map(str::to_string),
+                replaced: marker["replaced"].as_bool().unwrap_or(true),
+            }
+        }
+    };
+    if first.replaced && first.signer.as_deref() != plan.local_signer {
+        return Err(format!(
+            "this restore began under key {} and cleared the chain this datadir held, so \
+             whether key {} is a validator of that chain can no longer be told (SN-6). Resume \
+             it under key {0}, or restore onto a new datadir",
+            first.signer.as_deref().unwrap_or("(none)"),
+            plan.local_signer.unwrap_or("(none)")
+        ));
+    }
     if let Some(me) = plan.local_signer {
         if recorded_validator(storage, me) {
             return Err(sn6_refusal(me));
         }
+    }
+    Ok(first)
+}
+
+/// B396: a V4 checkpoint past epoch 0 must be an epoch boundary (see
+/// `restored_committee`), told from this node's own genesis before anything
+/// is asked or cleared. It was refused only after the whole download, and a
+/// replace restore had cleared the old chain by then.
+fn check_checkpoint_epoch(plan: &RestorePlan<'_>) -> Result<(), String> {
+    if plan
+        .genesis
+        .get(consensus::v4::VERTEX_FORMAT_KEY)
+        .map(String::as_str)
+        != Some("4")
+    {
+        return Ok(());
+    }
+    let interval = plan
+        .genesis
+        .get(consensus::v4::epoch::EPOCH_INTERVAL_KEY)
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .ok_or("this node's V4 genesis has no epoch interval")?;
+    let height = plan.checkpoint.height;
+    if consensus::v4::epoch::epoch_of_height(height, interval) > 0
+        && !height.is_multiple_of(interval)
+    {
+        return Err(format!(
+            "a V4 checkpoint past epoch 0 must be an epoch boundary (every {interval} blocks), not {height}"
+        ));
     }
     Ok(())
 }
@@ -1202,7 +1774,8 @@ fn too_slow(took: Duration, units: f64, slow_turn: Duration) -> bool {
     took > slow_turn && units / took.as_secs_f64() < MIN_TURN_UNITS_PER_SEC
 }
 
-/// The longest a struck peer sits out, in turns.
+/// The longest a struck peer sits out for its failures in a row, in turns
+/// (B463: its debt may sit out longer).
 const MAX_SIT_OUT: u32 = 256;
 
 /// Picks peers for the next request, round robin. A peer that fails to
@@ -1210,21 +1783,54 @@ const MAX_SIT_OUT: u32 = 256;
 /// slow, silent or stalling peer loses its turns to the ones that deliver
 /// while one that stumbled once is soon back. A peer caught lying is shut
 /// out for good.
+/// B463: and a peer owes the time its turns held the restore beyond what
+/// they delivered (`charge`): it sits out a turn for each `slow_turn` of
+/// that debt, and a delivery forgives it only once the debt is paid, at
+/// `MIN_TURN_UNITS_PER_SEC`. Any delivery forgave a peer, so one that
+/// alternated an 18-minute failed turn with a quick one-leaf chunk sat out
+/// one turn a cycle and slowed a restore up to about 360 times, past its
+/// deadline for a state over about 475,000 leaves.
 struct PeerSet {
     excluded: Vec<bool>,
     penalty: Vec<u32>,
     sit_out: Vec<u32>,
+    /// B463: each peer's debt, in seconds.
+    owed: Vec<f64>,
+    /// `Patience::slow_turn`: a turn within it adds no debt, and a debt
+    /// sits out a turn for each of it.
+    slow_turn: Duration,
     next: usize,
 }
 
 impl PeerSet {
-    fn new(peers: usize) -> Self {
+    fn new(peers: usize, slow_turn: Duration) -> Self {
         Self {
             excluded: vec![false; peers],
             penalty: vec![0; peers],
             sit_out: vec![0; peers],
+            owed: vec![0.0; peers],
+            slow_turn,
             next: 0,
         }
+    }
+
+    /// B463: what `peer`'s turn cost the restore: `took`, less what its
+    /// verified `units` pay for at `MIN_TURN_UNITS_PER_SEC`, added to its
+    /// debt (never below none). A turn within `slow_turn` adds nothing, as
+    /// `too_slow` never judges one, but pays.
+    fn charge(&mut self, peer: usize, took: Duration, units: f64) {
+        let mut cost = took.as_secs_f64() - units / MIN_TURN_UNITS_PER_SEC;
+        if took <= self.slow_turn {
+            cost = cost.min(0.0);
+        }
+        self.owed[peer] = (self.owed[peer] + cost).max(0.0);
+    }
+
+    /// B463: the turns `peer`'s debt sits out: one for each `slow_turn` of
+    /// it, the longest an honest turn takes unjudged, so the time it held
+    /// the restore goes to the others' turns.
+    fn debt_turns(&self, peer: usize) -> u32 {
+        (self.owed[peer] / self.slow_turn.as_secs_f64().max(1e-3)).ceil() as u32
     }
 
     fn pick(&mut self) -> Option<usize> {
@@ -1249,14 +1855,20 @@ impl PeerSet {
         Some(peer)
     }
 
+    /// A turn that delivered: its peer is forgiven, once (B463) its debt is
+    /// paid; until then it keeps its penalty and sits out its debt.
     fn delivered(&mut self, peer: usize) {
-        self.penalty[peer] = 0;
-        self.sit_out[peer] = 0;
+        if self.owed[peer] > 0.0 {
+            self.sit_out[peer] = self.penalty[peer].max(self.debt_turns(peer));
+        } else {
+            self.penalty[peer] = 0;
+            self.sit_out[peer] = 0;
+        }
     }
 
     fn strike(&mut self, peer: usize) {
         self.penalty[peer] = self.penalty[peer].saturating_mul(2).clamp(1, MAX_SIT_OUT);
-        self.sit_out[peer] = self.penalty[peer];
+        self.sit_out[peer] = self.penalty[peer].max(self.debt_turns(peer));
     }
 
     fn exclude(&mut self, peer: usize) {
@@ -1280,8 +1892,35 @@ enum Reply {
     Lied(String),
 }
 
+/// B463: a chunk turn's pace. Past the first request timeout the value
+/// bytes the turn brought must keep up with `min_bytes_per_sec`, counted
+/// over the whole turn from its chunk's ask (as B401 paces a shard turn).
+/// Each value's parts were paced by the length its chunk claimed, each from
+/// its own start: one claim of 256 MiB held a turn about 18 minutes for a
+/// junk part every request timeout, and a chunk of 2,047 values claimed one
+/// part long held it about 33 hours.
+struct Pace {
+    started: Instant,
+    received: u64,
+}
+
+impl Pace {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            received: 0,
+        }
+    }
+
+    /// Whether the turn has run past what the bytes it brought pay for.
+    fn spent(&self, patience: &Patience) -> bool {
+        let paid = Duration::from_secs(self.received / patience.min_bytes_per_sec.max(1));
+        self.started.elapsed() > patience.request_timeout.saturating_add(paid)
+    }
+}
+
 /// One value, in parts, from `peer`. Every part but the last must be exactly
-/// `VALUE_PART_BYTES`, and all of it must arrive at `min_bytes_per_sec`.
+/// `VALUE_PART_BYTES`, and the turn's parts must keep its `pace`.
 async fn ask_parts<F, Fut>(
     ask: &mut F,
     peer: usize,
@@ -1289,21 +1928,20 @@ async fn ask_parts<F, Fut>(
     key: &str,
     len: u64,
     patience: &Patience,
+    pace: &mut Pace,
 ) -> Result<Vec<u8>, Reply>
 where
     F: FnMut(usize, String) -> Fut,
     Fut: Future<Output = Result<String, String>>,
 {
-    let deadline = Instant::now()
-        + patience.request_timeout
-        + Duration::from_secs(len / patience.min_bytes_per_sec.max(1));
     let mut value = Vec::with_capacity(len as usize);
     let mut busy = 0usize;
     // A busy server is waited for, with no part lost, as long as parts keep
-    // coming: one per request timeout at least, at the minimum rate overall.
+    // coming: one per request timeout at least, at the minimum rate overall
+    // (B463: of the bytes received, never of the length claimed).
     let mut progress = Instant::now();
     while (value.len() as u64) < len {
-        if Instant::now() > deadline || progress.elapsed() > patience.request_timeout {
+        if pace.spent(patience) || progress.elapsed() > patience.request_timeout {
             return Err(Reply::Unanswered("value parts too slow".into()));
         }
         let request = ValueRequest {
@@ -1336,7 +1974,8 @@ where
         let expected = (len - value.len() as u64).min(VALUE_PART_BYTES as u64);
         match hex::decode(&part.data) {
             Ok(data) if part.len == len && data.len() as u64 == expected => {
-                value.extend_from_slice(&data)
+                pace.received = pace.received.saturating_add(expected);
+                value.extend_from_slice(&data);
             }
             Ok(data) => {
                 return Err(Reply::Lied(format!(
@@ -1373,6 +2012,8 @@ where
     let Ok(message) = serde_json::to_string(&request) else {
         return Reply::Unanswered("cannot encode the request".into());
     };
+    // B463: the whole turn's pace, every value's parts together.
+    let mut pace = Pace::new();
     let response = match ask(peer, format!("{CHUNK_REQ}{message}")).await {
         Ok(reply) => reply
             .strip_prefix(CHUNK_RESP)
@@ -1422,7 +2063,7 @@ where
             entries.push((key, value));
             continue;
         };
-        match ask_parts(ask, peer, version, &key, len, patience).await {
+        match ask_parts(ask, peer, version, &key, len, patience, &mut pace).await {
             Ok(value) => entries.push((key, value)),
             Err(reply) => return reply,
         }
@@ -1456,17 +2097,28 @@ where
     }
     let started = Instant::now();
     let patience = &plan.patience;
-    check_datadir(storage, plan)?;
+    check_checkpoint_epoch(plan)?;
+    let first = check_datadir(storage, plan)?;
     let cp = plan.checkpoint;
     let root = hex32(&cp.state_root).ok_or("malformed checkpoint root")?;
-    let pairs = fetch_anchor(cp, peers, &mut ask, patience).await?;
+    // B397: the anchor block's body, when it is fetched in shards.
+    // B401: one fetch and one body for the whole restore, which every pair
+    // shares.
+    let mut anchor_body = AnchorBody::default();
+    let pairs = fetch_anchor(cp, peers, &mut ask, patience, &mut anchor_body, started).await?;
 
-    let marker = serde_json::json!({"height": cp.height, "state_root": cp.state_root});
+    // B395: with the first attempt's key, and whether it replaced a chain.
+    let marker = serde_json::json!({
+        "height": cp.height,
+        "state_root": cp.state_root,
+        "signer": first.signer,
+        "replaced": first.replaced,
+    });
     storage
         .put(RESTORE_MARKER, &marker.to_string())
         .map_err(|e| e.to_string())?;
 
-    let mut set = PeerSet::new(peers);
+    let mut set = PeerSet::new(peers, patience.slow_turn);
     let mut restarts = 0usize;
     let mut failures = 0usize;
     let mut busy = 0usize;
@@ -1503,8 +2155,15 @@ where
                         let units = verified.len() as f64
                             + verified.iter().map(|(_, v)| v.len() as f64).sum::<f64>()
                                 / UNIT_BYTES as f64;
+                        // B463: and its peer's debt, which it pays toward.
+                        set.charge(peer, took, units);
                         if too_slow(took, units, patience.slow_turn) {
                             set.strike(peer);
+                            eprintln!(
+                                "⚠️ [STATE_SYNC] peer {peer} delivered too slowly ({took:?}), \
+                                 sits out {} turns",
+                                set.sit_out[peer]
+                            );
                         } else {
                             set.delivered(peer);
                         }
@@ -1522,9 +2181,10 @@ where
                             .map_err(|e| e.to_string())?;
                     }
                     Err(e) => {
-                        eprintln!(
-                            "⚠️ [STATE_SYNC] peer {peer} sent a refused chunk, shut out: {e}"
-                        );
+                        crate::log_line(format!(
+                            "⚠️ [STATE_SYNC] peer {peer} sent a refused chunk, shut out: {}",
+                            crate::loggable(&e.to_string())
+                        ));
                         set.exclude(peer);
                         restarts += 1;
                         continue 'restore;
@@ -1534,24 +2194,46 @@ where
                 Reply::Busy => {
                     // An honest server says busy at once, before reading
                     // anything; one that takes its time to say it stalls.
+                    // B463: and owes that time.
+                    set.charge(peer, took, 0.0);
                     if took >= patience.slow_turn {
                         set.strike(peer);
+                        eprintln!(
+                            "⚠️ [STATE_SYNC] peer {peer} said busy after {took:?}, sits out {} \
+                             turns",
+                            set.sit_out[peer]
+                        );
                     }
                     busy += 1;
                     tokio::time::sleep(patience.backoff(busy, set.live())).await;
                 }
                 Reply::Unanswered(why) => {
+                    // B463: it owes the time it held the restore, and is named:
+                    // no failed turn was logged, so an operator could not
+                    // tell which listed peer stalled the restore.
+                    set.charge(peer, took, 0.0);
                     set.strike(peer);
+                    crate::log_line(format!(
+                        "⚠️ [STATE_SYNC] peer {peer} gave no answer after {took:?} ({}), sits \
+                         out {} turns",
+                        crate::loggable(&why),
+                        set.sit_out[peer]
+                    ));
                     failures += 1;
                     if failures >= patience.max_failures {
+                        // B466: boot prints it, and a peer chose its text.
                         return Err(format!(
-                            "no peer serves the checkpoint's state (last: {why})"
+                            "no peer serves the checkpoint's state (last: {})",
+                            crate::loggable(&why)
                         ));
                     }
                     tokio::time::sleep(patience.backoff(failures, set.live())).await;
                 }
                 Reply::Lied(why) => {
-                    eprintln!("⚠️ [STATE_SYNC] peer {peer} broke the protocol, shut out: {why}");
+                    crate::log_line(format!(
+                        "⚠️ [STATE_SYNC] peer {peer} broke the protocol, shut out: {}",
+                        crate::loggable(&why)
+                    ));
                     set.exclude(peer);
                 }
             }
@@ -1559,7 +2241,10 @@ where
         let tree = match restore.finish() {
             Ok(batch) => batch,
             Err(e) => {
-                eprintln!("⚠️ [STATE_SYNC] peer {ended_by} ended the stream early, shut out: {e}");
+                crate::log_line(format!(
+                    "⚠️ [STATE_SYNC] peer {ended_by} ended the stream early, shut out: {}",
+                    crate::loggable(&e.to_string())
+                ));
                 set.exclude(ended_by);
                 restarts += 1;
                 continue 'restore;
@@ -1575,8 +2260,15 @@ where
         // the deadline, until a pair verifies against the restored state.
         let mut candidates = pairs;
         let mut asked = 1u32;
-        let (block, qc) = loop {
-            match verified_pair(storage, &chain_id, epoch, &committee, &candidates) {
+        let pair = loop {
+            match verified_pair(
+                storage,
+                &chain_id,
+                plan.genesis_identity,
+                epoch,
+                &committee,
+                &candidates,
+            ) {
                 Ok(pair) => break pair,
                 Err(e) if started.elapsed() > patience.deadline => {
                     return Err(inconsistent(e));
@@ -1586,12 +2278,19 @@ where
                     asked = asked.saturating_add(1);
                     // Rounds that found no pair count against the deadline
                     // only: giving up here would throw the download away.
-                    candidates = fetch_anchor(cp, peers, &mut ask, patience)
-                        .await
-                        .unwrap_or_default();
+                    candidates =
+                        fetch_anchor(cp, peers, &mut ask, patience, &mut anchor_body, started)
+                            .await
+                            .unwrap_or_default();
                 }
             }
         };
+        // B401: the whole block, for the pair that verified only, once the
+        // other pairs and the held body have let go of the body: it is taken
+        // over, not copied.
+        drop(candidates);
+        drop(anchor_body);
+        let (block, qc) = pair.into_block();
         // B50: at a V4 boundary, E+1's record, which QC(H_E) must bind (the
         // EP-4 check activation runs), and E+1 becomes the active epoch.
         let interval = consensus::v4::epoch::epoch_interval(storage).unwrap_or(0);
@@ -1652,17 +2351,29 @@ pub fn busy_reply(wire: &str) -> Option<String> {
             serde_json::to_string(&busy).ok()?
         ));
     }
-    // B275: a block part too (it was dropped, so a client's next part was
-    // lost whenever the server's answer budget was spent, which each part
-    // spends: no block over a batch could be fetched).
-    if wire.starts_with(crate::PART_REQ) {
-        let busy = crate::BlockPartResponse {
+    // B418: a checkpoint's anchor too: it was dropped unanswered, so a
+    // restore ended after `max_failures` rounds of a server's spent quota.
+    if wire.starts_with(ANCHOR_REQ) {
+        let busy = AnchorResponse {
+            error: Some(BUSY.into()),
+            ..Default::default()
+        };
+        return Some(format!(
+            "{ANCHOR_RESP}{}",
+            serde_json::to_string(&busy).ok()?
+        ));
+    }
+    // B275: a block's shard piece too (B319; it was dropped, so a client's
+    // next piece was lost whenever the server's answer budget was spent,
+    // which each piece spends: no block over a batch could be fetched).
+    if wire.starts_with(crate::SHARD_REQ) {
+        let busy = crate::ShardResponse {
             error: Some(BUSY.into()),
             ..Default::default()
         };
         return Some(format!(
             "{}{}",
-            crate::PART_RESP,
+            crate::SHARD_RESP,
             serde_json::to_string(&busy).ok()?
         ));
     }

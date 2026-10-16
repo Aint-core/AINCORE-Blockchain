@@ -1,39 +1,46 @@
 #!/usr/bin/env bash
 #
-# restore_node.sh — restore an AINCORE node from a backup_node.sh tar.gz into a
-# FRESH datadir (audit #16, DR drill + runbook).
+# restore_node.sh — restore the database of an AINCORE node that is NOT a
+# validator (an RPC or observer node) from a backup_node.sh tar.gz into a
+# FRESH datadir, under a NEW key (audit #16, DR drill + runbook; B467).
 #
-# It is the inverse of scripts/backup_node.sh. It:
-#   1. (optionally) verifies the archive sha256 against the sibling .sha256 file
-#      or an explicit --sha256 value (same hash you'd use for
-#      AINCORE_BOOTSTRAP_SHA256).
-#   2. extracts validator_*.db -> {datadir}/validator_{port}.db
-#   3. restores node.key into {datadir}/node.key only with --restore-validator-key.
-#   4. restores genesis.json next to the datadir if --genesis-out is given.
+# A VALIDATOR NEVER RESTORES ITS DATABASE (G1 SA-4, B459, B467). A restored
+# database carries the backed-up node's signing guards and its
+# consensus:guard_origin. Under that node's key the row still matches, so
+# G1 RC-3 counts the guards as continuous: the node does not abstain, and it
+# can sign again rounds it signed after the backup was taken (equivocation:
+# jailed for good, its stake and its delegators' slashed, G5 SL-4). RC-3
+# protects an EMPTY datadir, not a restored one. A validator recovers from an
+# empty datadir with its node.key and a fresh sync (docs/DR_RUNBOOK.md §4).
+#
+# It:
+#   1. refuses to run without --not-a-validator: you confirm the restored node
+#      is not a validator and will never run a validator's node.key, above
+#      all not the key of the node the backup was taken from.
+#   2. verifies the archive sha256 against the sibling .sha256 file or an
+#      explicit --sha256 value.
+#   3. extracts validator_*.db -> {datadir}/validator_{port}.db
+#   4. never restores node.key: the node generates a new keypair on first
+#      boot. An archive taken before B467 may hold the backed-up node's key;
+#      it stays in staging and is removed. If {datadir}/node.key already
+#      exists, it refuses (exit 3): that key on an older database can sign a
+#      slot it already signed (B373).
+#   5. writes {datadir}/RESTORED_FROM_BACKUP, a warning beside where a key
+#      would go (the node does not read it).
+#   6. restores genesis.json if --genesis-out is given.
 #
 # SAFETY: it NEVER overwrites a non-empty existing chain DB. If
 # {datadir}/validator_{port}.db already exists and is non-empty, it aborts
 # unless you pass --force (which moves the old DB aside to a .pre-restore copy,
 # it does not delete it).
 #
-# NODE IDENTITY:
-#   default        node.key is NOT restored: the node generates a fresh keypair
-#                  on first boot and runs as an OBSERVER.
-#   --restore-validator-key
-#                  restore the backup's node.key. DANGEROUS: the backup's signing
-#                  records are older than what the validator signed after the
-#                  backup was taken, so the restored node can sign the same
-#                  rounds again: a double-sign, slashed 100%. Use it only if the
-#                  validator provably never ran after the backup, and never while
-#                  any other copy of the key can run. The boot check that makes
-#                  this safe (look back at peers, then listen) is G1 RC-3, not
-#                  built yet. See docs/research/validator_signing_safety.md.
-#   --new-identity accepted for compatibility; it is the default now.
+# REMOVED: --restore-validator-key (B467) is refused (exit 2). --new-identity
+# is accepted for compatibility: a new identity is the only mode.
 #
 # Usage:
 #   restore_node.sh --backup <archive.tar.gz> --datadir <dir> --port <p> \
-#                   [--sha256 <hex> | --no-verify] \
-#                   [--restore-validator-key] [--force] [--genesis-out <path>]
+#                   --not-a-validator [--sha256 <hex> | --no-verify] \
+#                   [--force] [--genesis-out <path>]
 #
 # Exit codes: 0 ok, 2 usage error, 3 precondition failed, 4 integrity failed.
 set -euo pipefail
@@ -43,12 +50,12 @@ DATADIR=""
 PORT=""
 EXPECT_SHA=""
 VERIFY=1
-NEW_IDENTITY=1
+NOT_A_VALIDATOR=0
 FORCE=0
 GENESIS_OUT=""
 
 usage() {
-  sed -n '2,38p' "$0" >&2
+  sed -n '2,45p' "$0" >&2
   exit "${1:-2}"
 }
 
@@ -59,8 +66,13 @@ while [[ $# -gt 0 ]]; do
     --port)          PORT="${2:-}"; shift 2 ;;
     --sha256)        EXPECT_SHA="${2:-}"; shift 2 ;;
     --no-verify)     VERIFY=0; shift ;;
-    --new-identity)  NEW_IDENTITY=1; shift ;;
-    --restore-validator-key) NEW_IDENTITY=0; shift ;;
+    --not-a-validator) NOT_A_VALIDATOR=1; shift ;;
+    --new-identity)  shift ;;
+    --restore-validator-key)
+      echo "ERROR: --restore-validator-key was removed (B467): a validator never" >&2
+      echo "       restores its database (G1 SA-4, B459). Recover it from an empty" >&2
+      echo "       datadir with its node.key and a fresh sync (docs/DR_RUNBOOK.md §4)." >&2
+      exit 2 ;;
     --force)         FORCE=1; shift ;;
     --genesis-out)   GENESIS_OUT="${2:-}"; shift 2 ;;
     -h|--help)       usage 0 ;;
@@ -72,6 +84,24 @@ done
 [[ -n "$DATADIR" ]] || { echo "ERROR: --datadir is required" >&2; usage 2; }
 [[ -n "$PORT" ]] || { echo "ERROR: --port is required" >&2; usage 2; }
 [[ "$PORT" =~ ^[0-9]+$ ]] || { echo "ERROR: --port must be numeric, got '$PORT'" >&2; exit 2; }
+
+# --- B467: only a node that is not a validator restores a database ----------
+# Before, the default restore (no key) still installed a validator's database
+# with its guard_origin, and the runbook then had the operator move the
+# validator's node.key in "to resume its identity": continuous guards older
+# than what the key had signed, a double-sign.
+if [[ "$NOT_A_VALIDATOR" != 1 ]]; then
+  echo "ERROR: refusing to restore without --not-a-validator (B467)." >&2
+  echo "       A validator never restores its database (G1 SA-4, B459): the restored" >&2
+  echo "       guard_origin matches its key, so RC-3 counts its older guards as" >&2
+  echo "       continuous and it can sign rounds it already signed: equivocation," >&2
+  echo "       jailed for good, its stake and its delegators' slashed. Recover a" >&2
+  echo "       validator from an empty datadir with its node.key (docs/DR_RUNBOOK.md §4)." >&2
+  echo "       Pass --not-a-validator only for a node that will never run a" >&2
+  echo "       validator's node.key, above all not the backed-up node's." >&2
+  exit 3
+fi
+
 [[ -f "$BACKUP" ]] || { echo "ERROR: backup not found: $BACKUP" >&2; exit 3; }
 
 command -v tar >/dev/null || { echo "ERROR: tar not found" >&2; exit 3; }
@@ -115,13 +145,33 @@ DEST_DB="${DATADIR%/}/${DB_NAME}"
 DEST_KEY="${DATADIR%/}/node.key"
 
 # --- never clobber a non-empty existing DB ----------------------------------
+DB_NONEMPTY=0
 if [[ -d "$DEST_DB" ]] && [[ -n "$(ls -A "$DEST_DB" 2>/dev/null)" ]]; then
+  DB_NONEMPTY=1
   if [[ "$FORCE" != 1 ]]; then
     echo "ERROR: target DB already exists and is non-empty: $DEST_DB" >&2
     echo "       Refusing to overwrite. Use a fresh --datadir, or pass --force" >&2
     echo "       (which moves the existing DB aside, never deletes it)." >&2
     exit 3
   fi
+fi
+
+# --- B373: a new identity needs an empty key slot -----------------------------
+# Before, the default mode left an existing node.key in place and still said
+# "fresh keypair on boot": the node then booted that key on an older database
+# whose signing records predate what the key already signed, a double-sign
+# (G1 SA-4). Now it refuses before touching anything.
+if [[ -e "$DEST_KEY" || -L "$DEST_KEY" ]]; then
+  echo "ERROR: $DEST_KEY already exists. Refusing to restore." >&2
+  echo "       The node would boot THIS key on the restored, older database, and a" >&2
+  echo "       key on an older database can sign a slot it already signed: a" >&2
+  echo "       double-sign, jailed and slashed. A restore runs a new key: move this" >&2
+  echo "       one away first (mv, never cp). A validator's key never goes onto a" >&2
+  echo "       restored database (B459, B467)." >&2
+  exit 3
+fi
+
+if [[ "$DB_NONEMPTY" == 1 ]]; then
   ASIDE="${DEST_DB}.pre-restore.$(date -u +%Y%m%dT%H%M%SZ)"
   echo "==> --force: moving existing DB aside -> $ASIDE"
   mv "$DEST_DB" "$ASIDE"
@@ -150,28 +200,36 @@ done
 echo "==> Installing chain DB -> $DEST_DB"
 mv "$SRC_DB" "$DEST_DB"
 
-# --- node.key handling ------------------------------------------------------
-if [[ "$NEW_IDENTITY" == 1 ]]; then
-  echo "==> NOT restoring node.key: the node generates a fresh keypair on boot (observer)."
-  # If a key happens to pre-exist in the target datadir, leave it untouched;
-  # the operator chose new-identity so we simply don't import the backup's key.
-else
-  if [[ -f "$STAGING/node.key" ]]; then
-    if [[ -f "$DEST_KEY" ]]; then
-      echo "WARNING: $DEST_KEY already exists — keeping the EXISTING key, not the backup's." >&2
-      echo "         (Pass --new-identity to keep existing, or remove it first to import.)" >&2
-    else
-      echo "WARNING: restoring a validator key with an older database can double-sign" >&2
-      echo "         (slashed 100%). Only safe if the validator never ran after the" >&2
-      echo "         backup and no other copy of the key can run." >&2
-      echo "==> Restoring node.key -> $DEST_KEY"
-      cp "$STAGING/node.key" "$DEST_KEY"
-      chmod 600 "$DEST_KEY" 2>/dev/null || true
-    fi
-  else
-    echo "WARNING: backup contains no node.key — node will generate a fresh identity." >&2
-  fi
+# --- node.key: never restored (B467) -----------------------------------------
+# Reached only with no node.key in the datadir (B373, refused above), so the
+# node really does generate a new keypair.
+if [[ -f "$STAGING/node.key" ]]; then
+  echo "WARNING: this archive holds the backed-up node's node.key (a backup taken" >&2
+  echo "         before B467). It is NOT restored, and it must never be put into" >&2
+  echo "         $DATADIR: the restored database's guard_origin matches it." >&2
 fi
+echo "==> NOT restoring node.key: the node generates a fresh keypair on boot."
+
+# --- B467: a warning where a key would go -------------------------------------
+# The restored database keeps the backed-up node's guard_origin: that node's
+# key put here later would count its older guards as continuous (G1 RC-3) and
+# could sign rounds again. The node does not read this file; an operator
+# about to copy a node.key in finds it beside the database.
+MARKER="${DATADIR%/}/RESTORED_FROM_BACKUP"
+{
+  echo "This datadir's database was restored from $(basename "$BACKUP") by"
+  echo "scripts/restore_node.sh at $(date -u +%Y%m%dT%H%M%SZ), for a node that is not a validator."
+  echo "Never put a validator's node.key here, above all the key of the node the"
+  echo "backup was taken from: this database holds that node's consensus:guard_origin,"
+  echo "so under its key the node would count its older signing guards as continuous"
+  echo "(G1 RC-3) and could sign again rounds it signed after the backup: equivocation,"
+  echo "jailed for good, its stake and its delegators' slashed (G1 SA-4, B459, B467)."
+  echo "A validator recovers from an empty datadir with its node.key (docs/DR_RUNBOOK.md §4)."
+  if [[ -f "$STAGING/MANIFEST" ]]; then
+    echo "--- backup MANIFEST ---"
+    cat "$STAGING/MANIFEST"
+  fi
+} > "$MARKER"
 
 # --- genesis ----------------------------------------------------------------
 if [[ -n "$GENESIS_OUT" ]]; then
@@ -192,5 +250,5 @@ fi
 echo ""
 echo "✅ Restore complete into: $DATADIR"
 echo "   chain DB: $DEST_DB"
-[[ "$NEW_IDENTITY" == 1 ]] && echo "   identity: NEW (fresh keypair on boot)" || echo "   identity: restored from backup (if node.key present)"
+echo "   identity: NEW (fresh keypair on boot); see $MARKER"
 echo "   Start the node pointed at this datadir + --port $PORT."

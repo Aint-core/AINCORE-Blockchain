@@ -38,10 +38,16 @@ pub struct SlotState {
     pub ordered: BTreeSet<String>,
 }
 
-/// Every slot this node holds a CE-3 alarm for.
+/// Every slot this node holds a CE-3 alarm for. B456: the alarms are read
+/// whole or not at all (`try_scan_prefix`): a read error ended the scan,
+/// and the slots past it went unreported (`inspect`, and after a pin "no
+/// alarm is left").
 pub fn alarmed_slots(storage: &StateDB) -> Result<Vec<SlotState>, String> {
     let mut out = Vec::new();
-    for (key, _) in storage.scan_prefix("alarm:vcert_conflict:") {
+    let alarms = storage
+        .try_scan_prefix("alarm:vcert_conflict:")
+        .map_err(|e| e.to_string())?;
+    for (key, _) in alarms {
         let mut parts = key["alarm:vcert_conflict:".len()..].splitn(3, ':');
         let (Some(e), Some(r), Some(author)) = (parts.next(), parts.next(), parts.next()) else {
             return Err(format!("an alarm key of an unknown shape: {key}"));
@@ -55,7 +61,7 @@ pub fn alarmed_slots(storage: &StateDB) -> Result<Vec<SlotState>, String> {
 }
 
 fn read_cert(storage: &StateDB, key: &str) -> Result<Option<VertexCertificate>, String> {
-    match storage.get(key).map_err(|e| e.to_string())? {
+    match storage.try_get(key).map_err(|e| e.to_string())? {
         None => Ok(None),
         Some(raw) => serde_json::from_str(&raw)
             .map(Some)
@@ -63,7 +69,12 @@ fn read_cert(storage: &StateDB, key: &str) -> Result<Option<VertexCertificate>, 
     }
 }
 
-/// What this node holds for slot (epoch, round, author).
+/// What this node holds for slot (epoch, round, author). B456: every row is
+/// read fail-closed: one that cannot be read, or does not parse, is an
+/// error, never "absent". Read so, the CE-3 pin check could miss the other
+/// twin (in a committed-sequence row, the certificate or slot row, or the
+/// alarm's pair), pin over it and clear the halt, and `inspect` reported
+/// the slot without it.
 pub fn slot_state(
     storage: &StateDB,
     epoch: u64,
@@ -73,7 +84,7 @@ pub fn slot_state(
     let cert_digest =
         read_cert(storage, &staging::vcert_key(epoch, round, author))?.map(|c| c.body.digest);
     let alarm_digests = match storage
-        .get(&alarm_key(epoch, round, author))
+        .try_get(&alarm_key(epoch, round, author))
         .map_err(|e| e.to_string())?
     {
         None => None,
@@ -89,7 +100,7 @@ pub fn slot_state(
             Some(if a <= b { (a, b) } else { (b, a) })
         }
     };
-    let mut digests: BTreeSet<String> = staging::slot_digests(storage, epoch, round, author)
+    let mut digests: BTreeSet<String> = staging::slot_digests(storage, epoch, round, author)?
         .into_iter()
         .collect();
     digests.extend(cert_digest.iter().cloned());
@@ -97,7 +108,7 @@ pub fn slot_state(
         digests.insert(a.clone());
         digests.insert(b.clone());
     }
-    let ordered = ordered_among(storage, &digests);
+    let ordered = ordered_among(storage, &digests)?;
     Ok(SlotState {
         epoch,
         round,
@@ -110,15 +121,26 @@ pub fn slot_state(
 }
 
 /// The members of `digests` in this node's committed sequence (every
-/// `consensus:cseq:` row it still holds).
-fn ordered_among(storage: &StateDB, digests: &BTreeSet<String>) -> BTreeSet<String> {
+/// `consensus:cseq:` row it still holds). B456: a row that cannot be read
+/// (a read error, or a row that is not UTF-8: read lossily, a digest with
+/// one byte rotted named another) or does not parse is an error. Skipped,
+/// the row that held the other twin read as "not ordered here", and the
+/// pin went through on a node whose committed sequence held that twin.
+fn ordered_among(
+    storage: &StateDB,
+    digests: &BTreeSet<String>,
+) -> Result<BTreeSet<String>, String> {
     let mut out = BTreeSet::new();
-    for (_, raw) in storage.scan_prefix("consensus:cseq:") {
-        if let Ok(hashes) = serde_json::from_str::<Vec<String>>(&raw) {
-            out.extend(hashes.into_iter().filter(|h| digests.contains(h)));
-        }
+    let rows = storage
+        .try_scan_prefix("consensus:cseq:")
+        .map_err(|e| e.to_string())?;
+    for (key, raw) in rows {
+        let Ok(hashes) = serde_json::from_str::<Vec<String>>(&raw) else {
+            return Err(format!("{key} does not parse"));
+        };
+        out.extend(hashes.into_iter().filter(|h| digests.contains(h)));
     }
-    out
+    Ok(out)
 }
 
 /// What pinning changed.
@@ -257,6 +279,55 @@ mod tests {
         assert_eq!(
             alarm_key(3, 153_030, "ab"),
             "alarm:vcert_conflict:00000000000000000003:00000000000000153030:ab"
+        );
+    }
+
+    /// B456 witness: what this node holds for a slot is read fail-closed: a
+    /// row that is not UTF-8 or does not parse is an error, not "absent".
+    /// Read so, the CE-3 pin check could miss the other twin (in a
+    /// committed-sequence row, the certificate or slot row, or the alarm's
+    /// pair) and pin over it, and `inspect` reported the slot without it.
+    #[test]
+    fn a_slot_row_that_cannot_be_read_is_an_error_not_absent() {
+        let db = StateDB::open(&storage::test_dir_str("b456_slot_state")).unwrap();
+        let _seed = db.seeding();
+        let raw = |key: &str, bytes: &[u8]| {
+            let mut batch = storage::rocksdb::WriteBatch::default();
+            batch.put(key.as_bytes(), bytes);
+            db.write_batch(batch).unwrap();
+        };
+        let author = "ab";
+        let clean = slot_state(&db, 0, 1, author).unwrap();
+        assert!(clean.digests.is_empty() && clean.ordered.is_empty());
+        let rotted = [0xff_u8, 0xfe].to_vec();
+        let corrupt = [
+            (alarm_key(0, 1, author), rotted.clone()),
+            (staging::vcert_key(0, 1, author), rotted),
+            (staging::vslot_key(0, 1, author), b"not a slot".to_vec()),
+            ("consensus:cseq:7".to_string(), b"not a sequence".to_vec()),
+            // One byte of a digest rotted: read lossily, it parsed as
+            // another digest.
+            ("consensus:cseq:7".to_string(), b"[\"aa\xff\"]".to_vec()),
+        ];
+        for (key, bytes) in corrupt {
+            raw(&key, &bytes);
+            assert!(
+                slot_state(&db, 0, 1, author).is_err(),
+                "{key} was read as absent"
+            );
+            db.delete(&key).unwrap();
+            assert!(slot_state(&db, 0, 1, author).is_ok(), "control: {key}");
+        }
+        // An alarm key with one byte of its author rotted: read lossily, the
+        // slot was reported under another author, as if it held nothing.
+        let mut key = alarm_key(0, 2, author).into_bytes();
+        key.push(0xff);
+        let mut batch = storage::rocksdb::WriteBatch::default();
+        batch.put(&key, b"{}");
+        db.write_batch(batch).unwrap();
+        assert!(
+            alarmed_slots(&db).is_err(),
+            "inspect reported a slot whose alarm it could not read"
         );
     }
 }

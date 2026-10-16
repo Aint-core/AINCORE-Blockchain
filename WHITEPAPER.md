@@ -13,7 +13,7 @@
 | **Supply** | 150,000,000 AIN (Fixed Max Supply) |
 | **Emisi** | 1,90 %/tahun dari sisa cadangan, dibayar tiap periode reward menurut waktu konsensus |
 | **Block Time** | Diukur pada kandidat rilis sebelum genesis (belum dipublikasikan) |
-| **Fair Launch** | ✅ Ya (tanpa dana developer, tanpa ICO; genesis hanya berisi stake validator genesis dan cadangan treasury) |
+| **Genesis** | Hanya stake validator dan saldo akun yang tertulis di `genesis.json` (tanpa treasury, tanpa ICO). Rencana mainnet: maks. 1.500.000 AIN (1 %) hasil testnet insentif, nol untuk founder (lihat bagian 5) |
 | **Smart Contract** | Move VM (sama seperti Aptos/Sui) |
 | **Unique Feature** | DePIN Mining (Mine dengan IoT/Biometrics) |
 
@@ -86,7 +86,7 @@ await connection.sendTransaction(tx.toString());
 | Metric | Value |
 |--------|-------|
 | **Max Supply** | 150,000,000 AIN |
-| **Genesis Supply** | ~1.050.000 AIN (0,7 %): stake validator genesis dan cadangan treasury |
+| **Genesis Supply** | Yang tertulis di `genesis.json`, maks. cap: stake validator genesis (langsung ter-bond) dan saldo akun genesis (likuid). Rencana mainnet: maks. 1.500.000 AIN (1 %) |
 | **Emisi** | 1,90 %/tahun dari sisa cadangan (150 juta dikurangi semua yang sudah dicetak) |
 
 ### Kurva Emisi:
@@ -101,9 +101,9 @@ Tiap periode reward (20 blok) mencetak `sisa × λ × Δτ`, dengan λ = −ln(0
 | 100 tahun | 85,3 % |
 
 ### Reward Distribution:
-- Emisi dibagi ke anggota komite epoch itu menurut stake (dibatasi 1/50 dari total).
+- Emisi dibagi ke anggota komite epoch itu menurut bobotnya (stake sendiri, koin pool-nya, dan bobot bootstrap bila ada) dibagi total bobot komite, atau dibagi `s_min` bila komite lebih ringan; sisa yang tidak dibayar tetap di cadangan.
 - Bagian tiap validator dibagi lagi: bagian stake sendiri + komisi → validator; sisanya → delegator menurut poin.
-- **Fee transaksi:** 20 % ke anchor leader, 80 % ke komite menurut stake, 10 % dibakar (default).
+- **Fee transaksi:** base fee (EIP-1559) dibakar; dari tip di atasnya, 10 % dibakar (default), lalu 20 % ke anchor leader dan 80 % ke komite.
 - **DePIN:** 0 % untuk saat ini, sampai distribusinya tersambung.
 
 ---
@@ -112,7 +112,7 @@ Tiap periode reward (20 blok) mencetak `sisa × λ × Δτ`, dengan λ = −ln(0
 
 ### ✅ AINCORE adalah Fair Launch:
 
-1. **Tanpa dana developer** - Genesis hanya berisi stake validator genesis dan cadangan treasury (~0,7 %); 99,3 % dicetak sebagai emisi
+1. **Tanpa dana developer** - Tidak ada treasury (B7: genesis menolak `treasury_reserve` selain 0). Genesis hanya mencetak stake validator dan saldo akun yang tertulis di `genesis.json`; rencana mainnet: maks. 1 % untuk peserta testnet insentif, nol untuk founder; sisanya (≥ 99 %) hanya dicetak sebagai emisi
 2. **No ICO/IDO** - Tidak ada private sale
 3. **No VC Allocation** - Tidak ada token untuk investor
 4. **Validator terbuka** - Siapa pun dengan stake minimum 1.000 AIN bisa mendaftar; komite setiap epoch adalah 256 validator dengan stake terbesar
@@ -122,12 +122,17 @@ Tiap periode reward (20 blok) mencetak `sisa × λ × Δτ`, dengan λ = −ln(0
 | Method | Deskripsi |
 |--------|-----------|
 | **Staking** | Jadi validator (atau delegasi), stake AIN, dapat bagian emisi tiap periode reward |
-| **DePIN Mining** | Register IoT device, submit breath data, dapat reward |
+| **DePIN Mining** | Register IoT device, submit breath data, dapat reward (belum aktif: oracle tidak punya feeder di genesis, B314) |
 | **Transfer** | Terima dari orang lain yang sudah punya |
-| **Bridge** | Bridge dari chain lain (BTC → AIN-BTC) |
+| **Bridge** | Bridge dari chain lain (BTC → wBTC; belum aktif: mint wBTC tidak dipegang kunci apa pun di genesis, B314) |
 
 ### Genesis Bootstrap:
-Untuk bootstrap awal, genesis validator mendapat initial stake untuk memulai chain. Setelah itu, semua coin hanya bisa didapat melalui mining/staking.
+Genesis mencetak persis yang tertulis di `genesis.json` (`build_genesis`, `core/node/src/genesis.rs`) dan menolak file yang totalnya melewati cap:
+- **Stake validator genesis**, langsung ter-bond (coin store-nya mulai dari 0): minimal 1.000 AIN, atau 0 untuk operator yang punya bobot bootstrap. Ini stake biasa: keluar dari validator set + unbonding 21 hari mengembalikannya.
+- **Saldo akun genesis**, likuid.
+- **Bobot bootstrap** (G5 amendemen A4): bobot konsensus **tanpa koin**, tidak pernah masuk coin store, stake, atau supply. Bobot ini mengisi komite sampai `s_min`, menyusut saat stake milik bertambah, dan dicabut dari operator yang di-jail, keluar, atau skor partisipasinya (rata-rata slot leader yang ia commit) di bawah setengah. Bobot ini dapat bagian emisi seperti stake.
+
+Node hanya memeriksa cap dan bentuk file, bukan siapa penerima koinnya: itu aturan seremoni genesis, dan file genesis serta alamat founder publik. Rencana mainnet (`docs/G5_ECONOMICS_CONTRACT.md` A4): maks. 1.500.000 AIN dari testnet insentif (`genesis-tool score-testnet`: 1.000.000 AIN ter-bond dibagi rata ke operator yang lolos, maks. 500.000 AIN likuid untuk jalur publik). Founder tidak dapat koin (validator testnet-nya tidak pernah dinilai atau dibayar); validator founder hanya memegang bobot bootstrap, maks. 30 % dari `s_min` (18.500.000 AIN), dan dengan bobot itu mendapat sekitar 30 % emisi saat peluncuran, makin kecil saat stake milik menggantikan bobot bootstrap. Testnet AINCORE-TESTNET-V4 lebih tua dari bobot bootstrap: genesisnya memberi empat validator founder masing-masing 4.625.000 AIN sebagai stake biasa (pengganti sementara `s_min`); AIN testnet tidak terbawa ke mainnet. Setelah genesis, coin baru hanya lahir dari emisi.
 
 ---
 
@@ -334,12 +339,12 @@ await connection.sendTransaction(withdrawTx.toString());
 ### Q: Bagaimana dapat coin pertama?
 **A:** 
 1. Jadi validator (stake + run node)
-2. DePIN mining (pasang IoT device)
+2. DePIN mining (pasang IoT device; belum aktif, B314)
 3. Terima transfer dari orang lain
-4. Bridge dari chain lain
+4. Bridge dari chain lain (belum aktif, B314)
 
 ### Q: Apakah Fair Launch?
-**A:** Ya! Tidak ada pre-mine, ICO, atau alokasi khusus.
+**A:** Tanpa ICO, tanpa alokasi VC, tanpa treasury. Genesis mencetak stake validator dan saldo akun yang tertulis di `genesis.json`; rencana mainnet: maks. 1 % dari cap untuk peserta testnet insentif, nol untuk founder, yang validatornya hanya memegang bobot bootstrap tanpa koin (bagian 5).
 
 ### Q: Berapa minimum stake?
 **A:** 1000 AIN untuk jadi validator.

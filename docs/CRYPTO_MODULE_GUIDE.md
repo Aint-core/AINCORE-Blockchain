@@ -397,12 +397,15 @@ assert_eq!(scheme, TxScheme::MlDsa65);
 ```
 
 `verify_tx_signature` is the one transaction verifier (Ed25519 strictly, or
-ML-DSA-65). It is pinned to aws-lc-rs 1.18.1, whose ML-DSA is C-only code on
-every CPU; its keys and signatures are cross-checked against RustCrypto
-`ml-dsa` in the crate's tests. A version bump is a consensus change.
+ML-DSA-65). Its ML-DSA is RustCrypto `ml-dsa` 0.1.1 (B321: pure Rust, no
+assembly, so every CPU runs one code path; aws-lc-sys builds AVX2 and NEON
+assembly for the steps that decode a signature). aws-lc-rs 1.18.1 makes keys
+and signs; the crate's tests cross-check the two on honest and malformed
+signatures. A version bump of either is a consensus change.
 
-`MultiSigVerifier` takes `SignatureScheme::MlDsa65` (id 1) for the
-`aincore_verifyMultiSig` RPC.
+`MultiSigVerifier` takes `SignatureScheme::MlDsa65` (id 1). The
+`aincore_verifyMultiSig` and `aincore_ecdsaVerify` RPCs that exposed it were
+removed (B336): nothing on chain uses them.
 
 ---
 

@@ -64,7 +64,7 @@ AINCORE-Blockchain/
 | File | Kenapa Kritis |
 |------|--------------|
 | `consensus/consensus/src/dag.rs` | Core DAG consensus, BFT quorum, slashing, vertex ordering |
-| `consensus/consensus/src/ordering.rs` | Bullshark-lite: OrderingEngine, VDF leader election |
+| `consensus/consensus/src/ordering.rs` | Bullshark-lite: OrderingEngine, anchor decisions (leaders: `committee::leader_for_round`) |
 | `core/executor/src/lib.rs` | Eksekusi TX paralel (rayon), gas, Move VM call, reward distribusi |
 | `core/mempool/src/lib.rs` | Gate pertama TX: chain ID, signature verify, nonce dedup |
 | `common/crypto/src/lib.rs` | Root semua crypto primitif |
@@ -86,7 +86,7 @@ User TX
   ↓
 [DagConsensus::add_vertex()] → verifikasi sig, cek validator set, deteksi equivocation
   ↓
-[OrderingEngine::try_commit()] → Bullshark-lite, anchor leader via VDF
+[OrderingEngine::try_commit()] → Bullshark-lite, anchor leader from `committee::leader_for_round`
   ↓
 [Executor::execute_block_parallel()] → rayon parallel, Move VM, gas deduct
   ↓
@@ -108,7 +108,7 @@ User TX
 | `zkp/snark.rs` | SNARKProver, HashPreimageCircuit, SNARKError |
 | `poseidon/` | Poseidon hash (ZK-friendly) |
 | `mpc/` | MPCProtocol, MPCError |
-| `vdf/` | VDFEngine (leader election randomness) |
+| `vdf/` | VDFEngine (its beacon is computed but read by nothing, B338) |
 | `accumulator/` | Merkle accumulator untuk light clients |
 | `multi_sig.rs` | MultiSigVerifier, SignatureScheme |
 
@@ -131,7 +131,7 @@ User TX
 ### OrderingEngine (ordering.rs)
 - **Algoritma:** Bullshark-lite (simplified)
 - **Leader election:** round ganjil = leader round, cek support dari round sebelumnya
-- **VDF randomness:** `VDFEngine::new(50)` untuk unpredictable leader
+- **Leader:** `committee::leader_for_round`, jadwal SHA-256 publik (bisa diprediksi). Beacon VDF (`VDFEngine::new(50)`) dihitung tiap commit tapi tidak dibaca apa pun (B338)
 - **State persistence:** `consensus:committed_rounds`, `consensus:committed_sequence` di RocksDB
 
 ### Validator Set

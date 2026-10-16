@@ -150,9 +150,11 @@ module 0x1::token_factory {
         
         vector::push_back(&mut registry.tokens, token_info);
         
-        // Mint initial supply to creator (its wallet registers the token).
+        // Mint initial supply to creator (its wallet registers the token,
+        // and is made if missing: a creator who never called init_wallet
+        // used to pay gas and the fee for a create that aborted here).
         if (initial_supply > 0) {
-            register_internal(creator_addr, copy token_id);
+            register(creator, copy token_id);
             mint_internal(creator_addr, token_id, initial_supply);
         }
     }

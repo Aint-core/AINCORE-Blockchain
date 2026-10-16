@@ -76,11 +76,19 @@ JSON array, adds each validator's `stake_ain` (whole AIN), and runs:
 ```bash
 ./target/release/genesis-tool gen-multi \
   --entries-file entries.json \
-  --chain-id AINCORE-MAINNET-1 \
+  --chain-id AINCORE-MAINNET-1 --mainnet \
   --treasury-reserve-ain 50000 \
   --block-time-ms <t_b measured on the release candidate> \
   --out genesis.json
 ```
+
+**A chain id is used once (B348).** A transaction signs its chain id, not its
+genesis (as on Ethereum, Aptos and Cosmos), so every incarnation of a network (a
+relaunch, a rehearsal, a testnet reset) takes a chain id never used before; under a
+reused one, every transaction of one is valid on the other once its sequence number
+comes round. `gen-multi` gives `AINCORE-MAINNET-1` only with `--mainnet` (the launch
+genesis), and `--mainnet` nothing else: rehearsals use their own ids
+(`AINCORE-REHEARSAL-…`).
 
 Every entry is checked before the file is written: the address derives from
 `public_key`, `entry_sig` verifies under it, `bls_pop` verifies for `bls_public_key`,
@@ -188,7 +196,7 @@ chmod 600 data/val2/node.key
 
 ## 4. Start the cluster (peering via `--bootnodes`)
 
-Each node has a base port (`--port`, default `9001`): libp2p listens on base
+Each node has a base port (`--port`, default `9002`): libp2p listens on base
 port + 100 (every peer conversation, consensus and sync, runs over it), and the
 RPC/API port is auto-derived as `port - 1000` (or set with `--rpc-port`). Point every node at
 the **same** `genesis.json` (place it in the working directory or set

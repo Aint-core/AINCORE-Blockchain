@@ -45,6 +45,11 @@ private_key*
 # B307: a PQC spending seed and its default directory
 *.seed
 pqc_keys/
+# B328: encrypted keystores (`aincore-cli keys`' directory, files named by
+# their UUID with no extension; the bridges' JSON keystores)
+keys/
+*keystore*.json
+key[0-9]*.json
 vault_address.txt
 
 # Node Data (RocksDB / Database)

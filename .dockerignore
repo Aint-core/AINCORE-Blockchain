@@ -24,6 +24,9 @@ nas_data*
 **/*.pem
 **/*.p12
 **/*.keystore
+**/keys
+**/*keystore*.json
+**/key[0-9]*.json
 **/*.secret
 **/seed_phrase*
 **/private_key*

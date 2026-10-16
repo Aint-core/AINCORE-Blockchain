@@ -7,6 +7,7 @@ module 0x1::dex {
     use std::type_name;
     use std::vector;
     use 0x1::coin::{Self, Coin};
+    use 0x1::math;
     use 0x1::staking::AincoreCoin;
     use 0x1::wbtc::WBTC;
 
@@ -135,8 +136,7 @@ module 0x1::dex {
         // regardless of VM abort semantics.
         let minimum_lock: u128;
         if (pool.lp_supply == 0) {
-            assert_mul_safe(amount_x, amount_y);
-            let raw_liquidity = sqrt(amount_x * amount_y);
+            let raw_liquidity = first_liquidity(amount_x, amount_y);
             assert!(raw_liquidity > MINIMUM_LIQUIDITY, error::invalid_argument(EINVALID_LIQUIDITY));
             liquidity = raw_liquidity - MINIMUM_LIQUIDITY;
             minimum_lock = MINIMUM_LIQUIDITY;
@@ -144,19 +144,11 @@ module 0x1::dex {
             used_y = amount_y;
         } else {
             assert!(reserve_x > 0 && reserve_y > 0, error::invalid_state(EINVALID_LIQUIDITY));
-            assert_mul_safe(amount_x, pool.lp_supply);
-            assert_mul_safe(amount_y, pool.lp_supply);
-            let share_x = (amount_x * pool.lp_supply) / reserve_x;
-            let share_y = (amount_y * pool.lp_supply) / reserve_y;
-            if (share_x < share_y) {
-                liquidity = share_x;
-            } else {
-                liquidity = share_y;
-            };
-            assert_mul_safe(liquidity, reserve_x);
-            assert_mul_safe(liquidity, reserve_y);
-            used_x = (liquidity * reserve_x) / pool.lp_supply;
-            used_y = (liquidity * reserve_y) / pool.lp_supply;
+            let (minted, take_x, take_y) =
+                deposit_amounts(amount_x, amount_y, reserve_x, reserve_y, pool.lp_supply);
+            liquidity = minted;
+            used_x = take_x;
+            used_y = take_y;
             minimum_lock = 0;
         };
 
@@ -202,10 +194,8 @@ module 0x1::dex {
 
         let reserve_x = coin::value(&pool.coin_x);
         let reserve_y = coin::value(&pool.coin_y);
-        assert_mul_safe(lp_amount, reserve_x);
-        assert_mul_safe(lp_amount, reserve_y);
-        let amount_x = (lp_amount * reserve_x) / pool.lp_supply;
-        let amount_y = (lp_amount * reserve_y) / pool.lp_supply;
+        let (amount_x, amount_y) =
+            withdrawal_amounts(lp_amount, reserve_x, reserve_y, pool.lp_supply);
 
         assert!(amount_x >= min_x && amount_y >= min_y, error::invalid_argument(EINVALID_LIQUIDITY));
         assert!(amount_x > 0 && amount_y > 0, error::invalid_argument(EINVALID_LIQUIDITY));
@@ -247,7 +237,7 @@ module 0x1::dex {
         coin::merge(&mut pool.coin_x, coin_x);
 
         let coin_y = coin::split(&mut pool.coin_y, amount_y_out);
-        coin::deposit<Y>(signer::address_of(account), coin_y);
+        deposit_to_signer<Y>(account, coin_y);
     }
 
     /// Swap Y to X in a canonical pool.
@@ -274,7 +264,57 @@ module 0x1::dex {
         coin::merge(&mut pool.coin_y, coin_y);
 
         let coin_x = coin::split(&mut pool.coin_x, amount_x_out);
-        coin::deposit<X>(signer::address_of(account), coin_x);
+        deposit_to_signer<X>(account, coin_x);
+    }
+
+    /// Pays `coins` to the signer, making its CoinStore first when it has
+    /// none (what a swap pays through): a trader who never held the output
+    /// coin used to pay gas for a swap that aborted in coin::deposit.
+    /// coin::register is idempotent, so a held store is left as it is.
+    public fun deposit_to_signer<T>(account: &signer, coins: Coin<T>) {
+        coin::register<T>(account);
+        coin::deposit<T>(signer::address_of(account), coins);
+    }
+
+    /// The LP the first deposit makes (MINIMUM_LIQUIDITY of it is locked):
+    /// floor(sqrt(amount_x * amount_y)), the product in u256 (two balances
+    /// at 18 decimals pass u128).
+    public fun first_liquidity(amount_x: u128, amount_y: u128): u128 {
+        sqrt((amount_x as u256) * (amount_y as u256))
+    }
+
+    /// A deposit into a funded pool: the LP it mints and the coins it takes.
+    /// Products in u256 (math), rounded for the pool: shares down, the coins
+    /// taken up, so no deposit takes a sub-unit less than its LP is worth.
+    /// The coins taken never exceed those offered: liquidity <= amount *
+    /// lp_supply / reserve, so liquidity * reserve / lp_supply <= amount.
+    public fun deposit_amounts(
+        amount_x: u128,
+        amount_y: u128,
+        reserve_x: u128,
+        reserve_y: u128,
+        lp_supply: u128
+    ): (u128, u128, u128) {
+        let share_x = math::mul_div_floor(amount_x, lp_supply, reserve_x);
+        let share_y = math::mul_div_floor(amount_y, lp_supply, reserve_y);
+        let liquidity = if (share_x < share_y) { share_x } else { share_y };
+        let used_x = math::mul_div_ceil(liquidity, reserve_x, lp_supply);
+        let used_y = math::mul_div_ceil(liquidity, reserve_y, lp_supply);
+        (liquidity, used_x, used_y)
+    }
+
+    /// The coins `lp_amount` of `lp_supply` withdraws: rounded down, for the
+    /// pool, with the products in u256.
+    public fun withdrawal_amounts(
+        lp_amount: u128,
+        reserve_x: u128,
+        reserve_y: u128,
+        lp_supply: u128
+    ): (u128, u128) {
+        (
+            math::mul_div_floor(lp_amount, reserve_x, lp_supply),
+            math::mul_div_floor(lp_amount, reserve_y, lp_supply)
+        )
     }
 
     /// Get current reserves and pool fee.
@@ -331,16 +371,20 @@ module 0x1::dex {
         false
     }
 
-    fun quote_out(amount_in: u128, reserve_in: u128, reserve_out: u128, fee_bp: u64): u128 {
+    /// The CPMM output for `amount_in` after the fee, rounded down (for the
+    /// pool). Numerator and denominator are u256: amount x 9970 x reserve
+    /// passes u128 at real pool sizes (10 wBTC into 100M AIN is 1e39).
+    public fun quote_out(amount_in: u128, reserve_in: u128, reserve_out: u128, fee_bp: u64): u128 {
         assert!(fee_bp < 10000, error::invalid_state(EINVALID_LIQUIDITY));
         let fee_multiplier = BPS_DENOMINATOR - (fee_bp as u128);
+        // Binds only past 3.4e34 coin units (above either coin's supply); it
+        // keeps amount_in_with_fee in u128, so the numerator fits u256.
         assert_mul_safe(amount_in, fee_multiplier);
-        let amount_in_with_fee = amount_in * fee_multiplier;
-        assert_mul_safe(amount_in_with_fee, reserve_out);
-        assert_mul_safe(reserve_in, BPS_DENOMINATOR);
-        let numerator = amount_in_with_fee * reserve_out;
-        let denominator = (reserve_in * BPS_DENOMINATOR) + amount_in_with_fee;
-        numerator / denominator
+        let amount_in_with_fee = ((amount_in * fee_multiplier) as u256);
+        let numerator = amount_in_with_fee * (reserve_out as u256);
+        let denominator = (reserve_in as u256) * (BPS_DENOMINATOR as u256) + amount_in_with_fee;
+        // At most reserve_out, so it narrows back to u128.
+        ((numerator / denominator) as u128)
     }
 
     fun assert_mul_safe(a: u128, b: u128) {
@@ -367,7 +411,9 @@ module 0x1::dex {
         left_len < right_len
     }
 
-    fun sqrt(y: u128): u128 {
+    /// floor(sqrt(y)). For y <= (2^128 - 1)^2, the largest product of two
+    /// u128s, the root fits u128.
+    fun sqrt(y: u256): u128 {
         if (y < 4) {
             if (y == 0) return 0;
             return 1
@@ -378,6 +424,6 @@ module 0x1::dex {
             z = x;
             x = (y / x + x) / 2;
         };
-        z
+        (z as u128)
     }
 }

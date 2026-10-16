@@ -322,13 +322,16 @@ fn import_accepts_consistent_nonempty_body_commitments_after_reopen() {
 
 /// B101 witness: a V4 import of a QC already stored, or of one for a height
 /// this node does not hold, runs no pairing (a replayed QC_CERT cost one and
-/// a synced commit each time).
+/// a synced commit each time). B443: the tip is written, as on every node
+/// holding a block: `may_hold_block` is exact then, and the pairing comes
+/// before the block is read.
 #[test]
 fn a_replayed_or_unheld_qc_costs_no_pairing() {
     let dir = TestDir::new();
     dir.seed(false);
     let db = dir.open();
     prepare_block(&db, 10);
+    db.put("latest_height", "10").unwrap();
     let cert = certificate(&db, 10);
     let staged = |cert: &QuorumCertificate| {
         db.transaction(|view| {
@@ -350,6 +353,192 @@ fn a_replayed_or_unheld_qc_costs_no_pairing() {
         1,
         "a replay or an unheld height was verified"
     );
+}
+
+/// B335 witness: a QC of a vote stored already, in another encoding (or
+/// over another signer subset), runs no pairing: exact equality was the
+/// only check, so each copy cost two pairings and a synced rewrite.
+#[test]
+fn a_qc_of_a_stored_vote_costs_no_pairing() {
+    let dir = TestDir::new();
+    dir.seed(false);
+    let db = dir.open();
+    prepare_block(&db, 10);
+    let cert = certificate(&db, 10);
+    let staged = |cert: &QuorumCertificate| {
+        db.transaction(|view| {
+            stage_imported_certificate(&view, cert)
+                .map_err(storage::StorageError::DatabaseOperation)
+        })
+        .unwrap()
+    };
+    assert!(staged(&cert), "vacuous: the first import was not stored");
+    let pairings = || QC_PAIRINGS.with(|p| p.get());
+    let before = pairings();
+    let mut padded = cert.clone();
+    padded.signer_bitmap.push(0);
+    assert!(!staged(&padded));
+    assert_eq!(pairings(), before, "a copy of a stored vote was verified");
+    // Its other bytes, a valid point (another vote's signature by the same
+    // key), take no pairing either: only the vote decides.
+    let mut ctx = ctx_for(10);
+    ctx.block_hash = "ff".repeat(32);
+    let set = load_validator_set_v1(&db).unwrap();
+    let other = signed_vote_msg(&[7; 32], "local", &vote_for(&ctx, &set));
+    let mut resigned = cert.clone();
+    resigned.aggregate_signature = hex::decode(other.signature).unwrap();
+    assert_ne!(resigned.aggregate_signature, cert.aggregate_signature);
+    assert!(!staged(&resigned));
+    assert_eq!(
+        pairings(),
+        before,
+        "another encoding of a stored vote was verified"
+    );
+}
+
+/// B353 witness: a QC sync verified before staging it with its block is not
+/// paired again (a synced block's QC was paired four times: at sync's
+/// check, when stored with the block, at adoption and at its retry).
+#[test]
+fn a_qc_sync_verified_is_not_paired_again_when_stored() {
+    let dir = TestDir::new();
+    dir.seed(false);
+    let db = dir.open();
+    prepare_block(&db, 10);
+    let cert = certificate(&db, 10);
+    let pairings = || QC_PAIRINGS.with(|p| p.get());
+    let before = pairings();
+    let stored = db
+        .transaction(|view| {
+            stage_block_qc(&view, &cert).map_err(storage::StorageError::DatabaseOperation)
+        })
+        .unwrap();
+    assert!(stored, "vacuous: the QC was not stored");
+    assert_eq!(pairings(), before, "a QC sync verified was paired again");
+}
+
+/// B355 witness: a QC in an encoding no producer writes (another version),
+/// for a held block awaiting its QC, is refused before the block is read,
+/// and charged: it read the whole block under the consensus lock and went
+/// uncharged, so a member sending them was never muted.
+#[test]
+fn a_non_canonical_qc_is_refused_charged_before_the_block_is_read() {
+    let dir = TestDir::new();
+    dir.seed(false);
+    let db = dir.open();
+    prepare_block(&db, 10);
+    let mut cert = certificate(&db, 10);
+    cert.version = crate::qc::QC_VERSION + 1;
+    let pairings = || QC_PAIRINGS.with(|p| p.get());
+    let before = pairings();
+    let (result, failed) = crate::work::failed_in(|| {
+        db.transaction(|view| {
+            stage_imported_certificate(&view, &cert)
+                .map_err(storage::StorageError::DatabaseOperation)
+        })
+    });
+    assert!(result.is_err(), "a non-canonical QC was taken");
+    assert_eq!(failed, 1, "the refusal was not charged");
+    assert_eq!(pairings(), before, "it was refused past the block read");
+}
+
+/// B443 witness: a QC for a held block awaiting its QC that fails its stake
+/// checks (no signer, a stake the committee does not give) or its pairing (a
+/// public QC's fields over another vote, as a sync session can send), or
+/// that names another epoch than its height's, is refused before the block
+/// is read, charged once. Past B355's checks the block was read whole under
+/// the writer gate first, and the stake and epoch refusals went uncharged,
+/// so B51 never muted the member. A QC that verifies reads its block once
+/// (it was read and parsed three times). On a V4 chain, where the held
+/// block binds the QC (IM-3).
+#[test]
+fn a_qc_failing_its_signature_checks_is_refused_charged_before_the_block_is_read() {
+    let dir = TestDir::new();
+    dir.seed(false);
+    let db = dir.open();
+    {
+        let _seed = db.seeding();
+        db.put(crate::v4::VERTEX_FORMAT_KEY, "4").unwrap();
+        db.put(crate::v4::epoch::EPOCH_INTERVAL_KEY, "1000")
+            .unwrap();
+    }
+    prepare_block(&db, 10);
+    db.put("latest_height", "10").unwrap();
+    let cert = certificate(&db, 10);
+    let staged = |cert: &QuorumCertificate| {
+        crate::work::failed_in(|| {
+            db.transaction(|view| {
+                stage_imported_certificate(&view, cert)
+                    .map_err(storage::StorageError::DatabaseOperation)
+            })
+        })
+    };
+    let reads = || HELD_BLOCK_READS.with(|n| n.get());
+    let mut no_signer = cert.clone();
+    no_signer.signer_bitmap.iter_mut().for_each(|b| *b = 0);
+    let mut wrong_stake = cert.clone();
+    wrong_stake.signed_stake += 1;
+    let mut forged = cert.clone();
+    forged.finality_digest = "ee".repeat(32);
+    let mut other_epoch = cert.clone();
+    other_epoch.epoch += 1;
+    for (what, junk) in [
+        ("no signer", no_signer),
+        ("a wrong stake", wrong_stake),
+        ("a forged signature", forged),
+        ("another epoch", other_epoch),
+    ] {
+        let before = reads();
+        let (result, failed) = staged(&junk);
+        assert!(result.is_err(), "{what}: the QC was taken");
+        assert_eq!(failed, 1, "{what}: not charged once");
+        assert_eq!(reads(), before, "{what}: the block was read first");
+    }
+    let before = reads();
+    let (result, failed) = staged(&cert);
+    assert!(result.unwrap(), "control: the QC is stored");
+    assert_eq!(failed, 0, "control: a valid QC was charged");
+    assert_eq!(
+        reads() - before,
+        1,
+        "the held block was read more than once"
+    );
+}
+
+/// B443 witness: on a V4 chain a node before its first block (no tip) holds
+/// none, so a QC naming any height runs no pairing. With no tip
+/// `may_hold_block` holds for any height, and the pairing comes before the
+/// block is read: each replayed valid QC cost such a node one (B101's cost).
+#[test]
+fn a_v4_node_before_its_first_block_pairs_no_qc() {
+    let dir = TestDir::new();
+    dir.seed(false);
+    let db = dir.open();
+    {
+        let _seed = db.seeding();
+        db.put(crate::v4::VERTEX_FORMAT_KEY, "4").unwrap();
+        db.put(crate::v4::epoch::EPOCH_INTERVAL_KEY, "1000")
+            .unwrap();
+    }
+    prepare_block(&db, 10);
+    let cert = certificate(&db, 10);
+    db.delete("block_10").unwrap();
+    let staged = |cert: &QuorumCertificate| {
+        db.transaction(|view| {
+            stage_imported_certificate(&view, cert)
+                .map_err(storage::StorageError::DatabaseOperation)
+        })
+        .unwrap()
+    };
+    let pairings = || QC_PAIRINGS.with(|p| p.get());
+    let before = pairings();
+    assert!(!staged(&cert), "a node holding no block stored a QC");
+    assert_eq!(pairings(), before, "a node holding no block paired a QC");
+    // Control: holding the block, with its tip, the QC is paired and stored.
+    prepare_block(&db, 10);
+    db.put("latest_height", "10").unwrap();
+    assert!(staged(&cert), "control: the QC is stored");
+    assert_eq!(pairings() - before, 1, "control: the QC was not paired");
 }
 
 /// B225 witness: a QC naming a height this node cannot hold (pruned, or

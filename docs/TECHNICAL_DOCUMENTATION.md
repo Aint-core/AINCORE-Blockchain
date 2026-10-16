@@ -147,29 +147,28 @@ openssl rand 32 > core/node/data/node.key
 
 # 2. Start node
 cargo run --bin node -- \
-    --port 9000 \
-    --api-port 8001 \
+    --port 9002 \
     --datadir ./data
 
-# 3. Check node status
-curl http://localhost:8001/rpc -X POST \
+# 3. Check node status (the RPC is the base port less 1000)
+curl http://localhost:8002/rpc -X POST \
     -H "Content-Type: application/json" \
-    -d '{"method": "get_status", "params": []}'
+    -d '{"jsonrpc":"2.0","id":1,"method":"aincore_getStatus","params":[]}'
 ```
 
 ### Run Multiple Nodes (Local Testnet)
 
 ```bash
-# Terminal 1: Genesis node
-cargo run --bin node -- --port 9000 --api-port 8001 --datadir ./data1
+# Terminal 1: Genesis node (RPC 8001)
+cargo run --bin node -- --port 9001 --datadir ./data1
 
-# Terminal 2: Second node (connect to first)
-cargo run --bin node -- --port 9001 --api-port 8002 --datadir ./data2 \
-    --bootnodes "/ip4/127.0.0.1/tcp/9000"
+# Terminal 2: Second node (RPC 8002), connected to the first
+cargo run --bin node -- --port 9002 --datadir ./data2 \
+    --bootnodes "/ip4/127.0.0.1/tcp/9001"
 
-# Terminal 3: Third node
-cargo run --bin node -- --port 9002 --api-port 8003 --datadir ./data3 \
-    --bootnodes "/ip4/127.0.0.1/tcp/9000"
+# Terminal 3: Third node (RPC 8003)
+cargo run --bin node -- --port 9003 --datadir ./data3 \
+    --bootnodes "/ip4/127.0.0.1/tcp/9001"
 ```
 
 ---
@@ -434,11 +433,11 @@ const TOPIC_DA_BATCHES: &str = "aincore/da/1.0.0";
 
 ```bash
 # Using multiaddr format
---bootnodes "/ip4/192.168.1.100/tcp/9000"
---bootnodes "/dns4/node1.aincore.io/tcp/9000"
+--bootnodes "/ip4/192.168.1.100/tcp/9002"
+--bootnodes "/dns4/node1.aincore.io/tcp/9002"
 
 # Multiple bootnodes
---bootnodes "/ip4/1.2.3.4/tcp/9000,/ip4/5.6.7.8/tcp/9000"
+--bootnodes "/ip4/1.2.3.4/tcp/9002,/ip4/5.6.7.8/tcp/9002"
 ```
 
 ---
@@ -447,12 +446,14 @@ const TOPIC_DA_BATCHES: &str = "aincore/da/1.0.0";
 
 ### JSON-RPC Endpoints
 
-Base URL: `http://localhost:8001/rpc`
+Base URL: `http://localhost:8002/rpc`
 
 #### Get Status
 ```json
 {
-    "method": "get_status",
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "aincore_getStatus",
     "params": []
 }
 ```

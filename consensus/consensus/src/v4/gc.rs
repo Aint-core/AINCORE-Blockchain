@@ -28,15 +28,8 @@ impl Engine {
         // is stale (IN-1 E3).
         self.body_wants.retain(|_, w| w.round > g);
         self.cert_wants.retain(|(r, _), _| *r > g);
-        let keep: Vec<Vertex> = self
-            .pending
-            .take_all()
-            .into_iter()
-            .filter(|v| v.round > g)
-            .collect();
-        for v in keep {
-            self.pending.push(v);
-        }
+        // B442: in place, so what the others wait on is kept.
+        self.pending.prune_to(g);
         // B255: never above the rounds kept for a block without a QC.
         let cut = self.retention_cut();
         self.collect_garbage(cut, net);

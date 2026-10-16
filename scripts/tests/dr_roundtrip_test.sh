@@ -4,9 +4,10 @@
 #
 # Proves scripts/backup_node.sh + scripts/restore_node.sh faithfully round-trip
 # a node datadir (DB + node.key + genesis), that the sha256 integrity sidecar
-# verifies, that integrity tampering is caught, and that restore refuses to
-# clobber a non-empty existing DB. Needs NO running node — it fabricates a
-# RocksDB-shaped datadir.
+# verifies, that integrity tampering is caught, that restore refuses to
+# clobber a non-empty existing DB, and that the default restore refuses a
+# datadir that already holds a node.key (B373). Needs NO running node — it
+# fabricates a RocksDB-shaped datadir.
 #
 # Run:  scripts/tests/dr_roundtrip_test.sh
 # Exit: 0 all pass, non-zero on first failure.
@@ -109,6 +110,29 @@ if "$RESTORE_SH" --backup "$TAMPERED" --datadir "$WORK/tamper-restore" \
   fail "restore accepted a tampered archive (sha256 mismatch not caught)"
 fi
 ok "restore rejects tampered archive (sha256 mismatch caught)"
+
+# --- 8. B373 witness: the default restore refuses a datadir that already
+#        holds a node.key (that key on an older database can double-sign).
+#        Before, it installed the DB, kept the key and said "fresh keypair".
+HASKEY="$WORK/haskey"
+mkdir -p "$HASKEY"
+head -c 32 /dev/urandom > "$HASKEY/node.key"
+cp "$HASKEY/node.key" "$WORK/haskey.node.key.orig"
+for mode in "" "--new-identity"; do
+  RC=0
+  # shellcheck disable=SC2086 # $mode is empty or one flag on purpose
+  "$RESTORE_SH" --backup "$ARCHIVE" --datadir "$HASKEY" --port 9103 $mode \
+    >"$WORK/haskey.out" 2>&1 || RC=$?
+  [[ "$RC" == 3 ]] || fail "restore ${mode:-(default)} with an existing node.key exited $RC, want 3"
+  cmp -s "$HASKEY/node.key" "$WORK/haskey.node.key.orig" \
+    || fail "restore ${mode:-(default)} changed the existing node.key"
+  [[ ! -e "$HASKEY/validator_9103.db" ]] \
+    || fail "restore ${mode:-(default)} installed a DB next to an existing node.key"
+  if grep -q "fresh keypair" "$WORK/haskey.out"; then
+    fail "restore ${mode:-(default)} printed 'fresh keypair' while a node.key is present"
+  fi
+done
+ok "restore refuses (exit 3) a datadir with a node.key, key untouched (B373)"
 
 echo ""
 echo "✅ DR ROUND-TRIP TEST PASSED ($PASS checks)"

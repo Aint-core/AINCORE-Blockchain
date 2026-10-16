@@ -12,10 +12,31 @@ use nonce_store::BridgeState;
 use std::env;
 use std::time::Duration;
 
+/// B332: the bridge cannot see a lock (it reads a raw `bridge_lock:` payload
+/// that admission refuses, and no stdlib module escrows AIN), its mint would
+/// revert (it signs `abi.encode`, the contract recovers `abi.encodePacked`),
+/// and its signature binds neither the EVM chain nor the contract. It runs
+/// only when its operator says it is an experiment.
+fn refuse_unless_experimental(flag: Option<String>) -> Result<(), String> {
+    if flag.as_deref() == Some("1") {
+        Ok(())
+    } else {
+        Err(
+            "the EVM bridge is not part of the launch (no lock it can see, mints that \
+             revert): set AINCORE_BRIDGE_EXPERIMENTAL=1 to run it against a test chain"
+                .to_string(),
+        )
+    }
+}
+
 #[tokio::main]
 async fn main() {
     dotenv().ok();
     env_logger::init();
+    if let Err(why) = refuse_unless_experimental(env::var("AINCORE_BRIDGE_EXPERIMENTAL").ok()) {
+        error!("❌ {why}");
+        std::process::exit(1);
+    }
 
     info!("🌉 AINCORE Bridge Service (Rust) Starting...");
 
@@ -24,12 +45,21 @@ async fn main() {
     let aincore_rpc =
         env::var("AINCORE_RPC").unwrap_or_else(|_| "http://localhost:8002/rpc".to_string());
     // B258: the chain is named, never assumed (the default was mainnet).
-    if aincore_client::configured_chain_id().is_none() {
+    let Some(chain_id) = aincore_client::configured_chain_id() else {
         error!(
             "❌ AINCORE_CHAIN_ID is not set: name the chain whose certificates this bridge accepts"
         );
         std::process::exit(1);
-    }
+    };
+    // B320: a finality vote binds the genesis too, so the one this bridge
+    // follows is installed before any certificate is verified.
+    let Some(genesis_identity) = aincore_client::configured_genesis_identity() else {
+        error!(
+            "❌ AINCORE_GENESIS_IDENTITY is not set: name the genesis whose certificates this bridge accepts"
+        );
+        std::process::exit(1);
+    };
+    blockchain::set_vertex_domain(&chain_id, &genesis_identity);
     let evm_rpc = env::var("EVM_RPC").unwrap_or_else(|_| "https://rpc.sepolia.org".to_string());
     let contract_addr = env::var("CONTRACT_ADDRESS")
         .unwrap_or_else(|_| "0x0000000000000000000000000000000000000000".to_string());
@@ -200,5 +230,17 @@ async fn main() {
         }
 
         tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// B332 witness: the bridge does not run unless its operator says it is
+    /// an experiment (it cannot see a lock, and its mints revert).
+    #[test]
+    fn the_bridge_runs_only_as_an_experiment() {
+        assert!(super::refuse_unless_experimental(None).is_err());
+        assert!(super::refuse_unless_experimental(Some("yes".into())).is_err());
+        assert!(super::refuse_unless_experimental(Some("1".into())).is_ok());
     }
 }

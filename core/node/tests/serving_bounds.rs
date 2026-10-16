@@ -152,7 +152,11 @@ async fn answers_a_non_reader_holds_are_bounded_and_freed_on_close() {
     // share (20 MiB) of the pool; the rest do not.
     const FIT: usize = OPEN_HELD_PER_GROUP_BYTES / ANSWER;
     const _: () = assert!(FIT < REQUESTS);
-    let node_under_test = start_node("held", ANSWER).await;
+    // B60 charges each 9 MiB answer 144 of a host's 128 tokens: an answer
+    // charged before the last request arrived refused it before it was ever
+    // served (one run in five on the NAS). Answered together, every request
+    // is admitted and the held-answer bound alone decides.
+    let node_under_test = start_node_answering_in_batches("held", ANSWER, REQUESTS).await;
     let (target, held, answered) = (
         node_under_test.target.clone(),
         Arc::clone(&node_under_test.held),
@@ -216,10 +220,12 @@ async fn a_reading_clients_answers_are_freed_as_written() {
         sessions::SYNC_RESPONSE_CAP,
     ));
     let node = connect(&mut reader, &target).await;
+    // A block request: its answer may be a whole batch (B200 caps a
+    // height's answer at 64 KiB on the reading side).
     for _ in 0..2 {
         reader
             .behaviour_mut()
-            .send_request(&node, "GET_HEIGHT".to_string());
+            .send_request(&node, "SYNC_REQ:{\"from_height\":0}".to_string());
     }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut read = 0;
@@ -273,6 +279,14 @@ impl Drop for NodeUnderTest {
 }
 
 async fn start_node(name: &str, answer: usize) -> NodeUnderTest {
+    start_node_answering_in_batches(name, answer, 1).await
+}
+
+/// As `start_node`, but the test's answers come only once `batch` requests
+/// have arrived (a node under load builds them later): every request of a
+/// burst is then admitted (B60 spends one token at arrival) before the first
+/// answer is charged its bytes, whatever the order the streams arrive in.
+async fn start_node_answering_in_batches(name: &str, answer: usize, batch: usize) -> NodeUnderTest {
     let mut dir = storage::test_dir::process_dir();
     dir.push(format!("aincore_serving_{name}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -314,9 +328,16 @@ async fn start_node(name: &str, answer: usize) -> NodeUnderTest {
     {
         let answered = Arc::clone(&answered);
         tokio::spawn(async move {
+            let mut waiting = Vec::new();
             while let Some(serve) = serves.recv().await {
-                let _ = serve.reply.send(Some("x".repeat(answer)));
-                answered.fetch_add(1, Ordering::SeqCst);
+                waiting.push(serve);
+                if waiting.len() < batch {
+                    continue;
+                }
+                for serve in waiting.drain(..) {
+                    let _ = serve.reply.send(Some("x".repeat(answer)));
+                    answered.fetch_add(1, Ordering::SeqCst);
+                }
             }
         });
     }

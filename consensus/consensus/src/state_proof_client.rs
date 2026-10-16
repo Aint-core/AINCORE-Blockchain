@@ -1,7 +1,9 @@
 //! G3 PF-2: what a client must check before it believes an
 //! `aincore_getStateProof` answer. Any failure means the answer is refused.
 //!
-//! 1. The QC verifies under the committee the client trusts for its epoch.
+//! 1. The QC verifies under the committee the client trusts for its epoch
+//!    (B320: and under the genesis it pins, installed first with
+//!    `blockchain::set_vertex_domain`: a finality vote binds it).
 //! 2. `qc.epoch` is the epoch the client expects for `qc.block_height`. The
 //!    client selects the committee by height from a committee chain it
 //!    trusts (TA). Until the committee record lands (S5), the caller
@@ -112,7 +114,7 @@ mod tests {
                 stake: 100,
                 ed25519_public_key: "00".repeat(32),
                 bls_public_key: hex::encode(bls.pubkey_raw(&ikm)),
-                bls_pop: hex::encode(bls.prove_possession_raw(&ikm)),
+                bls_pop: hex::encode(bls.prove_possession_raw(&ikm, &[0u8; 32])),
             });
             secrets.push(ikm);
         }

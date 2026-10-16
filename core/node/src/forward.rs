@@ -21,11 +21,19 @@
 //! holding more than a third of the committee's stake refused it (and at
 //! least `REFUSALS_TO_DROP` of them), or once it is `FORWARD_TTL_SECS` old,
 //! never by how many passes it took, so the Byzantine minority cannot drop
-//! it however it sits in the rotation. Each pass and each re-forward asks
+//! it however it sits in the rotation. B452: no block settled a dropped one
+//! here, so it leaves with its dedup identity (`drop_unexecuted`) and its
+//! sender may submit the same bytes again (one that ran is refused by its
+//! used sequence number). Each pass and each re-forward asks
 //! the members that have not answered for it first (three adjacent
 //! accept-and-drop members held every re-forward). A busy member says so
 //! (`TX_BUSY`) and was not asked; only one that let the timeout run is
 //! skipped for `SILENT_FOR`; one ask is in flight to a member at a time.
+//!
+//! B462: one members over a third of the stake refused for now is deferred
+//! (`Mempool::defer`): a full pool evicts it for a ready transaction. B476:
+//! a loan to the forwarder is no vertex's, so a fee-bumped replacement takes
+//! its place (`Mempool::loan_for_forwarding_at`).
 
 use mempool::Mempool;
 use serde::{Deserialize, Serialize};
@@ -344,6 +352,17 @@ impl ForwardState {
         (r.accepted, r.refused)
     }
 
+    /// B462: the members whose last answer for `tx` was a refusal for now
+    /// (one that took it since is out of the set, `note`).
+    fn refused_for_now(&self, tx: &str) -> Members {
+        let key = storage::StateDB::raw_tx_hash(tx);
+        self.forwarded
+            .lock()
+            .ok()
+            .and_then(|f| f.by_tx.get(&key).map(|r| r.later))
+            .unwrap_or_default()
+    }
+
     /// B232: `peer` refused `tx` for now, at `now_secs`.
     fn note_later(&self, tx: &str, peer: &str, now_secs: u64) {
         let key = storage::StateDB::raw_tx_hash(tx);
@@ -406,11 +425,14 @@ thread_local! {
 /// transaction the mempool has seen, or of one earlier in `txs`, is refused
 /// before any signature is checked: each copy was checked in full (64
 /// copies of one signed transaction, 64 checks, refused only afterwards).
+/// B475: its lock of the pool lets a waiting consensus thread go first
+/// (B259), as an admission's does: every RPC send took it at once.
 pub fn check_from_outside(
     mempool: &Mutex<Mempool>,
     txs: Vec<String>,
 ) -> Vec<Result<(String, executor::admission::CheckedTx), String>> {
     let keys: Vec<Option<String>> = txs.iter().map(|tx| Mempool::dedup_key(tx)).collect();
+    mempool::yield_to_consensus();
     let held: Vec<bool> = match mempool.lock() {
         Ok(mp) => keys
             .iter()
@@ -573,7 +595,9 @@ pub async fn forward_once_at(
     let loaned: Vec<String> = match mempool.lock() {
         Ok(mut mp) => {
             mp.requeue_stale_uncapped_at(FORWARD_RETRY_SECS, now_secs);
-            mp.get_pending_transactions_at(FORWARD_BATCH * 4, now_secs)
+            // B476: loaned to this forwarder, not to a vertex: a fee-bumped
+            // replacement takes an original's place while it is forwarded.
+            mp.loan_for_forwarding_at(FORWARD_BATCH * 4, now_secs)
         }
         Err(_) => return 0,
     };
@@ -589,8 +613,11 @@ pub async fn forward_once_at(
         now_secs.saturating_sub(state.record(tx, now_secs).first_secs) >= FORWARD_TTL_SECS
     });
     if !expired.is_empty() {
+        // B452: no block ran it: its identity goes too, so its sender may
+        // submit it again (`mark_executed` kept it, refusing the same bytes
+        // as a duplicate).
         if let Ok(mut mp) = mempool.lock() {
-            mp.mark_executed(&expired);
+            mp.drop_unexecuted(&expired);
         }
         state.forget(&expired);
     }
@@ -671,6 +698,8 @@ async fn send_batch(
     // the order answered each transaction this pass.
     let mut later: HashSet<String> = HashSet::new();
     let mut answered: HashMap<String, usize> = HashMap::new();
+    // B462: taken by a member this pass.
+    let mut took_now: HashSet<String> = HashSet::new();
     // A committee whose stakes this node does not know counts each member
     // as one.
     let total = match state.total_stake() {
@@ -733,6 +762,7 @@ async fn send_batch(
         for (tx, verdict) in pending.into_iter().zip(verdicts) {
             match verdict {
                 Verdict::Accepted(_) => {
+                    took_now.insert(tx.clone());
                     let (took, refused) = state.note(&tx, peer, true);
                     // B154: taken before and not settled (it came back):
                     // on to the members not tried yet, until those that
@@ -756,7 +786,8 @@ async fn send_batch(
                     }
                 }
                 // B201: kept to its TTL whoever says so (the fee, the
-                // pool's room, a nonce gap, the payer's balance). B232: and
+                // pool's room, a nonce gap, the payer's balance, B453: a
+                // sequence on loan to a vertex). B232: and
                 // asked of the next member in this pass: B216 left it on
                 // loan at the first, so a member first in a sender's order
                 // that always said so censored its senders for free. Once
@@ -782,10 +813,28 @@ async fn send_batch(
         }
         pending = next;
     }
+    // B462: of what was answered this pass, what members over a third of
+    // the stake (at least `REFUSALS_TO_DROP`: the rule a refusal for good
+    // drops by) last answered with a refusal for now is deferred, the rest
+    // is not (read before the mempool's lock: none may hold the two
+    // together). Neither one member nor the Byzantine minority defers a
+    // transaction, and neither a silent member nor one that takes and
+    // drops it keeps one from being deferred.
+    let (mut deferred, mut cleared) = (Vec::new(), Vec::new());
+    for tx in later.union(&took_now) {
+        let refusers = state.refused_for_now(tx);
+        if refusers.len() >= REFUSALS_TO_DROP && stake_in(&refusers) * 3 > total {
+            deferred.push(tx.clone());
+        } else {
+            cleared.push(tx.clone());
+        }
+    }
     if let Ok(mut mp) = mempool.lock() {
-        // Refused by enough members: dropped here too (a used nonce, a payer
-        // that cannot pay, a transaction they already hold).
-        mp.mark_executed(&dropped);
+        // Refused by enough members: dropped here too (a used nonce, a
+        // transaction they already hold). B452: it did not run here, so its
+        // identity goes too: its sender may submit it again.
+        mp.drop_unexecuted(&dropped);
+        mp.defer(&deferred, &cleared);
         // Not settled: back to the front of the queue, in order. B133: no
         // pass counts against a transaction (busy or silent members, a
         // refusing minority); what bounds it is its TTL. B216/B232: one a

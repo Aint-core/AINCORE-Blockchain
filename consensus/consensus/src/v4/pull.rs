@@ -208,7 +208,7 @@ pub struct Want {
 impl Want {
     /// `start` spreads the rotation: wants made in one tick do not all ask
     /// the same peer first.
-    fn new(round: u64, targets: Arc<[String]>, start: usize, now: u64) -> Self {
+    pub(super) fn new(round: u64, targets: Arc<[String]>, start: usize, now: u64) -> Self {
         Self {
             round,
             targets,
@@ -355,6 +355,23 @@ impl Engine {
         // only if it joins a batch already open for its target, or a new
         // request is still allowed; otherwise it stays due for the next tick.
         let mut requests_left = CLIENT_REQS_PER_TICK.saturating_sub(self.sent.1);
+        // B318: bodies take at most half the requests while a certificate
+        // is due. Bodies came first and took every request: a member coming
+        // back whose due body wants named eight targets (f members minted
+        // certificates for their unused slots past its lead) asked for no
+        // certificate again. B344: a body past this node's lead is asked
+        // for like any other: after a long run of skipped anchors, the
+        // payload-free bodies past the lead are what a member coming back
+        // needs to decide the block waiting on its vote (B318 skipped them,
+        // and with f members withholding votes no QC formed again). One
+        // with a payload is dropped on arrival before any check, and its
+        // want backs off to `T_FETCH_MAX`.
+        let certs_due = self.cert_wants.values().any(|w| w.peek(now).is_some());
+        let mut body_requests = if certs_due {
+            requests_left / 2
+        } else {
+            requests_left
+        };
         let mut bodies: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for (digest, want) in self.body_wants.iter_mut() {
             let Some(target) = want.peek(now) else {
@@ -367,9 +384,10 @@ impl Engine {
             }
             let open = bodies.get(target).map_or(0, Vec::len);
             if open.is_multiple_of(MAX_REQ_DIGESTS) {
-                if requests_left == 0 {
+                if body_requests == 0 {
                     continue;
                 }
+                body_requests -= 1;
                 requests_left -= 1;
             }
             let target = want.take_turn(now).expect("peeked");

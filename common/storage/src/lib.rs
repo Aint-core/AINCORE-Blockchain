@@ -240,6 +240,10 @@ impl StateDB {
         self.write_batch(batch)
     }
 
+    /// A row as text. B456: a row that is not UTF-8 reads as `None`; in a
+    /// transaction view it also refuses the view's commit, outside one
+    /// nothing reports it. A caller that must tell a corrupt row from an
+    /// absent one takes [`Self::try_get`].
     pub fn get(&self, key: &str) -> std::result::Result<Option<String>, rocksdb::Error> {
         match self.db.get(key) {
             Ok(Some(v)) => match String::from_utf8(v) {
@@ -251,6 +255,24 @@ impl StateDB {
             },
             Ok(None) => Ok(None),
             Err(e) => Err(e),
+        }
+    }
+
+    /// B456: [`Self::get`] that tells a corrupt row from an absent one: a
+    /// row that is not UTF-8 is an error (in a transaction view it also
+    /// refuses the commit), as a read error is.
+    pub fn try_get(&self, key: &str) -> Result<Option<String>, StorageError> {
+        match self.db.get(key)? {
+            None => Ok(None),
+            Some(raw) => match String::from_utf8(raw) {
+                Ok(text) => Ok(Some(text)),
+                Err(_) => {
+                    self.db.invalid_read();
+                    Err(StorageError::DatabaseOperation(format!(
+                        "{key} is not UTF-8"
+                    )))
+                }
+            },
         }
     }
 
@@ -286,6 +308,13 @@ impl StateDB {
     /// Bounded prefix scanner. Stops iterating after `limit` matches.
     /// Use this from hot paths where the caller can reason about the
     /// expected upper bound (e.g. validator count, miner count).
+    ///
+    /// B456: unchecked. A read error ends the scan: a transaction view
+    /// refuses its commit, but outside one the caller cannot tell (the
+    /// error is only logged) and the answer is the rows before it. A row
+    /// that is not UTF-8 is converted lossily, and in a view it refuses the
+    /// commit, as one read by `get` does. A caller whose decision needs the
+    /// whole range takes [`Self::try_scan_prefix`], or reads inside a view.
     pub fn scan_prefix_limited(&self, prefix: &str, limit: usize) -> Vec<(String, String)> {
         if limit == 0 {
             return Vec::new();
@@ -295,9 +324,21 @@ impl StateDB {
         let prefix_bytes = prefix.as_bytes();
         let iter = self.db.prefix_iterator(prefix_bytes);
 
-        for (key, value) in iter.flatten() {
+        for row in iter {
+            let (key, value) = match row {
+                Ok(row) => row,
+                Err(e) => {
+                    eprintln!("[STORAGE] scan of {prefix} cut by a read error: {e}");
+                    break;
+                }
+            };
             if !key.starts_with(prefix_bytes) {
                 break;
+            }
+            // B456: as `get` does, a row that is not UTF-8 refuses a view's
+            // commit (a no-op outside one); the answer keeps it, lossily.
+            if std::str::from_utf8(&key).is_err() || std::str::from_utf8(&value).is_err() {
+                self.db.invalid_read();
             }
             let k = String::from_utf8_lossy(&key).into_owned();
             let v = String::from_utf8_lossy(&value).into_owned();
@@ -307,6 +348,47 @@ impl StateDB {
             }
         }
         results
+    }
+
+    /// B456: every row under `prefix`, or an error where the unchecked
+    /// scans give a shorter or altered answer: a read error partway (they
+    /// end there, and outside a transaction view nothing reports it), a key
+    /// or value that is not UTF-8 (they convert it lossily; in a view it
+    /// also refuses the commit, as `get` does), or more than
+    /// [`Self::SCAN_PREFIX_HARD_CAP`] rows (they stop at the cap). For a
+    /// caller whose decision needs the whole range: the CE-3 pin check read
+    /// a cut scan as "this node did not order the other twin".
+    pub fn try_scan_prefix(&self, prefix: &str) -> Result<Vec<(String, String)>, StorageError> {
+        self.try_scan_prefix_at_most(prefix, Self::SCAN_PREFIX_HARD_CAP)
+    }
+
+    /// [`Self::try_scan_prefix`] for a range that must hold at most `max`
+    /// rows: more is an error, not the first `max`.
+    pub fn try_scan_prefix_at_most(
+        &self,
+        prefix: &str,
+        max: usize,
+    ) -> Result<Vec<(String, String)>, StorageError> {
+        let refuse =
+            |why: &str| StorageError::DatabaseOperation(format!("a scan of {prefix}: {why}"));
+        let text = |bytes: Box<[u8]>| String::from_utf8(bytes.into_vec()).ok();
+        let prefix_bytes = prefix.as_bytes();
+        let mut results = Vec::new();
+        for row in self.db.prefix_iterator(prefix_bytes) {
+            let (key, value) = row.map_err(|e| refuse(&format!("a read error: {e}")))?;
+            if !key.starts_with(prefix_bytes) {
+                break;
+            }
+            if results.len() == max {
+                return Err(refuse(&format!("more than {max} rows")));
+            }
+            let (Some(key), Some(value)) = (text(key), text(value)) else {
+                self.db.invalid_read();
+                return Err(refuse("a row is not UTF-8"));
+            };
+            results.push((key, value));
+        }
+        Ok(results)
     }
 
     // === PEER ADDRESSES (libp2p dial book; G4 S6: the legacy `peer:` and
@@ -339,27 +421,21 @@ impl StateDB {
     }
 
     /// Every saved peer address: (peer, address, saved at). A row written
-    /// before B43 (the bare address) counts as saved at 0.
+    /// before B43 (the bare address) counts as saved at 0. B456: the
+    /// unchecked scan (a read error ends it, logged): the rows are dial
+    /// hints, and one a read error hides is only not dialled this boot.
     fn scan_peer_rows(&self) -> Vec<(String, String, u64)> {
-        let mut peers = Vec::new();
-        let prefix = b"peer_addr:";
-        let iter = self.db.prefix_iterator(prefix);
-
-        for (key, value) in iter.flatten() {
-            if !key.starts_with(prefix) {
-                break;
-            }
-
-            let k = String::from_utf8_lossy(&key).into_owned();
-            let node_id = k.replace("peer_addr:", "");
-            let value = String::from_utf8_lossy(&value).into_owned();
-            let (saved_at, addr) = match value.split_once(' ') {
-                Some((at, addr)) => (at.parse().unwrap_or(0), addr.to_string()),
-                None => (0, value),
-            };
-            peers.push((node_id, addr, saved_at));
-        }
-        peers
+        self.scan_prefix("peer_addr:")
+            .into_iter()
+            .map(|(key, value)| {
+                let node_id = key.replace("peer_addr:", "");
+                let (saved_at, addr) = match value.split_once(' ') {
+                    Some((at, addr)) => (at.parse().unwrap_or(0), addr.to_string()),
+                    None => (0, value),
+                };
+                (node_id, addr, saved_at)
+            })
+            .collect()
     }
 
     pub fn scan_peer_addrs(&self) -> Vec<(String, String)> {
@@ -384,22 +460,6 @@ impl StateDB {
             .collect()
     }
 
-    pub fn scan_vertices(&self) -> Vec<String> {
-        let mut vertices = Vec::new();
-        let prefix = b"vertex:";
-        let iter = self.db.prefix_iterator(prefix);
-
-        for (key, value) in iter.flatten() {
-            if !key.starts_with(prefix) {
-                break;
-            }
-
-            let v_json = String::from_utf8(value.to_vec()).unwrap_or_else(|_| "{}".to_string());
-            vertices.push(v_json);
-        }
-        vertices
-    }
-
     pub fn put_object(&self, object: &Object) -> std::result::Result<(), StorageError> {
         let key = format!("obj:{}", object.id);
         let value = serde_json::to_string(object).unwrap_or_default(); // Safe default or error? Default is ok for prototype.
@@ -421,12 +481,24 @@ impl StateDB {
         self.db.flush()
     }
 
-    /// Get current blockchain height
+    /// Get current blockchain height. B456: a read error and a row that is
+    /// not a height read as 0; [`Self::try_chain_height`] tells them apart.
     pub fn get_chain_height(&self) -> u64 {
         match self.get("latest_height") {
             Ok(Some(h)) => h.parse::<u64>().unwrap_or(0),
             _ => 0,
         }
+    }
+
+    /// B456: the stored chain height, or an error for a read error or a row
+    /// that is not a height. An absent row is 0 (a fresh database).
+    pub fn try_chain_height(&self) -> Result<u64, StorageError> {
+        let Some(height) = self.try_get("latest_height")? else {
+            return Ok(0);
+        };
+        height.parse().map_err(|_| {
+            StorageError::SerializationError(format!("latest_height is {height:?}, not a height"))
+        })
     }
 
     /// Save block as JSON string — atomically updates height, hash, AND
@@ -705,6 +777,9 @@ impl StateDB {
         }
     }
 
+    /// An object. B456: a read error and a row that does not decode read as
+    /// `None`; in a transaction view they also refuse the view's commit,
+    /// outside one nothing reports them.
     pub fn get_object(&self, object_id: &str) -> Option<Object> {
         let key = format!("obj:{}", object_id);
         match self.db.get(key) {
@@ -782,8 +857,15 @@ impl StateDB {
         // Scan all block_* keys. We don't use scan_prefix because that
         // returns Vec<(String,String)> — we want to stream into a single
         // WriteBatch without intermediate Vec materialisation.
+        //
+        // B456: a read error stops the migration before its sentinel. The
+        // scan ended there, and the sentinel marked the migration done over
+        // blocks it never read: their transactions were never indexed.
+        let unreadable_block =
+            |e: rocksdb::Error| StorageError::DatabaseOperation(format!("tx_index backfill: {e}"));
         let iter = self.db.prefix_iterator(b"block_");
-        for (key_bytes, value_bytes) in iter.flatten() {
+        for row in iter {
+            let (key_bytes, value_bytes) = row.map_err(unreadable_block)?;
             if !key_bytes.starts_with(b"block_") {
                 break;
             }

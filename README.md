@@ -15,16 +15,16 @@ AINCORE is a high-performance Layer-1 blockchain built entirely in Rust, featuri
 
 ### Key Features
 
-- **Consensus:** DAG-BFT (Bullshark-inspired) with VDF random beacon for unpredictable leader election
+- **Consensus:** DAG-BFT (Bullshark-inspired); leaders follow a public schedule (`committee::leader_for_round`): the VDF beacon feeds nothing in consensus, so leaders are predictable
 - **Execution:** Parallel Move VM with conflict-aware batch scheduling (Rayon)
 - **Smart Contracts:** Move language (Aptos-compatible) for resource-safe programmability
 - **Staking:** DPoS with 1,000 AIN minimum stake, 21-day unbonding, delegation pools with commission
 - **Emission:** 1.90 % per year of the remaining reserve (the 150M cap minus everything minted), paid every reward period by consensus time, so it does not depend on block speed
 - **Slashing:** equivocation only, by the share of stake that equivocated together: `(3 × share)²`, at least 1 %, 100 % from a third (any safety attack); the operator's own stake pays first, and the offender is jailed for good
-- **Genesis Lock:** Founder's pre-mine is **mathematically locked** in smart contract — cannot be transferred or sold
+- **Genesis:** genesis mints only the validator stakes and account balances its `genesis.json` lists ([Genesis Allocation](#genesis-allocation)); bootstrap weight fills the first committee and carries no coins; no key holds a mint or oracle authority at genesis (B314)
 - **Token Factory:** Create custom tokens (ERC-20 equivalent) on-chain
 - **DEX:** Built-in AMM (Constant Product x*y=k) with 0.3% fee
-- **DePIN Integration:** Bio-Oracle for real-world data mining (Universal Mining)
+- **DePIN Integration:** Bio-Oracle for real-world data mining (Universal Mining); inactive at launch: the oracle has no feeder at genesis (B314) and DePIN gets no share of emission
 - **Security:** Ed25519 + ML-DSA-65 (FIPS 204, post-quantum) transaction signatures, ChaCha20-Poly1305 encrypted P2P, full-transaction replay protection
 - **Downtime Detection:** Validators missing 100+ rounds are detected and attested (gossip) but NOT slashed in this protocol version; only equivocation is slashed (see Slashing), through evidence carried in the DAG
 
@@ -36,26 +36,41 @@ AINCORE is a high-performance Layer-1 blockchain built entirely in Rust, featuri
 |---|---|
 | **Native Coin** | **$AIN** |
 | **Max Supply** | 150,000,000 AIN (Hard Cap, enforced in smart contract) |
-| **Genesis Allocation** | ~1,050,000 AIN (0.7% — Validator Stake + Treasury) |
-| **Community Supply** | ~148,950,000 AIN (99.3% — the emission reserve, paid to validators and their delegators) |
+| **Genesis Allocation** | what `genesis.json` lists, within the cap: genesis validators' stake (bonded) and genesis accounts' balances (liquid); bootstrap weight carries no coins. Mainnet plan: at most 1,500,000 AIN (1 %), none of it to the founder ([details](#genesis-allocation)) |
+| **Emission Reserve** | the cap minus the genesis allocation (at least 148,500,000 AIN, 99 %, on the mainnet plan), minted only as emission to the committee and its delegators |
 | **VC Allocation** | **0% (Zero)** |
 | **Emission** | 1.90 % per year of the remaining reserve, paid to the committee every reward period (20 blocks) for the consensus time since the last payout |
 | **Emission Formula** | `e = remaining × λ × Δτ`, λ = −ln(0.981) per year; half of the reserve is emitted after about 36 years |
-| **Reward Split** | each committee member's share by stake (capped at 1/50 of the total); its own part and its commission go to the validator, the rest to its delegators by points |
-| **Fees** | EIP-1559 base fee (burned) that moves at most 1/8 a block toward half-full blocks; the tip above it: 10 % burned, then 20 % to the anchor leader and 80 % to the committee by stake. Gas includes 400 per transaction byte |
+| **Reward Split** | each committee member's share is its weight (own stake, its pool's coins and any bootstrap weight) over the committee's weight, or over `s_min` when the committee weighs less (the unpaid rest stays in the reserve); its own part, bootstrap weight included, and its commission go to the validator, the rest to its delegators by points |
+| **Fees** | EIP-1559 base fee (burned) that moves at most 1/8 a block toward half-full blocks; the tip above it: 10 % burned, then 20 % to the anchor leader and 80 % to the committee by weight, both against at least `s_min` (the part a lighter committee leaves is burned). Gas includes 400 per transaction byte |
 | **Min Validator Stake** | 1,000 AIN |
 | **Unbonding Period** | 21 days of consensus time, counted from the end of the last committee epoch |
 | **Slashing Penalty** | equivocation only: `(3 × share that equivocated together)²`, minimum 1 %, 100 % from a third; settled once, when every correlated piece of evidence is in; the operator's own stake pays first |
 | **Commission** | at most 30 %; an increase is at most 5 percentage points and takes effect after 7 days; a decrease applies at once |
 
-### Fairlaunch Model (No-VC, Hyperliquid-Style)
+### Fair Launch (No VC)
 
-AINCORE follows a **No-VC Fairlaunch** model inspired by Hyperliquid:
-
-1. **Genesis Validator Lock:** The founder's initial stake (used to bootstrap the network) is **permanently locked** at the protocol level. The `Executor` rejects any `transfer` transaction from the Genesis address. This is enforced in code, not by promise.
+1. **Founder:** the mainnet plan gives the founder no genesis coins. Its validators run on bootstrap weight alone and earn emission by it, like any operator (see [Genesis Allocation](#genesis-allocation)). Nothing locks genesis stake: it is ordinary stake.
 2. **Zero VC/Presale:** No tokens were sold to venture capitalists or institutional investors at a discount.
-3. **99.3% Community Owned:** Nearly all tokens are minted over time as staking rewards: 1.90 % a year of the remaining reserve, paid to the committee and its delegators. DePIN mining receives no share of emission at launch.
-4. **Fees:** each block's base fee (EIP-1559) is burned for every unit of gas charged; of the tip above it, 10 % is burned, then 20 % goes to the block's anchor leader and 80 % to the committee by stake. Only transactions that executed and paid are stored in a block.
+3. **At least 99 % minted as emission:** on the mainnet plan, everything beyond the genesis allocation (at most 1 % of the cap) is minted over time as staking rewards: 1.90 % a year of the remaining reserve, paid to the committee and its delegators. DePIN mining receives no share of emission at launch.
+4. **Fees:** each block's base fee (EIP-1559) is burned for every unit of gas charged; of the tip above it, 10 % is burned, then 20 % goes to the block's anchor leader and 80 % to the committee by weight. Only transactions that executed and paid are stored in a block.
+
+### Genesis Allocation
+
+Genesis mints exactly what `genesis.json` lists (`build_genesis` in `core/node/src/genesis.rs`), and refuses a file whose total passes the 150M cap:
+
+- **Validator stake**, bonded from the first block (a genesis validator's coin store starts empty): at least 1,000 AIN, or 0 for an operator with bootstrap weight. It is ordinary stake: leaving the validator set and 21 days of unbonding return it.
+- **Account balances**, liquid.
+- **Bootstrap weight** (G5 amendment A4) is consensus weight with no coins: it is never in a coin store, a stake or the supply. It fills the genesis committee up to `s_min`, shrinks as owned stake grows, and ends for good once owned stake has held `s_min` for 21 days. An operator forfeits its weight when it is jailed, leaves the validator set, or its participation score (a moving average of the leader slots it commits) falls below one half. It earns emission as stake does. With bootstrap weight, genesis refuses a committee in which one party (a validator, or the validators declaring one entity) holds a third or more.
+- **Nothing else:** no treasury (B7: genesis refuses a nonzero `treasury_reserve`), and no key holds a mint or oracle authority (B314: wBTC's mint authority is an address no key signs for, and the DePIN oracle has no feeder).
+
+The node checks the cap and the shape of the file, not who receives the coins: that is a rule of the genesis ceremony, and the file and the founder's addresses are public. The mainnet plan (`docs/G5_ECONOMICS_CONTRACT.md` amendment A4, `docs/research/genesis_bootstrap.md`):
+
+- At most 1,500,000 AIN (1 % of the cap), earned on the incentivized testnet and computed by `genesis-tool score-testnet`: 1,000,000 AIN bonded, split equally among the qualified operators (at least five), and at most 500,000 AIN liquid for the public track (at most 1,000 AIN per funding cluster; what that cap leaves is never minted).
+- No coins for the founder: its testnet validators are never scored or paid. Its validators hold bootstrap weight only, at most 30 % of `s_min` (18,500,000 AIN).
+- By that weight the founder's validators earn about 30 % of the emission at launch, less as owned stake replaces bootstrap weight. No way to waive it is implemented.
+
+A testnet's genesis lists what its operator chose. AINCORE-TESTNET-V4 predates bootstrap weight: its genesis gave the founder's four validators 4,625,000 AIN each as ordinary stake, a stand-in for `s_min`. Testnet AIN does not carry over: the mainnet allocation is computed from the testnet's leader slots and transactions, never from its balances.
 
 ---
 
@@ -66,10 +81,9 @@ AINCORE follows a **No-VC Fairlaunch** model inspired by Hyperliquid:
 │                    AINCORE Node                       │
 ├───────────┬───────────┬───────────┬──────────────────┤
 │  P2P Net  │  Mempool  │  DAG-BFT  │ Ordering Engine  │
-│ (AES-GCM) │ (Ed25519) │(Bullshark)│ (Commit/VDF)     │
+│  (Noise)  │ (Ed25519) │(Bullshark)│ (Commit)         │
 ├───────────┴───────────┴───────────┴──────────────────┤
 │          Executor (Parallel Batch Scheduling)         │
-│          ├── Genesis Lock (Anti-Rugpull)              │
 │          └── Gas Abstraction (Paymaster)              │
 ├──────────────────────────────────────────────────────┤
 │          Move VM (Smart Contracts)                    │
@@ -115,7 +129,7 @@ cargo build --release
 ### Run a Local Dev Node
 
 ```bash
-cargo run --release -p node -- --port 9000 --datadir .aincore
+cargo run --release -p node -- --datadir .aincore
 ```
 
 The node will start producing blocks and expose the JSON-RPC API at `http://localhost:8002/rpc`.
@@ -127,6 +141,10 @@ The node will start producing blocks and expose the JSON-RPC API at `http://loca
 cargo run --release -p bench-tps -- --rpc http://127.0.0.1:8002/rpc \
   --chain-id "$AINCORE_CHAIN_ID" --funder-key ./funder.key
 ```
+
+It shows the node's gas price and the most the run can pay in fees, and asks
+to confirm before the funder signs anything (B381). `--max-gas-price <quanta>`
+refuses a higher node price; `--assume-yes` skips the question.
 
 ---
 
@@ -456,35 +474,65 @@ cargo build --release
 
 ### Step 2: Generate Your Validator Identity
 
+<!-- B380: Steps 2 to 7 and "Leaving the Validator Set" described CLI
+behaviour that does not exist (keygen writing ~/.aincore/wallet.key and a
+seed phrase, register-validator without a chain id or fee prompt, and the
+enable-delegation, leave-validator and withdraw-unbonded commands). They now
+use the commands of core/cli/src/main.rs and say what the CLI cannot do. -->
+
+The validator's key is the node's `node.key` in its datadir: the node signs
+with it, and `register-validator` must be signed by the same key (it registers
+the signer's own Ed25519 key, and derives the BLS key from it). One file, two
+roles. `scripts/validator-join/join-validator.sh` (`prepare`, `start`, `join`,
+`verify`) runs Steps 2 to 6 for you.
+
 ```bash
 # Build the CLI wallet
 cargo build --release --bin aincore-cli
 
-# Generate a new keypair (saves to ~/.aincore/wallet.key)
-./target/release/aincore-cli keygen
+# keygen LOADS the key file named by --keyfile (default ./wallet.key, in the
+# working directory) and prints its address. It creates the file only when it
+# is missing and AINCORE_ALLOW_PLAINTEXT_WALLET=1 is set: a plaintext key, 0600.
+mkdir -p /var/aincore/data
+AINCORE_ALLOW_PLAINTEXT_WALLET=1 ./target/release/aincore-cli \
+  --keyfile /var/aincore/data/node.key keygen
 ```
 
-**IMPORTANT:** This will output your:
-- **Address** (32-char hex) — Your public validator address
-- **Public Key** (64-char hex) — Your identity on the network
-- **Seed Phrase** (24 words) — **BACK THIS UP SECURELY. NEVER SHARE IT.**
+It prints three lines, and no seed phrase (there is none: the key file is the
+only copy of the key, so back it up, `chmod 600`, never share it):
+- **Address** — the display form (`A1n…`)
+- **Address (hex)** — 64 hex characters, the form the RPC and `/get_validators` use
+- **Public Key** — the Ed25519 public key, 64 hex characters
+
+`aincore-cli keys generate [--out DIR]` makes a password-encrypted keystore
+instead (in `~/.aincore/keys` by default), used with `--keystore <file>`. It
+suits a spending wallet, not a validator: the node cannot read a keystore, so
+a validator registered from one is not the key the node signs with.
 
 ### Step 3: Get 1,000 AIN Tokens
 
-Before you can stake, your wallet must hold at least **1,000 AIN**.
+Before you can stake, the key must hold at least **1,000 AIN** plus the fee of
+the registration.
 
-- **Testnet:** Request tokens from the faucet or existing validators
+- **Testnet:** ask the network operator to send AIN to your 64-hex address
+  (there is no public faucet; the CLI's `faucet <address> <AIN>` is a plain
+  transfer from the signer's own wallet)
 - **Mainnet:** Acquire AIN through the DEX or from other holders
 
-Check your balance:
+Check your balance (the node's RPC is its `--port` less 1000: 8000 for the
+node of Step 4):
 ```bash
-./target/release/aincore-cli balance
+./target/release/aincore-cli --rpc http://127.0.0.1:8000/rpc balance <your-64-hex-address>
 ```
+
+It prints `{ "balance": "<quanta>", "btc_balance": 0 }`; the balance is in
+quanta (1 AIN = 10^18 quanta). Without an address it reads the address of
+`--keyfile` (or `--keystore`).
 
 ### Step 4: Configure and Start Your Node
 
 ```bash
-# Create data directory
+# Create data directory (it holds node.key from Step 2)
 mkdir -p /var/aincore/data
 
 # Start the node with your identity
@@ -495,61 +543,79 @@ mkdir -p /var/aincore/data
   --bootnodes BOOTNODE_IP:9000
 ```
 
-Wait for your node to fully sync. You will see logs like:
-```
-✅ DAG Initialized: X vertices, Starting Round Y
-🤝 Authenticated Peer registered: ...
-```
+Wait for your node to fully sync. `aincore-cli --rpc http://127.0.0.1:8000/rpc info`
+prints the node's status (`aincore_getStatus`); its `latest_height` must reach
+the network's.
 
 ### Step 5: Register as Validator (Stake 1,000 AIN)
 
 Once your node is synced and running:
 ```bash
-./target/release/aincore-cli register-validator
+./target/release/aincore-cli --rpc http://127.0.0.1:8000/rpc \
+  --keyfile /var/aincore/data/node.key --chain-id "$AINCORE_CHAIN_ID" \
+  register-validator
 ```
 
-This command will:
-1. Lock **1,000 AIN** from your wallet into the staking contract
-2. Register your public key with the consensus engine
-3. Your node will begin participating in block production
+- **`--chain-id`** (or the `AINCORE_CHAIN_ID` environment variable) is
+  required, and must be the chain the node runs: the CLI asks the node and
+  refuses to sign for any other chain.
+- `--rpc`, `--keyfile`, `--keystore`, `--pqc-seed` and `--chain-id` go
+  **before** the command name; `--execution-gas`, `--max-gas-price` and
+  `--assume-yes` may go anywhere.
+- **The fee is shown and confirmed.** Before signing, it prints
+  `Fee: at most <AIN> AIN (<quanta> quanta): <gas> gas at <price> quanta a gas`
+  and asks `Sign and submit? [y/N]`; only `y` or `yes` signs. The gas price is
+  the node's; `--max-gas-price <quanta>` refuses a price above it, and
+  `--assume-yes` skips the question (for scripts). The execution gas is the
+  node's estimate unless `--execution-gas` names it; either way, gas past a
+  transaction's limit (10,000,000) is refused.
 
-You should see in your node logs:
-```
-✅ Staking Successful! Validator Joined: <your_address>
-🔗 Native Hook: Syncing Validator Set -> Consensus Engine
-```
+It sends one transaction, `0x1::staking::join_validator_set`, with:
+1. a stake of exactly **1,000 AIN** (the minimum; the CLI does not take an amount)
+2. the key's Ed25519 public key
+3. a BLS public key and proof of possession, derived from the same key (an
+   ML-DSA-65 `--pqc-seed` wallet cannot register)
+
+`✅ Validator Registration Submitted` means the node took the transaction into
+its mempool, not that it executed: check Step 6.
 
 ### Step 6: Verify Your Validator Status
 
 ```bash
-./target/release/aincore-cli balance
+# The validator set (address and stake of each): your 64-hex address should be in it
+curl -s http://127.0.0.1:8000/get_validators
+
+# Your liquid balance: 1,000 AIN lower, less the fee
+./target/release/aincore-cli --rpc http://127.0.0.1:8000/rpc balance <your-64-hex-address>
 ```
 
-Your staked amount will be locked. From the next committee epoch you are in the committee if your stake is among the top 256, and you are paid every reward period (20 blocks) in proportion to your committee weight.
+The CLI has no validator-status command. Your staked amount will be locked.
+From the next committee epoch you are in the committee if your stake is among
+the top 256, and you are paid every reward period (20 blocks) in proportion to
+your committee weight.
 
 ### Step 7: (Optional) Enable Delegation
 
-Allow other users to delegate their AIN to your validator:
-```bash
-# Set your commission rate (in basis points, e.g., 1000 = 10%)
-./target/release/aincore-cli enable-delegation --commission 1000
-```
+**Not available from the CLI.** Delegation is opened on chain by the entry
+function `0x1::delegation::enable_delegation(commission_rate)` (basis points,
+at most 3,000 = 30 %), signed by the validator's key; `aincore-cli` has no
+command that sends it, so it needs a client that builds entry-function
+transactions.
 
 ---
 
 ## Leaving the Validator Set
 
-If you wish to stop validating:
+**Not available from the CLI.** `aincore-cli` has no `leave-validator` or
+`withdraw-unbonded` command. On chain, the validator's key signs the entry
+function `0x1::staking::leave_validator_set`, which starts a **21-day unbonding
+period** (consensus time) for network security; after it,
+`0x1::staking::withdraw_unbonded` returns the stake. Both need a client that
+builds entry-function transactions.
 
-```bash
-./target/release/aincore-cli leave-validator
-```
-
-**Important:** Your 1,000 AIN will be locked for a **21-day unbonding period** for network security. After 21 days:
-
-```bash
-./target/release/aincore-cli withdraw-unbonded
-```
+`aincore-cli --help` lists every command it has: `keygen`, `pqc-keygen`,
+`info`, `submit-proof`, `balance`, `transfer`, `publish`, `keys generate`,
+`keys import`, `register-validator` and `faucet`.
 
 ---
 
@@ -559,15 +625,14 @@ If you wish to stop validating:
 
 | Protection | Implementation | File |
 |---|---|---|
-| **Genesis Lock** | Transfers from Genesis address permanently blocked | `executor/src/lib.rs` |
 | **Equivocation slashing** | A proven double-sign jails the validator for good and moves its stake into 21-day unbonding at once; the fraction (1 % to 100 %, by the weight that equivocated together) is cut once it is final | `delegation.move`, `executor/src/lib.rs` |
 | **Downtime** | Not slashed in this protocol version | — |
 | **Double-Sign Detection** | Two bodies for one slot, or two certificates, become evidence carried through the DAG | `consensus/v4/evidence.rs` |
-| **Replay Protection** | Full transaction signing: `chain_id:sender:payload:seq_num` | `executor/src/lib.rs` |
+| **Replay Protection** | Full transaction signing: `chain_id:sender:payload:seq_num:gas_limit:gas_price:input_objects` (and the paymaster, when sponsored); a chain id is used by one network incarnation only (B348) | `executor/src/admission.rs` |
 | **Chain ID Isolation** | Transactions rejected if chain_id mismatches | `executor/src/lib.rs` |
 | **Sequence Numbers** | Per-account nonce prevents transaction replay | `executor/src/lib.rs` |
 | **Ed25519 Signatures** | All transactions cryptographically signed | `vm_move/src/lib.rs` |
-| **ChaCha20-Poly1305 P2P** | Authenticated encrypted node-to-node communication (X25519 key exchange) | `crypto/src/transport.rs` |
+| **Encrypted P2P** | libp2p Noise (XX handshake, X25519, ChaCha20-Poly1305) between nodes | `core/node/src/p2p.rs` |
 | **BFT Threshold** | `ceil(2n/3)` quorum for consensus finality | `ordering.rs` |
 | **Input Object ACL** | Move VM scripts restricted to declared objects | `executor/src/lib.rs` |
 | **Supply Hard Cap** | `MAX_SUPPLY` enforced in smart contract with checked arithmetic | `staking.move` |
@@ -595,7 +660,6 @@ AINCORE uses the Move programming language. All core modules live in `core/vm_mo
 | `dex` | `dex.move` | AMM DEX (Constant Product x*y=k, 0.3% fee) |
 | `token_factory` | `token_factory.move` | Create/Mint/Burn/Transfer custom tokens |
 | `governance` | `governance.move` | On-chain proposal creation and voting |
-| `treasury` | `treasury.move` | System treasury and reserve management |
 | `universal_mining` | `universal_mining.move` | DePIN Bio-Oracle with quorum voting |
 | `epoch` | `epoch.move` | Epoch lifecycle management |
 | `coin` | `coin.move` | Base coin operations (mint/burn/transfer) |
@@ -614,15 +678,15 @@ Default endpoint: `http://localhost:8002/rpc`
 
 | Method | Description |
 |---|---|
-| `aincore_getBalance` | Get account balance |
+| `aincore_getBalance` | Account balance |
 | `aincore_sendTransaction` | Submit a signed transaction |
-| `aincore_getBlock` | Get block by height |
-| `aincore_getBlocks` | Get latest N blocks |
-| `aincore_getTransaction` | Get transaction by hash |
-| `aincore_getChainInfo` | Get chain height, peers, round |
-| `aincore_getDAGStatus` | Get DAG consensus state |
-| `aincore_getValidators` | Get active validator set |
-| `aincore_getPeers` | Get connected peers |
+| `aincore_getBlocks` | Blocks from a height, or the latest N |
+| `aincore_getBlockByHash` | A block by its hash |
+| `aincore_getTransaction` | A transaction by hash (`aincore_getTransactionReceipt`: its receipt) |
+| `aincore_getStatus` | Height, round, peers, finality |
+| `aincore_getDag` | DAG consensus state |
+| `aincore_getValidatorsWithDelegation` | Validators and their delegation pools (REST: `/get_validators`) |
+| `aincore_getPeers` | Connected peers |
 
 Example request:
 ```bash
@@ -655,10 +719,7 @@ export AINCORE_CHAIN_ID=AINCORE-MAINNET-1  # Required for production
 
 ### v1.1.0 — May 12, 2026 (Security Hardening)
 
-**Genesis Lock (Anti-Rugpull)**
-- Executor permanently blocks transfer transactions from the Genesis Validator address
-- Genesis funds can only be used for staking, never sold or transferred
-- Automatically registered during genesis ceremony
+**Genesis Lock (Anti-Rugpull)** (withdrawn: nothing ever enforced it, and B314 deleted the genesis row (`sys:config:federation_addr`) that named the locked address; genesis stake is ordinary stake, see [Genesis Allocation](#genesis-allocation))
 
 **Jail System (Validator Protection)**
 - `slash_validator` now slashes 5% stake and force-unbonds remaining 95% for 21 days

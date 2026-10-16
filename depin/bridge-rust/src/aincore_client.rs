@@ -35,6 +35,13 @@ pub(crate) fn configured_chain_id() -> Option<String> {
     chain_id_from(std::env::var("AINCORE_CHAIN_ID").ok())
 }
 
+/// B320: the genesis the bridge follows: `AINCORE_GENESIS_IDENTITY` (the
+/// node's `genesis_identity` row). A finality vote binds it, so certificates
+/// verify only under it. Required, like the chain id.
+pub(crate) fn configured_genesis_identity() -> Option<String> {
+    chain_id_from(std::env::var("AINCORE_GENESIS_IDENTITY").ok())
+}
+
 fn chain_id_from(env: Option<String>) -> Option<String> {
     env.map(|c| c.trim().to_string()).filter(|c| !c.is_empty())
 }
@@ -729,7 +736,7 @@ mod qc_gate_tests {
             ikm[0] = seed;
             ikm[31] = seed.wrapping_add(7);
             let pk = bls.pubkey_raw(&ikm);
-            let pop = bls.prove_possession_raw(&ikm);
+            let pop = bls.prove_possession_raw(&ikm, &[0u8; 32]);
             infos.push(ValidatorInfo {
                 address: format!("{:032x}", seed as u128),
                 stake,

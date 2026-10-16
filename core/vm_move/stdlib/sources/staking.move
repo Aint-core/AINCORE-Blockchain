@@ -30,6 +30,8 @@ module 0x1::staking {
     const EPAYOUT_FROZEN: u64 = 11;
     /// G5 CH-1: this epoch's allowance of new stake is used up.
     const ECHURN_LIMIT: u64 = 12;
+    /// G5 PA-3 (B464): `reactivate` by a validator that is not out.
+    const ENOT_INACTIVE: u64 = 13;
 
     /// G5 CH-1 (`docs/research/churn_limit.md`): stake added to the active
     /// set within one committee epoch is at most this share of the epoch
@@ -154,6 +156,48 @@ module 0x1::staking {
         validators: vector<address>,
     }
 
+    /// G5 PA-1 (B464): what the committee of the epoch being counted took
+    /// part in, from the authors of each block's committed vertices (bound
+    /// in its header): the rounds its blocks closed, in each of which a
+    /// member could author one vertex, and the committed vertices each
+    /// member authored, in the committee's address order; the same since
+    /// the last payout (`period_*`, the reward period being paid, PA-2); and
+    /// the members of the last closed epoch that took part in under half its
+    /// rounds (`low`, PA-3). The executor writes it in every block; nothing
+    /// in Move reads it. Without it nothing was counted.
+    struct Participation has key {
+        epoch: u64,
+        rounds: u64,
+        authored: vector<u64>,
+        period_rounds: u64,
+        period_authored: vector<u64>,
+        low: vector<address>,
+    }
+
+    /// G5 PA-2 (B464): each member's participation in the last reward
+    /// period paid, in parts per million: the next period's fees are shared
+    /// by it. The executor writes it at each payout.
+    struct PeriodParticipation has key {
+        members: vector<address>,
+        ppm: vector<u64>,
+    }
+
+    /// G5 PA-3 (B464): a validator out of the committee from `from_epoch`.
+    struct InactiveMember has store, drop, copy {
+        validator: address,
+        from_epoch: u64,
+    }
+
+    /// G5 PA-3 (B464): the validators that took part in under half the
+    /// rounds of two committee epochs in a row. The executor gives them no
+    /// weight in the committee's set; their stake stays bonded, since
+    /// downtime is not slashed. The executor adds them at boundaries;
+    /// `reactivate` and a join take their sender off. Without it nobody is
+    /// out.
+    struct Inactive has key {
+        members: vector<InactiveMember>,
+    }
+
     /// EMISSION v4: the accrued, cap-reserved budget of the DePIN mint
     /// stream (universal_mining). Amounts here were already counted against
     /// MAX_SUPPLY when drawn (`draw_emission`), so drawing from the budget
@@ -211,7 +255,7 @@ module 0x1::staking {
         public_key: vector<u8>,
         bls_public_key: vector<u8>,
         bls_pop: vector<u8>
-    ) acquires ValidatorSet, ChurnState, BootstrapProtected {
+    ) acquires ValidatorSet, ChurnState, BootstrapProtected, Inactive {
         let addr = signer::address_of(account);
         assert!(stake_amount >= MIN_STAKE, error::invalid_argument(EINSUFFICIENT_STAKE));
         // BLS sizes are MinPk: pk=48 bytes (G1), pop=96 bytes (G2). The
@@ -276,6 +320,9 @@ module 0x1::staking {
             i = i + 1;
         };
 
+        // G5 PA-3 (B464): a former member that was out when it left starts
+        // afresh, as any joiner.
+        take_inactive(addr);
         admit_increase(stake_amount);
         // Withdraw stake from user account
         let stake = coin::withdraw<AincoreCoin>(account, stake_amount);
@@ -428,6 +475,35 @@ module 0x1::staking {
         abort error::not_found(ENOT_VALIDATOR)
     }
 
+    /// G5 PA-3 (B464): a validator out of the committee for taking part in
+    /// under half the rounds of two committee epochs in a row returns. It
+    /// leaves the inactive list; the executor, on a transaction that calls
+    /// this directly, gives it its weight in the live set again at once, so
+    /// the next boundary elects it as any member. Its stake never left.
+    /// `entry`, never `public`, as `join_validator_set`.
+    entry fun reactivate(account: &signer) acquires ValidatorSet, Inactive {
+        let addr = signer::address_of(account);
+        assert!(is_validator(addr), error::not_found(ENOT_VALIDATOR));
+        assert!(take_inactive(addr), error::invalid_state(ENOT_INACTIVE));
+    }
+
+    /// G5 PA-3 (B464): take `addr` off the inactive list; whether it was on.
+    fun take_inactive(addr: address): bool acquires Inactive {
+        if (!exists<Inactive>(@0x1)) {
+            return false
+        };
+        let members = &mut borrow_global_mut<Inactive>(@0x1).members;
+        let i = 0;
+        while (i < vector::length(members)) {
+            if (vector::borrow(members, i).validator == addr) {
+                vector::remove(members, i);
+                return true
+            };
+            i = i + 1;
+        };
+        false
+    }
+
     /// G5 CH-1: count `amount` of stake added to the active set this epoch
     /// (a join, `add_stake`, or a deposit into an open delegation pool), or
     /// abort when the epoch's total would pass `CHURN_INCREASE_BPS` of the
@@ -538,8 +614,9 @@ module 0x1::staking {
     }
 
     /// Return what a payout did not pay (division dust, members without a
-    /// coin store, pools that cannot take rewards) to the reserve: it was
-    /// never minted, so it leaves total_supply and is not a burn.
+    /// coin store, pools that cannot take rewards, the part of a pool's
+    /// delegators that left, B451) to the reserve: it was never minted, so
+    /// it leaves total_supply and is not a burn.
     public(friend) fun close_emission(emission: Emission) acquires ValidatorSet {
         let Emission { coins } = emission;
         let validator_set = borrow_global_mut<ValidatorSet>(@0x1);
@@ -702,36 +779,54 @@ module 0x1::staking {
         };
     }
 
-    /// G5 SL-6: cut every unbonding entry of `validator_addr` that started in
-    /// committee epoch `from_epoch` or later by `bps`, rounded up against the
-    /// offender. Earlier entries left before the offense and are out of scope.
-    /// The cut is never paid, so it leaves total_supply and is counted as
-    /// burned (AUDIT-#8: cumulative minted is unchanged).
+    /// G5 SL-6: cut the unbonding entries of `validator_addr` that started in
+    /// committee epoch `from_epoch` or later by `bps` of what its own stake
+    /// had at stake in that committee (`own_slash_cuts`). Earlier entries
+    /// left before the offense and are out of scope. The cut is never paid,
+    /// so it leaves total_supply and is counted as burned (AUDIT-#8:
+    /// cumulative minted is unchanged).
+    ///
+    /// B392: `at_stake` is the operator's frozen own weight in that
+    /// committee (whole AIN). Every in-scope entry was cut by `bps` of all it
+    /// held, so stake added after the epoch began (an `add_stake`, or fresh
+    /// coins after leaving and joining again) weighed nothing there and was
+    /// burned too: all of it once a large pool made `bps` 100 %. Now the
+    /// cut is `bps` of no more than `at_stake`, as the pool's (B149).
     public(friend) fun slash_unbonding(
         validator_addr: address,
         from_epoch: u64,
         bps: u64,
+        at_stake: u64,
     ) acquires ValidatorSet, SupplyStats {
         if (bps == 0) {
             return
         };
         let interval = chain::epoch_blocks();
         let validator_set = borrow_global_mut<ValidatorSet>(@0x1);
-        let burned = 0u128;
+        // The in-scope entries, oldest first: the queue is in creation
+        // order (only push_back adds, and every removal keeps the order).
+        let at = vector::empty<u64>();
+        let stakes = vector::empty<u128>();
         let len = vector::length(&validator_set.unbonding_queue);
         let i = 0;
         while (i < len) {
-            let request = vector::borrow_mut(&mut validator_set.unbonding_queue, i);
+            let request = vector::borrow(&validator_set.unbonding_queue, i);
             let epoch = if (request.start_height == 0) { 0 } else { (request.start_height - 1) / interval };
             if (request.validator_addr == validator_addr && epoch >= from_epoch) {
-                let cut = (request.stake * (bps as u128) + (MAX_BPS as u128) - 1) / (MAX_BPS as u128);
-                if (cut > request.stake) {
-                    cut = request.stake;
-                };
-                request.stake = request.stake - cut;
-                burned = burned + cut;
+                vector::push_back(&mut at, i);
+                vector::push_back(&mut stakes, request.stake);
             };
             i = i + 1;
+        };
+        let cuts = own_slash_cuts(&stakes, at_stake, bps);
+        let burned = 0u128;
+        let k = 0;
+        while (k < vector::length(&at)) {
+            let cut = *vector::borrow(&cuts, k);
+            let request = vector::borrow_mut(&mut validator_set.unbonding_queue, *vector::borrow(&at, k));
+            request.stake = request.stake - cut;
+            burned = burned + cut;
+            k = k + 1;
         };
         if (burned == 0) {
             return
@@ -742,5 +837,41 @@ module 0x1::staking {
             let stats = borrow_global_mut<SupplyStats>(@0x1);
             stats.cumulative_burned = stats.cumulative_burned + removed;
         };
+    }
+
+    /// G5 SL-6 (B392): the cut of each of an operator's in-scope unbonding
+    /// entries, `stakes` oldest first, for a slash of `bps`. The loss is `bps`
+    /// of their total, but of no more than its own stake had at stake in the
+    /// offense's committee: `at_stake`, its frozen own weight, rounded up to
+    /// the next whole AIN (the part whole-AIN weights drop), as
+    /// `delegation::slash_pool` bounds the pool's (B149). Rounded up against
+    /// the offender, and taken from the oldest entry first: every removal
+    /// unbonds the whole own stake, so the stake at stake is all in the
+    /// oldest in-scope entry, and a later one holds only stake that joined
+    /// after the epoch began.
+    public fun own_slash_cuts(stakes: &vector<u128>, at_stake: u64, bps: u64): vector<u128> {
+        let n = vector::length(stakes);
+        let total = 0u128;
+        let i = 0;
+        while (i < n) {
+            total = total + *vector::borrow(stakes, i);
+            i = i + 1;
+        };
+        let cap = ((at_stake as u128) + 1) * COIN_SCALE;
+        let base = if (total < cap) { total } else { cap };
+        let left = (base * (bps as u128) + (MAX_BPS as u128) - 1) / (MAX_BPS as u128);
+        if (left > base) {
+            left = base;
+        };
+        let cuts = vector::empty<u128>();
+        let i = 0;
+        while (i < n) {
+            let stake = *vector::borrow(stakes, i);
+            let cut = if (left < stake) { left } else { stake };
+            vector::push_back(&mut cuts, cut);
+            left = left - cut;
+            i = i + 1;
+        };
+        cuts
     }
 }

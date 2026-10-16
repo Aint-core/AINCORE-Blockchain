@@ -32,7 +32,7 @@ fn member(seed: u8) -> Member {
             stake: 100,
             ed25519_public_key: hex::encode(ed),
             bls_public_key: hex::encode(bls.pubkey_raw(&bls_seed)),
-            bls_pop: hex::encode(bls.prove_possession_raw(&bls_seed)),
+            bls_pop: hex::encode(bls.prove_possession_raw(&bls_seed, &ed)),
         },
     }
 }

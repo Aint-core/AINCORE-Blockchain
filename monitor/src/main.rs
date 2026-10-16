@@ -9,25 +9,26 @@ fn main() {
     // L2 FIX: Configurable node list via AINCORE_NODES env var
     // Example: AINCORE_NODES=9001,9002,9003 (B305: the default is a node
     // left to its default port).
-    let nodes: Vec<u16> = std::env::var("AINCORE_NODES")
-        .unwrap_or_else(|_| config::DEFAULT_PORT.to_string())
-        .split(',')
-        .filter_map(|s| s.trim().parse().ok())
-        .collect();
-    let rpc_ports_override: Option<Vec<u16>> = std::env::var("AINCORE_RPC_PORTS")
-        .ok()
-        .map(|value| {
-            value
-                .split(',')
-                .filter_map(|s| s.trim().parse().ok())
-                .collect::<Vec<u16>>()
-        })
-        .filter(|ports| !ports.is_empty());
-
-    if nodes.is_empty() {
-        eprintln!("❌ No valid node ports specified. Set AINCORE_NODES=9000,9001,...");
-        return;
-    }
+    // B382: an entry that did not parse was dropped, so the RPC list shifted
+    // and a halted node showed another node's status. Now any bad entry, or
+    // an RPC list of another length, stops the monitor (exit 2).
+    let nodes_env = std::env::var("AINCORE_NODES").ok();
+    let rpc_env = std::env::var("AINCORE_RPC_PORTS").ok();
+    let targets = match parse_targets(nodes_env.as_deref(), rpc_env.as_deref()) {
+        Ok(targets) => targets,
+        Err(problems) => {
+            for problem in &problems {
+                eprintln!("❌ {problem}");
+            }
+            eprintln!("   Example: AINCORE_NODES=9001,9002 AINCORE_RPC_PORTS=8001,8002");
+            std::process::exit(2);
+        }
+    };
+    let rpc_source = if given(rpc_env.as_deref()).is_some() {
+        "AINCORE_RPC_PORTS"
+    } else {
+        "node port less 1000"
+    };
 
     let client = Client::builder()
         .timeout(Duration::from_secs(2))
@@ -42,6 +43,11 @@ fn main() {
         "{}",
         "─────────────────────────────────────────────".dimmed()
     );
+    // B382: the mapping it will poll, so a wrong pairing is seen at start.
+    println!("Node -> RPC ({rpc_source}):");
+    for (port, rpc_port) in &targets {
+        println!("   Node {port} -> http://localhost:{rpc_port}/rpc");
+    }
 
     loop {
         // Clear screen
@@ -59,11 +65,7 @@ fn main() {
         let mut max_height = 0;
         let mut node_data = Vec::new();
 
-        for &port in &nodes {
-            let rpc_port = rpc_ports_override
-                .as_ref()
-                .and_then(|ports| ports.get(node_data.len()).copied())
-                .unwrap_or_else(|| rpc_port_of(port));
+        for &(port, rpc_port) in &targets {
             let url = format!("http://localhost:{}/rpc", rpc_port);
 
             let mut status = "Offline".to_string();
@@ -164,6 +166,66 @@ fn rpc_port_of(node_port: u16) -> u16 {
     config::api_port_for(node_port)
 }
 
+/// B382: an unset variable and an empty one both mean "not given".
+fn given(value: Option<&str>) -> Option<&str> {
+    value.filter(|v| !v.trim().is_empty())
+}
+
+/// B382: the comma-separated ports in `value`; every entry that is not a
+/// port (1-65535) adds a problem naming the variable and the entry.
+fn parse_ports(name: &str, value: &str, problems: &mut Vec<String>) -> Vec<u16> {
+    let mut ports = Vec::new();
+    for (i, entry) in value.split(',').enumerate() {
+        match entry.trim().parse::<u16>() {
+            Ok(port) if port > 0 => ports.push(port),
+            _ => problems.push(format!(
+                "{name} entry {} ({:?}) is not a port (1-65535)",
+                i + 1,
+                entry.trim()
+            )),
+        }
+    }
+    ports
+}
+
+/// B382: each node's P2P port paired with the RPC port it is polled on,
+/// from AINCORE_NODES (default: `config::DEFAULT_PORT`) and
+/// AINCORE_RPC_PORTS (default: each node port less 1000). Every problem is
+/// returned: an entry that is not a port, or an RPC list whose length is
+/// not the node list's. Before, bad entries were dropped and the lists
+/// were paired by position, so one bad RPC entry shifted every later node
+/// onto its neighbour's RPC.
+fn parse_targets(
+    nodes: Option<&str>,
+    rpc_ports: Option<&str>,
+) -> Result<Vec<(u16, u16)>, Vec<String>> {
+    let default_nodes = config::DEFAULT_PORT.to_string();
+    let nodes_value = given(nodes).unwrap_or(default_nodes.as_str());
+    let mut problems = Vec::new();
+    let node_ports = parse_ports("AINCORE_NODES", nodes_value, &mut problems);
+    let rpc = given(rpc_ports).map(|value| {
+        let rpc_entries = value.split(',').count();
+        let node_entries = nodes_value.split(',').count();
+        if rpc_entries != node_entries {
+            problems.push(format!(
+                "AINCORE_RPC_PORTS has {rpc_entries} entries but AINCORE_NODES has \
+                 {node_entries}: give one RPC port per node, in the same order"
+            ));
+        }
+        parse_ports("AINCORE_RPC_PORTS", value, &mut problems)
+    });
+    if !problems.is_empty() {
+        return Err(problems);
+    }
+    Ok(match rpc {
+        Some(rpc) => node_ports.into_iter().zip(rpc).collect(),
+        None => node_ports
+            .into_iter()
+            .map(|port| (port, rpc_port_of(port)))
+            .collect(),
+    })
+}
+
 /// B269: the height and session count an `aincore_getStatus` answer
 /// carries; `None` for any other answer (an error, a null result).
 fn node_status(answer: &Value) -> Option<(u64, u64)> {
@@ -177,7 +239,7 @@ fn node_status(answer: &Value) -> Option<(u64, u64)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{node_status, rpc_port_of};
+    use super::{node_status, parse_targets, rpc_port_of};
     use serde_json::json;
 
     /// B278 witness: the RPC port guessed from a node port is the node's
@@ -203,6 +265,71 @@ mod tests {
         assert_eq!(
             node_status(&json!({"error": {"code": -32601, "message": "Method not found"}})),
             None
+        );
+    }
+
+    /// B382 witness: an RPC entry that does not parse stops the monitor.
+    /// Before, `8O02` was dropped, so node 9002 was polled on 8003 (node
+    /// 9003's RPC) and showed its status, and a halted 9002 looked alive.
+    #[test]
+    fn a_bad_rpc_entry_is_refused_not_shifted() {
+        let problems = parse_targets(Some("9001,9002,9003"), Some("8001,8O02,8003"))
+            .expect_err("a bad RPC entry must be refused");
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("AINCORE_RPC_PORTS entry 2"),
+            "{problems:?}"
+        );
+    }
+
+    /// B382 witness: a bad node entry, an empty entry, port 0 and an RPC
+    /// list of another length are all refused, and every problem is
+    /// reported at once.
+    #[test]
+    fn every_problem_is_reported() {
+        let problems = parse_targets(Some("x,9002"), Some("y")).unwrap_err();
+        assert_eq!(problems.len(), 3, "{problems:?}");
+        assert!(problems.iter().any(|p| p.contains("AINCORE_NODES entry 1")));
+        assert!(problems
+            .iter()
+            .any(|p| p.contains("has 1 entries but AINCORE_NODES has 2")));
+        assert!(problems
+            .iter()
+            .any(|p| p.contains("AINCORE_RPC_PORTS entry 1")));
+        assert!(
+            parse_targets(Some("9001,,9002"), None).is_err(),
+            "an empty entry"
+        );
+        assert!(parse_targets(Some("0"), None).is_err(), "port 0");
+        assert!(parse_targets(Some("70000"), None).is_err(), "above u16");
+        assert!(
+            parse_targets(Some("9001,9002"), Some("8001")).is_err(),
+            "an RPC list shorter than the node list"
+        );
+    }
+
+    /// B382: well-formed lists pair by position; without an RPC list each
+    /// node is polled on its own port less 1000; empty means not given.
+    #[test]
+    fn good_lists_pair_node_to_rpc() {
+        assert_eq!(
+            parse_targets(Some(" 9001, 9002 "), Some("8101 ,8102")),
+            Ok(vec![(9001, 8101), (9002, 8102)])
+        );
+        assert_eq!(
+            parse_targets(Some("9001,9002"), None),
+            Ok(vec![(9001, 8001), (9002, 8002)])
+        );
+        assert_eq!(
+            parse_targets(None, None),
+            Ok(vec![(
+                config::DEFAULT_PORT,
+                rpc_port_of(config::DEFAULT_PORT)
+            )])
+        );
+        assert_eq!(
+            parse_targets(Some(" "), Some("")),
+            parse_targets(None, None)
         );
     }
 }

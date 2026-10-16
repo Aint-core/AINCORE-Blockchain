@@ -44,11 +44,17 @@ pub fn vslot_key(epoch: u64, round: u64, author: &str) -> String {
 }
 
 /// The digests staged for a slot (at most `MAX_STAGED_PER_SLOT`); empty when
-/// the slot row is absent or unreadable.
-pub fn slot_digests(storage: &StateDB, epoch: u64, round: u64, author: &str) -> Vec<String> {
-    read_slot(storage, &vslot_key(epoch, round, author))
-        .map(|slot| slot.into_iter().map(|e| e.digest).collect())
-        .unwrap_or_default()
+/// the slot row is absent. B456: a row that cannot be read or does not
+/// parse is an error, not an empty slot (CE-3's pin check read it so, and
+/// missed the other twin).
+pub fn slot_digests(
+    storage: &StateDB,
+    epoch: u64,
+    round: u64,
+    author: &str,
+) -> Result<Vec<String>, String> {
+    let slot = read_slot(storage, &vslot_key(epoch, round, author))?;
+    Ok(slot.into_iter().map(|e| e.digest).collect())
 }
 
 /// B155: the digest this node attested for a slot (AT-2), if it staged one.
@@ -298,6 +304,18 @@ pub fn load(
     Ok(out)
 }
 
+/// B442: a parent slot a PENDING vertex waits on: (round, author, digest).
+pub type ParentSlot = (u64, String, String);
+
+/// B442: a held vertex waiting on parent certificates.
+#[derive(Debug)]
+struct Waiting {
+    author: String,
+    round: u64,
+    /// Its parent slots with no verified certificate here yet.
+    slots: usize,
+}
+
 /// The PENDING buffer (ST-3): vertices that passed Layer S and wait for an
 /// epoch or for parent certificates, at most `PENDING_MAX_PER_AUTHOR` per
 /// author, the highest round evicted first.
@@ -309,12 +327,48 @@ pub struct PendingBuffer {
     /// every held vertex, once per body want, every tick, under the
     /// consensus lock (members fill the buffer for free, 16 each).
     digests: std::collections::HashSet<String>,
+    /// B442: the held digests waiting on each parent slot, and what each
+    /// still waits on, kept with every change: a certificate wakes only its
+    /// own waiters, each once, at the last slot it waited on. Every
+    /// certificate took the whole buffer out, sorted it and scanned each
+    /// held vertex's refs, and woke every vertex naming its slot, so a body
+    /// ran Layer S again on each of its parents' certificates.
+    waiters: std::collections::HashMap<ParentSlot, std::collections::HashSet<String>>,
+    waiting: std::collections::HashMap<String, Waiting>,
 }
 
 impl PendingBuffer {
     /// Keep `v`; returns the vertex evicted to make room, if any (possibly
-    /// `v` itself, when it is the highest round).
+    /// `v` itself, when it is the highest round). It waits on no
+    /// certificate here: a next-epoch vertex, judged again at activation.
     pub fn push(&mut self, v: Vertex) -> Option<Vertex> {
+        self.push_waiting(v, &[])
+    }
+
+    /// B442: `push`, `v` waiting on the certificates of its parent refs
+    /// `missing` (indices): `certified` hands it back once the last of them
+    /// is certified.
+    pub fn push_waiting(&mut self, v: Vertex, missing: &[usize]) -> Option<Vertex> {
+        if self.digests.contains(&v.hash) {
+            self.remove(&v.author, v.round, &v.hash);
+        }
+        let mut slots = 0;
+        for r in missing.iter().filter_map(|&i| v.parent_refs.get(i)) {
+            let slot = (r.round, r.author.clone(), r.digest.clone());
+            if self.waiters.entry(slot).or_default().insert(v.hash.clone()) {
+                slots += 1;
+            }
+        }
+        if slots > 0 {
+            self.waiting.insert(
+                v.hash.clone(),
+                Waiting {
+                    author: v.author.clone(),
+                    round: v.round,
+                    slots,
+                },
+            );
+        }
         let held = self.per_author.entry(v.author.clone()).or_default();
         self.digests.insert(v.hash.clone());
         held.insert((v.round, v.hash.clone()), v);
@@ -323,9 +377,73 @@ impl PendingBuffer {
             let key = held.keys().rev().find(|(r, _)| *r == highest)?.clone();
             let evicted = held.remove(&key)?;
             self.digests.remove(&evicted.hash);
+            self.forget(&evicted);
             return Some(evicted);
         }
         None
+    }
+
+    /// B442: the slot (round, author, digest) is certified here: the held
+    /// vertices that waited on it last, taken out (lowest round first).
+    pub fn certified(&mut self, round: u64, author: &str, digest: &str) -> Vec<Vertex> {
+        let slot = (round, author.to_string(), digest.to_string());
+        let Some(waiters) = self.waiters.remove(&slot) else {
+            return Vec::new();
+        };
+        let mut woken = Vec::new();
+        for hash in waiters {
+            let Some(w) = self.waiting.get_mut(&hash) else {
+                continue;
+            };
+            w.slots = w.slots.saturating_sub(1);
+            if w.slots > 0 {
+                continue;
+            }
+            let (author, round) = (w.author.clone(), w.round);
+            if let Some(v) = self.remove(&author, round, &hash) {
+                woken.push(v);
+            }
+        }
+        woken.sort_by(|a, b| (a.round, &a.author, &a.hash).cmp(&(b.round, &b.author, &b.hash)));
+        woken
+    }
+
+    /// B442: `v` left the buffer; what it waited on goes with it.
+    fn forget(&mut self, v: &Vertex) {
+        if self.waiting.remove(&v.hash).is_none() {
+            return;
+        }
+        for r in &v.parent_refs {
+            let slot = (r.round, r.author.clone(), r.digest.clone());
+            if let Some(waiters) = self.waiters.get_mut(&slot) {
+                waiters.remove(&v.hash);
+                if waiters.is_empty() {
+                    self.waiters.remove(&slot);
+                }
+            }
+        }
+    }
+
+    /// GC (IN-1 E3): every held vertex at or below `floor` is stale.
+    pub fn prune_to(&mut self, floor: u64) {
+        let mut doomed: Vec<(String, u64, String)> = Vec::new();
+        for (author, held) in &self.per_author {
+            for (round, digest) in held.keys() {
+                if *round > floor {
+                    break;
+                }
+                doomed.push((author.clone(), *round, digest.clone()));
+            }
+        }
+        for (author, round, digest) in doomed {
+            self.remove(&author, round, &digest);
+        }
+    }
+
+    /// Tests only: the slots and the vertices the wake index holds.
+    #[cfg(test)]
+    pub(crate) fn wake_index_len(&self) -> usize {
+        self.waiters.len() + self.waiting.len()
     }
 
     /// B224: the held vertex of `author` at `round` with this digest.
@@ -354,18 +472,22 @@ impl PendingBuffer {
     }
 
     pub fn remove(&mut self, author: &str, round: u64, digest: &str) -> Option<Vertex> {
-        let removed = self
-            .per_author
-            .get_mut(author)?
-            .remove(&(round, digest.to_string()))?;
+        let held = self.per_author.get_mut(author)?;
+        let removed = held.remove(&(round, digest.to_string()))?;
+        if held.is_empty() {
+            self.per_author.remove(author);
+        }
         self.digests.remove(&removed.hash);
+        self.forget(&removed);
         Some(removed)
     }
 
     /// Every held vertex, lowest round first per author, leaving the buffer
-    /// empty: what a trigger re-evaluates (a new certificate or epoch).
+    /// empty: what an epoch's activation re-evaluates.
     pub fn take_all(&mut self) -> Vec<Vertex> {
         self.digests.clear();
+        self.waiters.clear();
+        self.waiting.clear();
         let mut out: Vec<Vertex> = self
             .per_author
             .drain()

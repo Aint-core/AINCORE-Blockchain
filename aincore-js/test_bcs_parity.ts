@@ -102,8 +102,36 @@ async function testMoveBalanceIsSourceOfTruth() {
     if (await connection.getMoveBalance(sender.address) !== '123456789') {
         throw new Error('getMoveBalance did not use Move CoinStore balance');
     }
-    if (await connection.getBalance(sender.address) !== 123456789) {
+    if (await connection.getBalance(sender.address) !== 123456789n) {
         throw new Error('getBalance did not use Move CoinStore balance');
+    }
+
+    // B479: a balance past 2^53 quanta comes back exactly (through a number,
+    // 1 AIN plus one quantum read as 1 AIN), and an answer that is not a
+    // decimal integer is an error, not a guess.
+    let moveBalance = '1000000000000000001';
+    (connection as any).request = async () => ({ id: sender.address, move_balance: moveBalance });
+    if (await connection.getBalance(sender.address) !== 1000000000000000001n) {
+        throw new Error('getBalance rounded a balance past 2^53 quanta');
+    }
+    if ((await connection.getAccount(sender.address)).balance !== 1000000000000000001n) {
+        throw new Error('getAccount rounded a balance past 2^53 quanta');
+    }
+    moveBalance = '340282366920938463463374607431768211455';
+    if (await connection.getBalance(sender.address) !== (1n << 128n) - 1n) {
+        throw new Error('getBalance did not read the largest u128 exactly');
+    }
+    for (const answer of ['0x10', '', '-1', '1e+21', '1'.repeat(40)]) {
+        moveBalance = answer;
+        let refused = false;
+        try {
+            await connection.getBalance(sender.address);
+        } catch {
+            refused = true;
+        }
+        if (!refused) {
+            throw new Error(`getBalance took ${JSON.stringify(answer)} for a balance`);
+        }
     }
 
     // G3 FX-8: the faucet is gone from the node; the SDK method must say so

@@ -149,7 +149,7 @@ fn every_shard_of_every_body_verifies_against_its_root() {
             let sample = ext.sample(index).expect("an index below the total");
             // B62: the verified count of shards, whatever a server reports.
             assert_eq!(
-                verify_sample(&ext.root(), &sample),
+                verify_sample(&ext.root(), index, &sample),
                 Ok(total),
                 "{len} bytes, shard {index}"
             );
@@ -172,53 +172,80 @@ fn a_tampered_sample_is_refused() {
         ..good.clone()
     };
     assert_eq!(
-        verify_sample(&root, &flipped),
+        verify_sample(&root, 13, &flipped),
         Err(SampleError::RootMismatch)
     );
 
     // Another index's shard and proof, relabelled.
     let other = ext.sample(12).unwrap();
     let relabelled = Sample { index: 13, ..other };
-    assert!(verify_sample(&root, &relabelled).is_err());
+    assert!(verify_sample(&root, 13, &relabelled).is_err());
 
     // The same shard claimed at a different index of the same tree.
     let moved = Sample {
         index: 12,
         ..good.clone()
     };
-    assert!(verify_sample(&root, &moved).is_err());
+    assert!(verify_sample(&root, 12, &moved).is_err());
 
-    let mut short = good.clone();
-    short.proof.pop();
-    assert_eq!(verify_sample(&root, &short), Err(SampleError::BadProof));
+    let mut cut = good.clone();
+    cut.proof.pop();
+    assert_eq!(verify_sample(&root, 13, &cut), Err(SampleError::BadProof));
 
     let mut long = good.clone();
     long.proof.push("00".repeat(32));
-    assert_eq!(verify_sample(&root, &long), Err(SampleError::BadProof));
+    assert_eq!(verify_sample(&root, 13, &long), Err(SampleError::BadProof));
 
     let mut too_long = good.clone();
     too_long.proof = vec!["00".repeat(32); MAX_PROOF_LEN + 1];
-    assert_eq!(verify_sample(&root, &too_long), Err(SampleError::BadProof));
+    assert_eq!(
+        verify_sample(&root, 13, &too_long),
+        Err(SampleError::BadProof)
+    );
 
     // A different length changes the layout, and the root binds the length.
     let resized = Sample {
         body_len: 4_999,
         ..good.clone()
     };
-    assert!(verify_sample(&root, &resized).is_err());
+    assert!(verify_sample(&root, 13, &resized).is_err());
 
     let other_body = Extended::new(&pattern(5_001)).root();
     assert_eq!(
-        verify_sample(&other_body, &good),
+        verify_sample(&other_body, 13, &good),
         Err(SampleError::RootMismatch)
     );
 
-    assert_eq!(verify_sample("zz", &good), Err(SampleError::BadRoot));
+    assert_eq!(verify_sample("zz", 13, &good), Err(SampleError::BadRoot));
     assert_eq!(
-        verify_sample(&"g".repeat(64), &good),
+        verify_sample(&"g".repeat(64), 13, &good),
         Err(SampleError::BadRoot)
     );
-    assert!(verify_sample(&root, &good).is_ok(), "control");
+    assert!(verify_sample(&root, 13, &good).is_ok(), "control");
+}
+
+/// B455 witness: a genuine sample of another index than the one drawn is
+/// refused. `verify_sample` checked the sample's own index, so a server
+/// holding one shard answered every draw with it and each answer verified: a
+/// body nobody could recover passed every sample.
+#[test]
+fn a_genuine_sample_of_another_index_than_the_one_drawn_is_refused() {
+    let ext = Extended::new(&pattern(5_000));
+    let root = ext.root();
+    let total = ext.layout().total_shards();
+    let held = ext.sample(0).unwrap();
+    assert_eq!(verify_sample(&root, 0, &held), Ok(total), "control");
+    for drawn in 1..total {
+        assert_eq!(
+            verify_sample(&root, drawn, &held),
+            Err(SampleError::WrongIndex),
+            "drawn {drawn}"
+        );
+    }
+    assert_eq!(
+        verify_sample(&root, u64::MAX, &held),
+        Err(SampleError::WrongIndex)
+    );
 }
 
 /// Hostile lengths and indices are refused without a panic or a large
@@ -233,27 +260,27 @@ fn hostile_samples_are_refused_cheaply() {
         proof: vec![],
     };
     assert_eq!(
-        verify_sample(&root, &hostile(u64::MAX, u64::MAX, "00")),
+        verify_sample(&root, u64::MAX, &hostile(u64::MAX, u64::MAX, "00")),
         Err(SampleError::IndexOutOfRange)
     );
     assert_eq!(
-        verify_sample(&root, &hostile(u64::MAX, 0, "00")),
+        verify_sample(&root, 0, &hostile(u64::MAX, 0, "00")),
         Err(SampleError::BadShard)
     );
     assert_eq!(
-        verify_sample(&root, &hostile(1, 2, "00")),
+        verify_sample(&root, 2, &hostile(1, 2, "00")),
         Err(SampleError::IndexOutOfRange)
     );
     assert_eq!(
-        verify_sample(&root, &hostile(1, 0, "0")),
+        verify_sample(&root, 0, &hostile(1, 0, "0")),
         Err(SampleError::BadShard)
     );
     assert_eq!(
-        verify_sample(&root, &hostile(1, 0, "zz")),
+        verify_sample(&root, 0, &hostile(1, 0, "zz")),
         Err(SampleError::BadShard)
     );
     assert_eq!(
-        verify_sample(&root, &hostile(1, 0, "78")),
+        verify_sample(&root, 0, &hostile(1, 0, "78")),
         Err(SampleError::BadProof),
         "a two-leaf tree needs one sibling"
     );
@@ -389,6 +416,9 @@ struct ValidVector {
 struct InvalidVector {
     name: String,
     da_root: String,
+    /// B455: the index the client drew, where it is not the sample's own.
+    #[serde(default)]
+    index: Option<u64>,
     sample: Sample,
     error: String,
 }
@@ -396,22 +426,67 @@ struct InvalidVector {
 /// The vectors the SDK verifier also checks (`aincore-js/test_da_sample.ts`),
 /// made by the independent reference (`da/reference/da_vectors.py`). This
 /// crate builds every valid sample byte for byte, accepts it, and refuses every
-/// invalid one with the named error.
+/// invalid one with the named error. A sample answers a draw of its own index
+/// unless the vector names another (B455).
 #[test]
 fn shared_vectors_from_the_independent_reference() {
     let v: Vectors = serde_json::from_str(include_str!("../vectors/da_vectors.json")).unwrap();
     assert!(
-        v.valid.len() >= 12 && v.invalid.len() >= 12,
+        v.valid.len() >= 12 && v.invalid.len() >= 13,
         "positive control"
     );
     for t in &v.valid {
         let ext = Extended::new(&pattern(t.sample.body_len as usize));
         assert_eq!(ext.root(), t.da_root);
-        assert_eq!(ext.sample(t.sample.index).as_ref(), Some(&t.sample));
-        assert!(verify_sample(&t.da_root, &t.sample).is_ok());
+        let index = t.sample.index;
+        assert_eq!(ext.sample(index).as_ref(), Some(&t.sample));
+        assert!(verify_sample(&t.da_root, index, &t.sample).is_ok());
     }
+    let mut drawn_elsewhere = 0;
     for t in &v.invalid {
-        let err = verify_sample(&t.da_root, &t.sample).expect_err(&t.name);
-        assert_eq!(format!("{err:?}"), t.error, "{}", t.name);
+        let at = t.index.unwrap_or(t.sample.index);
+        drawn_elsewhere += usize::from(at != t.sample.index);
+        match verify_sample(&t.da_root, at, &t.sample) {
+            Ok(_) => panic!("{} verified", t.name),
+            Err(err) => assert_eq!(format!("{err:?}"), t.error, "{}", t.name),
+        }
     }
+    assert!(drawn_elsewhere > 0, "B455 control");
+}
+
+/// B337 witness: every job runs when no helper thread starts (a thread the
+/// OS refuses only means one helper fewer: `Scope::spawn` panicked, and the
+/// node aborted in the middle of a block), and with helpers alike.
+#[test]
+fn every_job_runs_without_a_helper_thread() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for helpers in [0, 3] {
+        let done = AtomicUsize::new(0);
+        super::run_jobs((1..=10).collect::<Vec<usize>>(), helpers, |job| {
+            done.fetch_add(job, Ordering::SeqCst);
+        });
+        assert_eq!(done.load(Ordering::SeqCst), 55, "{helpers} helpers");
+    }
+}
+
+/// B319 witness: a data shard served from the body with the proof kept
+/// apart (`ShardProofs`) verifies as the extension's own sample does.
+#[test]
+fn a_data_shard_from_the_body_and_its_kept_proof_verifies() {
+    let body = pattern(300_000);
+    let extended = Extended::new(&body);
+    let root = extended.root();
+    let expected = extended.sample(5).unwrap();
+    let proofs = extended.into_proofs();
+    let size = proofs.layout().shard_size as usize;
+    let shard = &body[5 * size..6 * size];
+    let sample = Sample {
+        body_len: body.len() as u64,
+        index: 5,
+        shard: hex::encode(shard),
+        proof: proofs.proof(5).unwrap(),
+    };
+    assert_eq!(sample, expected);
+    assert!(verify_sample(&root, 5, &sample).is_ok());
+    assert!(proofs.proof(proofs.layout().total_shards()).is_none());
 }

@@ -1,5 +1,5 @@
 {
- "description": "B1 DA sample vectors from da/reference/da_vectors.py. Bodies are pattern(len): byte i is (31 i + 7) mod 256.",
+ "description": "B1 DA sample vectors from da/reference/da_vectors.py. Bodies are pattern(len): byte i is (31 i + 7) mod 256. A sample answers a draw of its own index, unless the vector gives the drawn index (B455).",
  "valid": [
   {
    "da_root": "627670dc0ad6858e4a8290cab1ea460007edb5bdd9453e358c6ae33ca808ac47",
@@ -360,6 +360,20 @@
     ]
    },
    "error": "BadRoot"
+  },
+  {
+   "name": "a genuine sample of another index than the one drawn",
+   "da_root": "4242cbc3c34686faa320a9a7aab32f1e6950a280dda3d0e1e4e70a36eee79aac",
+   "index": 1,
+   "sample": {
+    "body_len": 1,
+    "index": 0,
+    "shard": "07",
+    "proof": [
+     "7500b72a0cfc3a0eaf93963bb0e25885502ce2a7a2ea3066b613892b8863af0b"
+    ]
+   },
+   "error": "WrongIndex"
   }
  ]
 }

@@ -17,14 +17,12 @@ services:
       - "0.0.0.0:9100:9100" # libp2p: consensus + sync sessions (base port + 100)
       - "0.0.0.0:8545:8002" # API/RPC (and /metrics)
     volumes:
-      - ./testnet_data:/root/.aincore/data
-      - ${AINCORE_GENESIS_FILE:?set AINCORE_GENESIS_FILE to the genesis.json of the chain this node joins}:/root/.aincore/genesis.json:ro
+      - ./testnet_data:/home/aincore/.aincore/data
+      - ${AINCORE_GENESIS_FILE:?set AINCORE_GENESIS_FILE to the genesis.json of the chain this node joins}:/home/aincore/.aincore/genesis.json:ro
     environment:
-      - AINCORE_PORT=9000
-      - AINCORE_API_PORT=8002
       # The chain id comes from genesis.json (sys:chain_id), G3 FX-6.
       - RUST_LOG=info
-    command: [ "node", "--port", "9000", "--rpc-port", "8002", "--datadir", "/root/.aincore/data" ]
+    command: [ "node", "--port", "9000", "--rpc-port", "8002", "--datadir", "/home/aincore/.aincore/data" ]
     # B306: bounded logs.
     logging:
       driver: json-file
@@ -51,25 +49,11 @@ services:
     networks:
       - aincore-testnet
 
-  # Playit.gg tunnel agent. For the RPC only: a TCP tunnel delivers every
-  # peer from one address, and the node's P2P admission is per address (its
-  # handshake, identity and sync budgets), so one stranger through the tunnel
-  # could hold what every other tunnelled peer needs. Publish the P2P port
-  # directly.
-  playit:
-    image: ghcr.io/playit-cloud/playit-agent:0.17
-    container_name: aincore-playit-agent
-    restart: always
-    network_mode: host
-    environment:
-      # B281: the agent's key comes from the environment (or an untracked
-      # .env file beside this one); it was committed to the public repo.
-      - SECRET_KEY=${PLAYIT_SECRET_KEY:?set PLAYIT_SECRET_KEY}
-    logging:
-      driver: json-file
-      options:
-        max-size: "50m"
-        max-file: "5"
+  # B330: no TCP tunnel for the RPC. A tunnel (the playit agent stood here)
+  # delivers every client from one address, so all shared one client's rate
+  # limit and heavy-call lease. Serve the public RPC through an HTTP proxy
+  # that names each client in a header, on the node's proxy listener
+  # (AINCORE_RPC_PROXY_BIND, with the proxy's address trusted: B303).
 
 networks:
   aincore-testnet:

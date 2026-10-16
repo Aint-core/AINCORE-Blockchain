@@ -22,12 +22,17 @@ use sha2::{Digest, Sha256};
 /// Domain tag mixed into every finality-vote message so a finality vote can
 /// never collide with a DAG vertex signature (which uses the same consensus DST
 /// at the BLS layer). Bump the suffix on any breaking change to the vote shape.
-const FINALITY_VOTE_DOMAIN: &[u8] = b"AINCORE_FINALITY_VOTE_V1";
-/// FinalityVote V2 (G1 IM-5): a vote that also binds the next epoch's
-/// committee. Only votes that carry `next_validator_set_hash` use it, so
-/// every other vote keeps its V1 bytes.
-const FINALITY_VOTE_DOMAIN_V2: &[u8] = b"AINCORE_FINALITY_VOTE_V2";
+/// B320: V3 also binds the genesis the vote is made under (see
+/// `FinalityVote::to_signing_bytes`); V1 and V2 bound only the chain id.
+const FINALITY_VOTE_DOMAIN: &[u8] = b"AINCORE_FINALITY_VOTE_V3";
+/// FinalityVote with the next epoch's committee (G1 IM-5, V2's field): only
+/// votes that carry `next_validator_set_hash` use it. Equal in length to
+/// `FINALITY_VOTE_DOMAIN`.
+const FINALITY_VOTE_DOMAIN_NEXT: &[u8] = b"AINCORE_FINALITY_NEXT_V3";
 const VALIDATOR_BLS_DOMAIN: &[u8] = b"AINCORE_VALIDATOR_BLS_V1";
+/// The one `QuorumCertificate::version` a producer writes (B335: a verifier
+/// takes no other).
+pub const QC_VERSION: u8 = 1;
 
 /// Per-validator finality identity, and the committee order (G5: defined in
 /// `blockchain::committee` so the executor pays exactly this committee).
@@ -55,21 +60,35 @@ pub struct FinalityVote {
 }
 
 impl FinalityVote {
-    /// Deterministic signing bytes: domain tag || BCS(self). BCS is canonical
-    /// (no map ordering ambiguity), and the domain prefix separates finality
-    /// votes from vertex signatures. NEVER sign JSON.
+    /// Deterministic signing bytes: domain tag || genesis || BCS(self). BCS
+    /// is canonical (no map ordering ambiguity), and the domain prefix
+    /// separates finality votes from vertex signatures. NEVER sign JSON.
     ///
-    /// Without a next committee the bytes are V1's exactly (the serde skip
-    /// drops the empty field from BCS too); with one, the V2 domain.
+    /// A vote with a next committee takes `FINALITY_VOTE_DOMAIN_NEXT` (the
+    /// serde skip drops the empty field from BCS, so the domain tells them
+    /// apart). B320: `genesis` is the installed genesis identity
+    /// (`blockchain::vertex_domain`, set at boot; a client verifying QCs
+    /// installs the one it pins), length-prefixed. The vote bound the chain
+    /// id alone: a rehearsal or relaunch under the same chain id and genesis
+    /// validators has the same committee hash, so its QCs verified here, and
+    /// one for a height this node holds raised a decision conflict that
+    /// halted ordering for good.
     pub fn to_signing_bytes(&self) -> Vec<u8> {
+        self.signing_bytes_under(&blockchain::vertex_domain().1)
+    }
+
+    /// `to_signing_bytes` under the genesis identity `genesis`.
+    pub fn signing_bytes_under(&self, genesis: &str) -> Vec<u8> {
         let domain = if self.next_validator_set_hash.is_empty() {
             FINALITY_VOTE_DOMAIN
         } else {
-            FINALITY_VOTE_DOMAIN_V2
+            FINALITY_VOTE_DOMAIN_NEXT
         };
-        let mut out = Vec::with_capacity(domain.len() + 320);
-        out.extend_from_slice(domain);
         let body = bcs::to_bytes(self).expect("FinalityVote is BCS-serializable");
+        let mut out = Vec::with_capacity(domain.len() + 8 + genesis.len() + body.len());
+        out.extend_from_slice(domain);
+        out.extend_from_slice(&(genesis.len() as u64).to_le_bytes());
+        out.extend_from_slice(genesis.as_bytes());
         out.extend_from_slice(&body);
         out
     }
@@ -138,6 +157,9 @@ pub enum QcError {
     ChainIdMismatch { claimed: String, expected: String },
     BadBlsKey(String),
     VerifyFailed(String),
+    /// B335: a QC not in the one encoding a producer makes (`QC_VERSION`, a
+    /// bitmap of exactly one bit a member).
+    NonCanonical(String),
 }
 
 impl std::fmt::Display for QcError {
@@ -343,9 +365,13 @@ pub fn expected_chain_id() -> String {
 /// internally). Returns Ok(()) only if the aggregate BLS signature is valid over
 /// the canonical finality-vote bytes for exactly the bitmap signers AND their
 /// stake strictly exceeds 2/3 of the total.
-pub fn verify_qc(
+/// The checks of a QC that need neither its block nor a pairing: its chain
+/// and (B335) the one encoding a producer makes (`QC_VERSION`, a bitmap of
+/// one bit a member of a committee of `members`). B355: an importer runs
+/// them before it reads the block the QC names, charged.
+pub fn canonical(
     qc: &QuorumCertificate,
-    validators: &[ValidatorInfo],
+    members: usize,
     expected_chain_id: &str,
 ) -> Result<(), QcError> {
     // SEC (audit M-1): bind the QC to the verifier's chain. The aggregate signature
@@ -361,13 +387,53 @@ pub fn verify_qc(
             expected: expected_chain_id.to_string(),
         });
     }
+    // B335: one encoding a certificate (the vertex certificate's verifier
+    // refuses the same): a version or a zero byte padded onto the bitmap
+    // made a valid QC new bytes, past the stored-copy check, so each copy
+    // cost pairings and a synced rewrite.
+    if qc.version != QC_VERSION {
+        return Err(QcError::NonCanonical(format!("version {}", qc.version)));
+    }
+    if qc.signer_bitmap.len() != members.div_ceil(8) {
+        return Err(QcError::NonCanonical(format!(
+            "a {}-byte bitmap for {members} members",
+            qc.signer_bitmap.len()
+        )));
+    }
+    Ok(())
+}
+
+pub fn verify_qc(
+    qc: &QuorumCertificate,
+    validators: &[ValidatorInfo],
+    expected_chain_id: &str,
+) -> Result<(), QcError> {
+    verify_qc_under(
+        qc,
+        validators,
+        expected_chain_id,
+        &blockchain::vertex_domain().1,
+    )
+}
+
+/// `verify_qc` under the genesis identity `genesis` (B345: a checkpoint
+/// restore verifies its anchor's QC before boot installs the domain, under
+/// the identity the checkpoint names; under the empty one every honest QC
+/// failed and no node could join from a checkpoint).
+pub fn verify_qc_under(
+    qc: &QuorumCertificate,
+    validators: &[ValidatorInfo],
+    expected_chain_id: &str,
+    genesis: &str,
+) -> Result<(), QcError> {
+    canonical(qc, validators.len(), expected_chain_id)?;
     verify_stake_aggregate(
         validators,
         &qc.signer_bitmap,
         qc.signed_stake,
         qc.total_stake,
         &qc.validator_set_hash,
-        &qc.finality_vote().to_signing_bytes(),
+        &qc.finality_vote().signing_bytes_under(genesis),
         &qc.aggregate_signature,
     )
 }
@@ -500,7 +566,7 @@ pub fn build_qc(
         .sum();
     let total_stake: u128 = validators.iter().map(|v| v.stake as u128).sum();
     Ok(QuorumCertificate {
-        version: 1,
+        version: QC_VERSION,
         chain_id: vote.chain_id.clone(),
         epoch: vote.epoch,
         finalized_round: vote.finalized_round,
@@ -565,7 +631,7 @@ mod tests {
         ikm[0] = seed;
         ikm[31] = seed.wrapping_add(7);
         let pk = bls.pubkey_raw(&ikm);
-        let pop = bls.prove_possession_raw(&ikm);
+        let pop = bls.prove_possession_raw(&ikm, &[0u8; 32]);
         let info = ValidatorInfo {
             address: format!("{:032x}", seed as u128),
             stake,
@@ -619,17 +685,17 @@ mod tests {
         let mut ikm_b = [0u8; 32];
         ikm_b[0] = 99;
         let pk_a = bls.pubkey_raw(&ikm_a);
-        let pop_b = bls.prove_possession_raw(&ikm_b); // mismatched PoP
+        let pop_b = bls.prove_possession_raw(&ikm_b, &[0u8; 32]); // mismatched PoP
 
         // Mismatched PoP must NOT verify.
         assert!(
-            !bls.verify_possession(&pk_a, &pop_b).unwrap(),
+            !bls.verify_possession(&pk_a, &pop_b, &[0u8; 32]).unwrap(),
             "PoP from a different secret must be rejected"
         );
         // Matching PoP DOES verify (sanity).
-        let pop_a = bls.prove_possession_raw(&ikm_a);
+        let pop_a = bls.prove_possession_raw(&ikm_a, &[0u8; 32]);
         assert!(
-            bls.verify_possession(&pk_a, &pop_a).unwrap(),
+            bls.verify_possession(&pk_a, &pop_a, &[0u8; 32]).unwrap(),
             "matching PoP must verify"
         );
     }
@@ -640,7 +706,10 @@ mod tests {
         let (v, _sk) = make_validator(1, 100);
         let pk = hex::decode(&v.bls_public_key).unwrap();
         let pop = hex::decode(&v.bls_pop).unwrap();
-        assert!(bls.verify_possession(&pk, &pop).unwrap(), "PoP must verify");
+        assert!(
+            bls.verify_possession(&pk, &pop, &[0u8; 32]).unwrap(),
+            "PoP must verify"
+        );
     }
 
     #[test]
@@ -752,6 +821,32 @@ mod tests {
         );
     }
 
+    /// B335 witness: one encoding a QC: a zero byte padded onto its bitmap,
+    /// or another version, is refused (a re-encoded valid QC was new bytes
+    /// to the stored-copy check: two pairings and a synced rewrite a copy).
+    #[test]
+    fn a_non_canonical_qc_is_refused() {
+        let mut vote = sample_vote();
+        let (v, sk) = make_validator(1, 100);
+        let validators = vec![v];
+        vote.validator_set_hash = validator_set_hash(&validators);
+        let sig = sign_vote(&sk, &vote);
+        let qc = build_qc(&vote, &validators, &[0], &[sig]).unwrap();
+        assert_eq!(verify_qc(&qc, &validators, &qc.chain_id), Ok(()));
+        let mut padded = qc.clone();
+        padded.signer_bitmap.push(0);
+        assert!(matches!(
+            verify_qc(&padded, &validators, &padded.chain_id),
+            Err(QcError::NonCanonical(_))
+        ));
+        let mut versioned = qc.clone();
+        versioned.version = QC_VERSION + 1;
+        assert!(matches!(
+            verify_qc(&versioned, &validators, &versioned.chain_id),
+            Err(QcError::NonCanonical(_))
+        ));
+    }
+
     #[test]
     fn forged_stake_field_rejected() {
         let vote = sample_vote();
@@ -824,5 +919,58 @@ mod tests {
         assert_eq!(v.to_signing_bytes(), v.to_signing_bytes());
         // Domain prefix is present.
         assert!(v.to_signing_bytes().starts_with(FINALITY_VOTE_DOMAIN));
+    }
+
+    /// B345 witness: a QC verifies under the genesis identity it was signed
+    /// under when the verifier names it, whatever the process installed (a
+    /// checkpoint restore verifies before boot installs the domain, and under
+    /// the empty identity every honest QC failed), and under no other.
+    #[test]
+    fn a_qc_verifies_under_the_genesis_it_names() {
+        let mut vote = sample_vote();
+        let (v, sk) = make_validator(1, 100);
+        let validators = vec![v];
+        vote.validator_set_hash = validator_set_hash(&validators);
+        let genesis = "1d".repeat(32);
+        let signature = BLSEngine::consensus().sign_raw(&vote.signing_bytes_under(&genesis), &sk);
+        let qc = build_qc(&vote, &validators, &[0], &[signature]).unwrap();
+        assert_eq!(
+            verify_qc_under(&qc, &validators, &qc.chain_id, &genesis),
+            Ok(())
+        );
+        assert!(matches!(
+            verify_qc_under(&qc, &validators, &qc.chain_id, ""),
+            Err(QcError::VerifyFailed(_))
+        ));
+        assert!(matches!(
+            verify_qc_under(&qc, &validators, &qc.chain_id, &"2e".repeat(32)),
+            Err(QcError::VerifyFailed(_))
+        ));
+    }
+
+    /// B320 witness: a finality vote binds the genesis it is made under, so a
+    /// QC of another incarnation of the chain (same chain id, same genesis
+    /// validators, so the same committee hash) does not verify here; it
+    /// verified, and one for a held height halted ordering for good.
+    #[test]
+    fn a_finality_vote_binds_its_genesis() {
+        let v = sample_vote();
+        assert_eq!(
+            v.to_signing_bytes(),
+            v.signing_bytes_under(&blockchain::vertex_domain().1)
+        );
+        assert_ne!(
+            v.signing_bytes_under(&"aa".repeat(32)),
+            v.signing_bytes_under(&"bb".repeat(32)),
+            "two geneses sign the same bytes"
+        );
+        let next = FinalityVote {
+            next_validator_set_hash: "cc".repeat(32),
+            ..v.clone()
+        };
+        assert!(next
+            .to_signing_bytes()
+            .starts_with(FINALITY_VOTE_DOMAIN_NEXT));
+        assert_eq!(FINALITY_VOTE_DOMAIN.len(), FINALITY_VOTE_DOMAIN_NEXT.len());
     }
 }

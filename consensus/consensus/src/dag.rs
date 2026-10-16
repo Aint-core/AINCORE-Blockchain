@@ -171,8 +171,15 @@ pub struct DagConsensus {
     /// row that disagrees, DE-6) halts ordering: no block is placed, no
     /// finality vote signed, no synced anchor adopted. Survives restarts.
     ordering_halt: Option<String>,
+    /// B456: the conflict alarms could not be read at the last look (they
+    /// may hold one): ordering halts while so, and they are read again each
+    /// tick (`refresh_alarm_halt`), as sync reads them again each pass.
+    alarms_unreadable: Option<String>,
     /// V4 ticks so far, and the QC(H_E) ask/answer throttles (EP-4).
     v4_ticks: u64,
+    /// B405: this run's proof-of-boot transactions not yet seen in a block
+    /// (their ids, newest last, at most `MAX_BOOT_PROOFS`).
+    boot_proofs: Vec<String>,
     qc_want_next: u64,
     qc_want_boundary_next: u64,
     /// B96: per (height, asker) the tick it was last answered, and per asker
@@ -376,7 +383,9 @@ impl DagConsensus {
             v4_chain: v4_format,
             v4_stakes: Vec::new(),
             ordering_halt: None,
+            alarms_unreadable: None,
             v4_ticks: 0,
+            boot_proofs: Vec::new(),
             qc_want_next: 0,
             qc_want_boundary_next: 0,
             qc_answered: HashMap::new(),
@@ -390,30 +399,25 @@ impl DagConsensus {
             #[cfg(any(test, feature = "sim"))]
             v4_outbox: None,
         };
-        for alarms in ["alarm:decision_conflict:", "alarm:committee_mismatch:"] {
-            if let Some(Ok((key, _))) = this.storage.db.prefix_iterator(alarms.as_bytes()).next() {
-                if key.starts_with(alarms.as_bytes()) {
-                    this.ordering_halt = Some(format!(
-                        "a consensus conflict was recorded ({})",
-                        String::from_utf8_lossy(&key)
-                    ));
-                }
-            }
-        }
+        this.refresh_alarm_halt();
         if v4_format {
             this.start_v4();
         }
         this
     }
 
-    /// Why ordering is halted, if it is: a conflict this node recorded, or
-    /// the V4 engine's certificate conflict (CE-3, OR-2).
+    /// Why ordering is halted, if it is: a conflict this node recorded,
+    /// conflict alarms it cannot read (B456), or the V4 engine's certificate
+    /// conflict (CE-3, OR-2).
     pub fn ordering_halted(&self) -> Option<String> {
-        self.ordering_halt.clone().or_else(|| {
-            self.v4
-                .as_ref()
-                .and_then(|e| e.halted().map(str::to_string))
-        })
+        self.ordering_halt
+            .clone()
+            .or_else(|| self.alarms_unreadable.clone())
+            .or_else(|| {
+                self.v4
+                    .as_ref()
+                    .and_then(|e| e.halted().map(str::to_string))
+            })
     }
 
     /// G5 BT-1: the drift alarm, this node's clock minus the chain's time in
@@ -488,7 +492,8 @@ impl DagConsensus {
 
     /// G1 EP-3 and EP-4 on the node. E closes in memory once H_E is accepted
     /// or adopted (its record was written in H_E's transaction). E+1 activates
-    /// once this node holds QC(H_E), verified under C_E and binding H_E; the
+    /// once this node holds QC(H_E), verified under C_E and binding H_E, and
+    /// (B317) no block of E waits on its QC here; the
     /// QC's `next_validator_set_hash` must be the hash of the committee this
     /// node derived, or ordering halts with `alarm:committee_mismatch`.
     fn v4_epoch_step(&mut self) {
@@ -503,14 +508,64 @@ impl DagConsensus {
         self.v4 = Some(engine);
     }
 
+    /// B425: the tip is a boundary block H_E (or a later one) and E's close
+    /// is not known in memory: E+1's record could not be read (B419: a read
+    /// error is no decision this tick) or is not observed yet. Ordering
+    /// closes E only through `adopt_close`, so until then it would scan past
+    /// r* and decide an epoch-E anchor for H_E + 1 that no peer builds. An
+    /// interval that cannot be read counts as unknown too.
+    fn v4_close_unknown(&self) -> bool {
+        let Some(engine) = self.v4.as_ref() else {
+            return false;
+        };
+        let tip = self.latest_block_height;
+        if tip == 0 || engine.next_start().is_some() {
+            return false;
+        }
+        let interval = match self.storage.get(crate::v4::epoch::EPOCH_INTERVAL_KEY) {
+            Ok(raw) => match raw.and_then(|v| v.trim().parse::<u64>().ok()) {
+                Some(interval) if interval > 0 => interval,
+                _ => return false,
+            },
+            Err(_) => return true,
+        };
+        tip.is_multiple_of(interval)
+            && crate::v4::epoch::epoch_of_height(tip, interval) >= engine.epoch()
+    }
+
     fn v4_epoch_step_with(&mut self, engine: &mut crate::v4::Engine) {
         match engine.observe_close() {
             Ok(true) => {}
             Ok(false) => return,
             Err(e) => {
-                // Fail closed: E cannot be known closed, so nothing more of E
-                // may be decided (the peers have closed it).
-                let why = format!("the next epoch's record is unreadable: {e}");
+                // B419: a read error is no decision this tick, retried at the
+                // next (as `parent_timestamp` defers): halted in memory, the
+                // node stopped ordering until a restart while sync kept
+                // importing. Only a corrupt record halts, and durably: E
+                // cannot be known closed, so nothing more of E may be decided
+                // (the peers have closed it). The alarm row stops sync too
+                // (`recorded_conflict`) and holds across a restart, where the
+                // record is still corrupt; a panic would only restart the
+                // node into it again and again.
+                let next = engine.epoch().saturating_add(1);
+                let corrupt = matches!(
+                    self.storage.get(&crate::v4::epoch::epoch_start_key(next)),
+                    Ok(Some(raw))
+                        if serde_json::from_str::<crate::v4::epoch::EpochStart>(&raw).is_err()
+                );
+                if !corrupt {
+                    eprintln!(
+                        "[EP-3] the next epoch's record is unreadable ({e}): retried next tick"
+                    );
+                    return;
+                }
+                let why = format!(
+                    "{}: the record of epoch {next} is corrupt: {e}",
+                    crate::v4::epoch::COMMITTEE_MISMATCH
+                );
+                let _ = self
+                    .storage
+                    .put(&format!("alarm:committee_mismatch:{next:020}"), &why);
                 eprintln!("🚨 [EP-3] {why}: ordering halted");
                 self.ordering_halt = Some(why);
                 return;
@@ -523,6 +578,45 @@ impl DagConsensus {
         if let Ok(Some(why)) = self.storage.get(&mismatch_key) {
             // Sync refused QC(H_E) for this reason (see chain_sync).
             self.ordering_halt = Some(why);
+            return;
+        }
+        // B317: and only once every block of E holds its QC. Activation
+        // drops C_E from the session book, so a member of C_E alone (it left
+        // the committee) could no longer send the vote a block of E without
+        // its QC needed (f members withholding theirs): that block never got
+        // one, and its pending work stopped proposals in E+1 for good. B352:
+        // waited before QC(H_E) is verified (a pairing each step). B419: and
+        // while the pending work cannot be read (it read as none).
+        // B358's regression of B317: a row whose QC is stored waits on
+        // nothing, but only a retry retires it (a QC assembled from votes or
+        // taken from a QC_CERT is stored with its row left in place), and
+        // B358 took the retry off the reload of the chain tip: a node syncing
+        // back across boundaries activated no epoch in its pass, and the
+        // QC_CERT this wait asked for activated nothing until the next tick.
+        // Such a row is retired here first (`qc_work_at`; B420's alarm still
+        // keeps a row whose stored QC differs from the work), and a row that
+        // stays is waited on.
+        let mut retired = None;
+        let lowest = loop {
+            let lowest = match crate::qc_producer::try_lowest_pending_qc_height(&self.storage) {
+                Ok(lowest) => lowest,
+                Err(e) => {
+                    eprintln!("[EP-4] pending QC work is unreadable ({e}): activation waits");
+                    return;
+                }
+            };
+            let Some(low) = lowest.filter(|&low| low <= next.prev_height) else {
+                break lowest;
+            };
+            let certified = crate::qc_producer::stored_qc(&self.storage, low).is_some();
+            if !certified || retired == Some(low) {
+                break lowest;
+            }
+            self.qc_work_at(low);
+            retired = Some(low);
+        };
+        if let Some(low) = lowest.filter(|&low| low <= next.prev_height) {
+            self.want_boundary_qc(low);
             return;
         }
         let Some(qc) = crate::qc_producer::stored_qc(&self.storage, next.prev_height) else {
@@ -583,20 +677,29 @@ impl DagConsensus {
 
     /// A conflict another component recorded (sync's IM-3 / EP-4 checks write
     /// `alarm:decision_conflict:*` or `alarm:committee_mismatch:*`) halts
-    /// ordering here too, not only at the next boot.
+    /// ordering here too, not only at the next boot (which reads them here).
+    /// B456: alarms that cannot be read halt it while they cannot, and are
+    /// read again each tick. Read as no alarm, a read error let ordering go
+    /// on over a conflict; held until a restart, the node would stop
+    /// ordering while sync, which reads them again each pass, went on
+    /// importing (B419).
     fn refresh_alarm_halt(&mut self) {
         if self.ordering_halt.is_some() {
             return;
         }
-        for alarms in ["alarm:decision_conflict:", "alarm:committee_mismatch:"] {
-            if let Some(Ok((key, _))) = self.storage.db.prefix_iterator(alarms.as_bytes()).next() {
-                if key.starts_with(alarms.as_bytes()) {
-                    self.ordering_halt = Some(format!(
-                        "a consensus conflict was recorded ({})",
-                        String::from_utf8_lossy(&key)
-                    ));
-                    return;
+        match conflict_alarm(&self.storage, &CONFLICT_ALARMS) {
+            Ok(None) => self.alarms_unreadable = None,
+            Ok(Some(key)) => {
+                self.alarms_unreadable = None;
+                self.ordering_halt = Some(format!("a consensus conflict was recorded ({key})"));
+            }
+            Err(e) => {
+                if self.alarms_unreadable.is_none() {
+                    eprintln!(
+                        "🚨 [B456] ordering halts while the conflict alarms are unreadable: {e}"
+                    );
                 }
+                self.alarms_unreadable = Some(format!("the conflict alarms are unreadable: {e}"));
             }
         }
     }
@@ -707,12 +810,21 @@ impl DagConsensus {
         // Verified under the height's committee and bound to the held block
         // before it is stored (a verified QC for another block is IM-3's
         // conflict); on V4 an import never touches the ordering keys.
-        if let Err(e) = crate::qc_producer::import_finality_qc(&self.storage, &qc) {
-            eprintln!("[EP-4] QC of block {} not stored: {e}", qc.block_height);
-            self.refresh_alarm_halt();
-            return;
+        match crate::qc_producer::import_finality_qc(&self.storage, &qc) {
+            Ok(true) => self.v4_epoch_step(),
+            // B352: nothing stored (a height not held, or held already): no
+            // step. Each step verified QC(H_E) again (a pairing, under the
+            // consensus lock), so while B317's wait lasted a member's junk
+            // certificates for heights it does not hold cost one each.
+            Ok(false) => {}
+            Err(e) => {
+                // B443: cut and escaped (`loggable`): the error echoes fields
+                // the sender chose.
+                let why = loggable(&e);
+                eprintln!("[EP-4] QC of block {} not stored: {why}", qc.block_height);
+                self.refresh_alarm_halt();
+            }
         }
-        self.v4_epoch_step();
     }
 
     /// Boot the certified-DAG engine on a V4 chain (RC-1). A V4 chain without
@@ -774,6 +886,13 @@ impl DagConsensus {
         self.now_secs = now_secs;
     }
 
+    /// B405: whether this node signs vertices now: a member that abstains
+    /// under RC-3 puts nothing into vertices, so its transactions (its own
+    /// proof of boot, and what its RPC took) are forwarded instead.
+    pub fn v4_signs(&self) -> bool {
+        self.v4.as_ref().is_some_and(|engine| engine.signs())
+    }
+
     /// G4 S1: the committees whose members the network admits on consensus
     /// sessions: C_E, and C_{E+1} once E has closed. None without a V4
     /// engine (an inert node admits nobody).
@@ -816,6 +935,85 @@ impl DagConsensus {
         }
     }
 
+    /// B405: while this node lacks continuous guards under RC-3 with no
+    /// proof yet that a block was made after this boot: the height it holds
+    /// once one of its proof-of-boot transactions has a receipt (the block
+    /// that carries it is at or below it), and a fresh one every
+    /// `BOOT_PROOF_EVERY_TICKS` until then (the first is lost while its
+    /// sequence number is stale, before the node caught up), sent while its
+    /// key is a member of C_E or (B441) of the live set, as a joiner's is
+    /// before its first member epoch. It goes to the mempool, which forwards
+    /// it while this node does not sign (`signs`). No clock and no peer's
+    /// word: a transaction with a random amount did not exist before this
+    /// boot.
+    fn prove_boot(&mut self) {
+        if !self.v4.as_ref().is_some_and(|e| e.lacks_guards())
+            || !crate::v4::epoch::awaits_boot_proof(&self.storage).unwrap_or(false)
+        {
+            return;
+        }
+        let seen = self.boot_proofs.iter().any(|id| {
+            self.storage
+                .get(&format!("tx_receipt:{id}"))
+                .is_ok_and(|r| r.is_some())
+        });
+        if seen {
+            // B421: the stored tip (`boot_proof_height`). B456: one that
+            // cannot be read is no height: nothing is noted this tick.
+            let held = match boot_proof_height(&self.storage, self.latest_block_height) {
+                Ok(held) => held,
+                Err(e) => {
+                    eprintln!("⚠️ [RC-3] the boot proof is not noted yet: {e}");
+                    return;
+                }
+            };
+            match crate::v4::epoch::note_boot_proof(&self.storage, held) {
+                Ok(()) => {
+                    println!(
+                        "🔓 [RC-3] a block after this boot holds a proof transaction: \
+                         signing resumes at the first boundary above height {held}"
+                    );
+                    self.boot_proofs.clear();
+                }
+                Err(e) => eprintln!("⚠️ [RC-3] the boot proof was not kept: {e}"),
+            }
+            return;
+        }
+        // B441: who proves is asked only when a proof is due (it reads the
+        // live set).
+        if self.v4_ticks % BOOT_PROOF_EVERY_TICKS != 1
+            || !self.v4.as_ref().is_some_and(|e| e.seeks_boot_proof())
+        {
+            return;
+        }
+        use rand::Rng;
+        let amount = rand::thread_rng().gen_range(1..=u128::from(u32::MAX));
+        let key = crypto::SigningKey::from_bytes(&self.node_key);
+        let built = executor::admission::proof_of_boot_tx(
+            &self.storage,
+            &self.resolve_chain_id(),
+            &key,
+            amount,
+        );
+        let added = built.and_then(|(json, id)| {
+            let mut mp = mempool::lock_for_consensus(&self.mempool).map_err(|e| e.to_string())?;
+            mp.add_transaction(json)?;
+            Ok(id)
+        });
+        match added {
+            Ok(id) => {
+                self.boot_proofs.push(id);
+                if self.boot_proofs.len() > MAX_BOOT_PROOFS {
+                    self.boot_proofs.remove(0);
+                }
+            }
+            Err(e) => eprintln!(
+                "⚠️ [RC-3] no proof-of-boot transaction this time ({e}); the account \
+                 needs a little AIN for its gas"
+            ),
+        }
+    }
+
     /// The V4 tick: PR-1..PR-4 through the engine, with this node's payload
     /// gathered only when a proposal is due, then the commit loop if O_E grew.
     fn v4_tick(&mut self) {
@@ -830,6 +1028,7 @@ impl DagConsensus {
         }
         self.retry_qc_work();
         self.v4_epoch_step();
+        self.prove_boot();
         let Some(mut engine) = self.v4.take() else {
             return;
         };
@@ -970,6 +1169,16 @@ impl DagConsensus {
             if self.last_adopted_height < self.latest_block_height {
                 break;
             }
+            // B425: nothing is decided above H_E until E's close is known
+            // (the epoch step retries the read at the next tick).
+            if self.v4_close_unknown() {
+                eprintln!(
+                    "[EP-3] block {} closes an epoch whose close is not known yet: \
+                     no decision this tick",
+                    self.latest_block_height
+                );
+                break;
+            }
             let plan = {
                 let engine = self
                     .ordering_engine
@@ -1098,14 +1307,21 @@ impl DagConsensus {
             // block later superseded by the synced chain carried a stale-high value
             // into its next clamp and produced a header one second off from every
             // other node (same vertices, same state, different hash).
-            let parent_ts = self
-                .storage
-                .get(&format!("block_{}", self.latest_block_height))
-                .ok()
-                .flatten()
-                .and_then(|j| serde_json::from_str::<blockchain::Block>(&j).ok())
-                .map(|b| b.header.timestamp)
-                .unwrap_or(self.latest_block_timestamp);
+            let parent_ts = match parent_timestamp(
+                &self.storage,
+                self.latest_block_height,
+                self.latest_block_timestamp,
+            ) {
+                Ok(ts) => ts,
+                Err(e) => {
+                    eprintln!(
+                        "🚨 [PARENT_TIME] {e}; deferring anchor round {} rather than \
+                         clamping against the in-memory time",
+                        commit.anchor_round
+                    );
+                    break 'anchors;
+                }
+            };
             // Join raw samples with a freshly sampled stake map: both the
             // membership filter and the weights must come from the set as of the
             // tip we are building on.
@@ -1381,7 +1597,7 @@ impl DagConsensus {
 
                     // The request committed with the block. Signing/gossip may
                     // fail here; later ticks or reopen retry that same context.
-                    self.retry_qc_work();
+                    self.qc_work_at(self.latest_block_height);
                 }
             }
         }
@@ -1479,6 +1695,10 @@ impl DagConsensus {
         payload
     }
 
+    /// The next rows of pending QC work, round-robin: once a tick (B358:
+    /// it also ran on every reload of the chain tip, once per vertex that
+    /// grew O_E, each row re-reading its block and sending its vote to every
+    /// member again).
     fn retry_qc_work(&mut self) {
         // A halted node signs no finality vote, nor does an inert one.
         if !self.v4_chain || self.ordering_halted().is_some() {
@@ -1494,20 +1714,39 @@ impl DagConsensus {
         ) {
             Ok(outcomes) => {
                 for outcome in outcomes {
-                    match outcome {
-                        crate::qc_producer::QcOutcome::Partial(message) => {
-                            self.broadcast_qc_vote(&message)
-                        }
-                        crate::qc_producer::QcOutcome::Complete(cert) => {
-                            if let Ok(mut engine) = self.ordering_engine.lock() {
-                                engine.fold_qc_for_height(cert.block_height);
-                            }
-                        }
-                        crate::qc_producer::QcOutcome::Skipped => {}
-                    }
+                    self.publish_qc_outcome(outcome);
                 }
             }
             Err(error) => eprintln!("[QC] pending work scan deferred: {error}"),
+        }
+    }
+
+    /// B358: the QC work just staged with the block at `height` (its first
+    /// vote, or the QC it was adopted with), alone.
+    fn qc_work_at(&mut self, height: u64) {
+        if !self.v4_chain || self.ordering_halted().is_some() {
+            return;
+        }
+        let chain = self.resolve_chain_id();
+        let outcome = crate::qc_producer::retry_pending_qc_at(
+            &self.storage,
+            &self.node_key,
+            &self.node_id,
+            &chain,
+            height,
+        );
+        self.publish_qc_outcome(outcome);
+    }
+
+    fn publish_qc_outcome(&self, outcome: crate::qc_producer::QcOutcome) {
+        match outcome {
+            crate::qc_producer::QcOutcome::Partial(message) => self.broadcast_qc_vote(&message),
+            crate::qc_producer::QcOutcome::Complete(cert) => {
+                if let Ok(mut engine) = self.ordering_engine.lock() {
+                    engine.fold_qc_for_height(cert.block_height);
+                }
+            }
+            crate::qc_producer::QcOutcome::Skipped => {}
         }
     }
 
@@ -1763,12 +2002,17 @@ impl DagConsensus {
     /// consensus. A QC is never stored unless it verifies (enforced inside
     /// `collect_vote_and_try_aggregate`).
     fn handle_remote_qc_vote(&self, content: &str) {
-        let vote_msg: crate::qc_producer::QcVoteMessage = match serde_json::from_str(content) {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("❌ [QC] Malformed finality vote JSON: {}", e);
-                return;
-            }
+        // B443: charged, and logged without its text: no honest member sends
+        // one, and each copy logged a line (echoing up to 8 KiB of the
+        // sender's bytes), uncharged, so B51 never muted the sender.
+        let Ok(vote_msg) = serde_json::from_str::<crate::qc_producer::QcVoteMessage>(content)
+        else {
+            crate::work::note_failed_check();
+            eprintln!(
+                "❌ [QC] a malformed finality vote ({} bytes) refused",
+                content.len()
+            );
+            return;
         };
 
         // B52: a vote counts only for a block this node holds, at that
@@ -1784,7 +2028,8 @@ impl DagConsensus {
         // (junk votes for fresh rounds read a whole block each). B190: and
         // first, so a vote for work this node does not hold is dropped
         // before the committee record is parsed (~130 KB at 256 members).
-        let Some(work) =
+        // B469: as is a vote for work this node cannot read.
+        let Ok(Some(work)) =
             crate::qc_producer::pending_context(&self.storage, vote_msg.vote.block_height)
         else {
             return;
@@ -1927,7 +2172,6 @@ impl DagConsensus {
     /// Reload chain tip from storage after external state changes (e.g. sync)
     /// This prevents consensus from forking by building on stale state.
     pub fn reload_chain_tip(&mut self) {
-        self.retry_qc_work();
         let new_height = match self.storage.get("latest_height") {
             Ok(Some(h)) => h.parse::<u64>().unwrap_or(0),
             _ => 0,
@@ -2000,8 +2244,8 @@ impl DagConsensus {
                         // adoption waits (the QC is fetched with the block).
                         let Some(qc) =
                             crate::qc_producer::stored_qc(&self.storage, h).filter(|q| {
-                                crate::qc_producer::verify_block_qc(&self.storage, &block, q)
-                                    .is_ok()
+                                // B353: a stored QC was verified when stored.
+                                crate::qc_producer::block_qc_binds(&self.storage, &block, q).is_ok()
                             })
                         else {
                             eprintln!("V4: block {h} has no verified QC yet; adoption waits");
@@ -2080,7 +2324,7 @@ impl DagConsensus {
                             if let Some(hook) = self.local_acceptance_hook {
                                 hook(3, &self.storage).expect("post-adoption test hook failed");
                             }
-                            self.retry_qc_work();
+                            self.qc_work_at(h);
                         }
                     }
                     self.last_adopted_height = h;
@@ -2281,6 +2525,73 @@ static PRUNING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// advances the tip calls it, a block this node built and one it imported
 /// through sync, so a node that only follows prunes too. Node-local and
 /// root-neutral.
+/// B405: how often an abstaining member sends a proof-of-boot transaction
+/// (20 ticks, a minute at the 3 s default tick).
+const BOOT_PROOF_EVERY_TICKS: u64 = 20;
+/// B405: the proof-of-boot transactions kept watching at once.
+const MAX_BOOT_PROOFS: usize = 8;
+
+/// The durable rows of a consensus conflict: each halts ordering until an
+/// operator clears it.
+pub const CONFLICT_ALARMS: [&str; 2] = ["alarm:decision_conflict:", "alarm:committee_mismatch:"];
+
+/// B406: the rows sync stops on: every recorded conflict that halts
+/// ordering, CE-3's certificate conflict too. The V4 engine reads that one
+/// itself, for its epoch; sync, missing it, imported blocks behind a halted
+/// engine and kept them all (B371's floor), as B390 found for the others.
+/// Recovery (`pin_canonical`) and a restore delete the row.
+const SYNC_STOP_ALARMS: [&str; 3] = [
+    CONFLICT_ALARMS[0],
+    CONFLICT_ALARMS[1],
+    "alarm:vcert_conflict:",
+];
+
+/// B390: the first conflict `storage` records, if any (ordering is halted).
+/// B456: or the alarms that cannot be read, which may hold one.
+pub fn recorded_conflict(storage: &StateDB) -> Option<String> {
+    conflict_alarm(storage, &SYNC_STOP_ALARMS).unwrap_or_else(Some)
+}
+
+/// The key of the first row under one of `alarms`, if any. B456: a read
+/// error is an error, not "no alarm": every reader of these rows (the boot,
+/// `refresh_alarm_halt`, sync through `recorded_conflict`) took one for no
+/// conflict, and went on over a recorded one.
+fn conflict_alarm(storage: &StateDB, alarms: &[&str]) -> Result<Option<String>, String> {
+    for prefix in alarms {
+        match storage.db.prefix_iterator(prefix.as_bytes()).next() {
+            Some(Ok((key, _))) if key.starts_with(prefix.as_bytes()) => {
+                return Ok(Some(String::from_utf8_lossy(&key).into_owned()));
+            }
+            Some(Err(e)) => return Err(format!("{prefix}* cannot be read ({e})")),
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
+/// B421, B456: the height a seen proof of boot is noted at: the stored tip
+/// (written in the transaction that wrote the receipt, so at or above the
+/// block that carries it), never below the cached one, which lags sync's
+/// imports (it moves at `reload_chain_tip`). A stored tip that cannot be
+/// read is no height: read as 0, the cached tip was noted, below a pre-boot
+/// boundary, and that boundary re-armed the node.
+fn boot_proof_height(storage: &StateDB, cached: u64) -> Result<u64, String> {
+    let stored = storage.try_chain_height().map_err(|e| e.to_string())?;
+    Ok(stored.max(cached))
+}
+
+/// B443: the most characters of a refused QC's error a log line keeps.
+const MAX_LOGGED_REFUSAL_CHARS: usize = 200;
+
+/// B443: `e` for a log line: its first `MAX_LOGGED_REFUSAL_CHARS`
+/// characters, control characters escaped (B342/B448's cut). A refused
+/// QC's error echoes fields its sender chose (a claimed chain id or
+/// committee hash, up to `QC_CERT_MAX_BYTES`), so each refusal wrote what
+/// the sender chose, line breaks included.
+fn loggable(e: &str) -> String {
+    e.escape_debug().take(MAX_LOGGED_REFUSAL_CHARS).collect()
+}
+
 pub fn prune_history(storage: &Arc<StateDB>, height: u64, policy: Option<(u64, u64)>) {
     let Some((keep_blocks, max_delete)) = policy else {
         return;
@@ -2290,6 +2601,33 @@ pub fn prune_history(storage: &Arc<StateDB>, height: u64, policy: Option<(u64, u
         Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
         Err(std::sync::TryLockError::WouldBlock) => return,
     };
+    // B369: no block at or above the lowest whose QC this node still waits
+    // on is pruned: the window ends where it would keep that one. A QC for a
+    // block not held is ignored, so a retention shorter than the wait kept
+    // the work pending for good, and 50 blocks later the member proposed
+    // nothing again. State pruning keeps its cadence on the tip.
+    let tip = height;
+    let height = match crate::qc_producer::try_lowest_pending_qc_height(storage) {
+        Ok(Some(pending)) => height.min(pending.saturating_add(keep_blocks)),
+        Ok(None) => height,
+        // B419: pending work that cannot be read skips this run (a later tip
+        // runs again): read as none, a block awaiting its QC was pruned.
+        Err(e) => {
+            eprintln!("[GC-1] pruning skipped: pending QC work is unreadable ({e})");
+            return;
+        }
+    };
+    // B371: nor a block this node has not adopted. Sync imports, and prunes,
+    // a whole pass before the adoption loop runs, and that loop stops at a
+    // missing block for good: a validator back after a short absence with a
+    // small retention never decided or voted again.
+    let adopted = storage
+        .get("consensus:last_adopted_height")
+        .ok()
+        .flatten()
+        .and_then(|h| h.parse::<u64>().ok())
+        .unwrap_or(0);
+    let height = height.min(adopted.saturating_add(1).saturating_add(keep_blocks));
     // The pinned versions keep their blocks too, so a snapshot at a pin has
     // its anchor block (SN-4).
     let interval = state_commit::epoch_interval(storage);
@@ -2341,7 +2679,7 @@ pub fn prune_history(storage: &Arc<StateDB>, height: u64, policy: Option<(u64, u
     }
     // State versions follow the same window, so proofs are served exactly as
     // long as blocks are.
-    if !height.is_multiple_of(STATE_PRUNE_EVERY) {
+    if !tip.is_multiple_of(STATE_PRUNE_EVERY) {
         return;
     }
     match prune_state_window(
@@ -2380,6 +2718,51 @@ pub(crate) fn prune_state_window(
     }
     let pinned = state_commit::pin_schedule(tip, keep, state_commit::epoch_interval(storage));
     state_commit::prune(storage, tip - keep, &pinned, max_rows).map_err(|e| e.to_string())
+}
+
+/// B404: the BFT time of the canonical parent a block is built on: the
+/// stored tip block's header, or `fallback` where no block row exists (the
+/// genesis tip). A read error or a corrupt row is no decision: the builder
+/// defers the anchor. It fell back to the in-memory time, a stale-high
+/// running max, so one transient read error built a header no other node
+/// built: a decision conflict and a halted node.
+pub(crate) fn parent_timestamp(storage: &StateDB, tip: u64, fallback: u64) -> Result<u64, String> {
+    let key = format!("block_{tip}");
+    match storage.get(&key) {
+        Ok(None) => Ok(fallback),
+        Ok(Some(json)) => serde_json::from_str::<blockchain::Block>(&json)
+            .map(|b| b.header.timestamp)
+            .map_err(|e| format!("{key} is corrupt: {e}")),
+        Err(e) => Err(format!("{key} could not be read: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod parent_time_tests {
+    use super::parent_timestamp;
+    use storage::StateDB;
+
+    /// B404 witness: a corrupt parent row is no decision; only a missing
+    /// row (genesis) takes the in-memory time.
+    #[test]
+    fn a_corrupt_parent_block_is_no_decision() {
+        let path =
+            storage::test_dir::process_dir().join(format!("parent_time_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        let db = StateDB::open(path.to_str().unwrap()).unwrap();
+        let _seed = db.seeding();
+        assert_eq!(parent_timestamp(&db, 0, 77), Ok(77));
+        let mut block = blockchain::Block::new(5, 9, "p".into(), vec![], "a".into());
+        block.header.timestamp = 1_234;
+        db.put("block_5", &serde_json::to_string(&block).unwrap())
+            .unwrap();
+        assert_eq!(parent_timestamp(&db, 5, 9_999), Ok(1_234));
+        db.put("block_5", "{\"header\":").unwrap();
+        assert!(
+            parent_timestamp(&db, 5, 9_999).is_err(),
+            "a corrupt parent took the in-memory time"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2445,5 +2828,96 @@ mod prune_window_tests {
             prune_state_window(&db, 8, 10, usize::MAX).unwrap(),
             state_commit::PruneStats::default()
         );
+    }
+}
+
+#[cfg(test)]
+mod b456_tests {
+    use super::{boot_proof_height, loggable, recorded_conflict, MAX_LOGGED_REFUSAL_CHARS};
+    use storage::StateDB;
+
+    /// B456 witness: a conflict alarm that cannot be read (here a table
+    /// block whose checksum fails, as bit rot does) stops sync as a recorded
+    /// one does. Every reader of the alarm rows (the boot, the per-tick
+    /// refresh, sync's `recorded_conflict`, which all read them through
+    /// `conflict_alarm`) took the read error for no conflict: sync went on
+    /// importing, and the node ordering, over a recorded conflict.
+    #[test]
+    fn an_unreadable_conflict_alarm_is_not_no_conflict() {
+        let path = storage::test_dir_str("b456_alarm_read_error");
+        let alarm = "alarm:decision_conflict:7";
+        {
+            let db = StateDB::open(&path).expect("open");
+            let _seed = db.seeding();
+            db.put(alarm, "anchor round 9 was decided aa, not bb")
+                .unwrap();
+            assert!(
+                recorded_conflict(&db).is_some(),
+                "control: a recorded conflict"
+            );
+            db.flush().expect("flush");
+        }
+        // Damage the table's first data block: it starts the file.
+        let table = std::fs::read_dir(&path)
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .find(|file| file.extension().is_some_and(|ext| ext == "sst"))
+            .expect("the flush wrote a table");
+        let mut bytes = std::fs::read(&table).unwrap();
+        for byte in bytes.iter_mut().take(4) {
+            *byte ^= 0xff;
+        }
+        std::fs::write(table, bytes).unwrap();
+
+        let db = StateDB::open(&path).expect("reopen");
+        assert!(
+            db.get(alarm).is_err(),
+            "control: the damaged block cannot be read"
+        );
+        assert!(
+            recorded_conflict(&db).is_some(),
+            "an alarm that cannot be read was read as no conflict"
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    /// B456 witness: a proof of boot seen while the stored tip cannot be
+    /// read is not noted. Read as 0, the cached tip (which lags sync's
+    /// imports) was noted, below a pre-boot boundary that then re-armed the
+    /// node (B421's failure, through a read error or a corrupt row).
+    #[test]
+    fn a_boot_proof_is_not_noted_at_a_tip_that_cannot_be_read() {
+        let db = StateDB::open(&storage::test_dir_str("b456_boot_proof_tip")).unwrap();
+        let _seed = db.seeding();
+        assert_eq!(boot_proof_height(&db, 3), Ok(3), "a fresh database");
+        db.put("latest_height", "9").unwrap();
+        assert_eq!(boot_proof_height(&db, 3), Ok(9), "the stored tip");
+        assert_eq!(boot_proof_height(&db, 12), Ok(12), "never below the cached");
+        db.put("latest_height", "nine").unwrap();
+        assert!(
+            boot_proof_height(&db, 3).is_err(),
+            "a tip that cannot be read was read as the cached one"
+        );
+    }
+
+    /// B443 witness: a refused QC's error is logged cut and escaped. It
+    /// echoes fields the sender chose (up to `QC_CERT_MAX_BYTES`), and each
+    /// refusal wrote them whole, line breaks included (a forged log line).
+    #[test]
+    fn a_refused_qc_is_logged_cut_and_escaped() {
+        let long = format!(
+            "finality QC is bound to another committee: {}",
+            "e".repeat(64 << 10)
+        );
+        let line = loggable(&long);
+        assert_eq!(line.chars().count(), MAX_LOGGED_REFUSAL_CHARS);
+        assert!(
+            line.starts_with("finality QC is bound to another committee: eee"),
+            "control: the refusal's kind is kept"
+        );
+        let forged = loggable("refused\n🚨 [DE-6] a forged alarm line");
+        assert!(!forged.contains('\n'), "a line break was logged: {forged}");
+        assert!(forged.starts_with("refused\\n"), "{forged}");
     }
 }

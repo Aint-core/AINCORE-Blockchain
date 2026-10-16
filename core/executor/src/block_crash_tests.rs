@@ -43,7 +43,7 @@ fn fixture(db: &StateDB, initialize: bool) -> (Vec<String>, String, String) {
         for key in [&sender_key, &recipient_key, &proposer_key] {
             create_account(db, key);
         }
-        set_coin_store(db, &sender, 1_000_000);
+        set_coin_store(db, &sender, 10_000_000);
         set_coin_store(db, &recipient, 0);
         set_coin_store(db, &proposer, 0);
         let _seed = db.seeding();
@@ -61,7 +61,9 @@ fn fixture(db: &StateDB, initialize: bool) -> (Vec<String>, String, String) {
                 &sender,
                 &coin_transfer_payload(&sender, &recipient, amount),
                 nonce as u64,
-                100_000,
+                // Cover execution and retained state history so the positive
+                // control reaches the crash boundary after moving coins.
+                1_000_000,
                 1,
             )
         })
@@ -313,9 +315,29 @@ fn block_crash_child() {
                 // delegation.mv cc7f01a0.... Rounds 9-16 moved it through the
                 // stdlib alone: with round 8's bytecode the round-16 executor
                 // reproduces cc7f01a0... exactly; B276's delegation.mv gives
-                // f949d282....
-                "f949d282210ae13f5d782a42ee4a4987a9c3ca9ebeb2937d2a77ddb213034e18",
-                "clean execution must preserve the pre-staging fixture root"
+                // f949d282.... Rounds 19-27 moved it through the stdlib
+                // alone: B392's staking.mv (`slash_unbonding` cuts no more
+                // than the frozen own weight, `own_slash_cuts`) and
+                // B392/B411's delegation.mv (its callers pass that weight,
+                // `raised_split`) give 24936a00...; round 28's dex.mv (u256
+                // pool math, B436) and token_factory.mv (the creator's store
+                // registered, B437) give 0dfa37c3...; round 29's
+                // delegation.mv (a pool paid only for the weight still at
+                // stake, `pool_payout`, B451) gives a41d75b7... (the round-29
+                // executor keeps 0dfa37c3... with round 28's bytecode).
+                // Nothing else in this block moves: the transfers pay their
+                // whole limits, so the
+                // gas schedule's changes (B315, B316, B339, B341, B346) move
+                // no balance or burn, and at price 1 the fee is all base fee,
+                // so no tip reaches B393/B403's split.
+                // Round 30 changes staking/delegation bytecode and charges
+                // retained history. The fixture now funds both transfers and
+                // gives each 1M execution gas (previously 100K); the sender
+                // starts with 10M (previously 1M). Pin this new fixture, not
+                // the obsolete round-29 inputs. Every crash/replay comparison
+                // below still compares all rows against a separate clean run.
+                "efa9aa7ae0f3ab2936125ffbd6be24d485b1e36207414827b5d478441e0fc7b4",
+                "clean execution must match the round-30 fixture root"
             );
         }
         BlockExecOutcome::Executed(_) | BlockExecOutcome::AlreadyExecuted { .. } if replay => {}

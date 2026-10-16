@@ -833,7 +833,8 @@ impl MemberBudget {
 /// one token of the sync quota (12.8 a second, shared with block sync,
 /// B156) while its signatures cost this node 64 checks. The rate is an
 /// observer's full mempool every re-forward period (5,000 / 30 s, ~167 a
-/// second).
+/// second) of the smallest transactions (B477: a full pool by bytes for
+/// the operator's reserved peers, `RESERVED_TX_SUBMIT_BYTES_PER_SEC`).
 pub const TX_SUBMIT_PER_SEC: f64 =
     mempool::MAX_PENDING_TXS as f64 / crate::forward::FORWARD_RETRY_SECS as f64;
 /// B172/B183: the quota in bytes, priced by the length alone, so the swarm
@@ -847,22 +848,53 @@ pub const TX_SUBMIT_BYTES_PER_SEC: f64 =
     TX_SUBMIT_PER_SEC * crate::forward::MIN_WIRE_PER_CHECK as f64;
 pub const TX_SUBMIT_BYTE_BURST: f64 = (4 * SYNC_REQUEST_CAP) as f64;
 
-/// B157: what a `TX_SUBMIT` costs its sender: its bytes (B172).
+/// B477: the quota of the operator's reserved peers (B114: its RPC nodes),
+/// at B157's rate in the unit the mempool is bounded by since B215: an
+/// observer's full mempool by bytes every re-forward period (8 MiB / 30 s,
+/// ~280 KB/s). Priced from the smallest transaction, a check's 324 bytes,
+/// `TX_SUBMIT_BYTES_PER_SEC` carried ~5 ML-DSA-65 transactions (~10.8 KB
+/// each) a second to a member, a full pool of them in ~160 s. A stranger
+/// keeps that price: it is what bounds the checks junk buys (B172/B183),
+/// and a host's quota at every member carries more than the chain
+/// includes (a 200M-gas block holds 500 KB at 400 gas a byte: ~75 KB/s at
+/// 6.65 s blocks, under two members' 108 KB/s; ~139 KB/s at 3.59 s, under
+/// three members' 162 KB/s).
+pub const RESERVED_TX_SUBMIT_BYTES_PER_SEC: f64 =
+    mempool::MAX_PENDING_BYTES as f64 / crate::forward::FORWARD_RETRY_SECS as f64;
+
+/// B157: what a `TX_SUBMIT` costs its sender: its bytes (B172), from the
+/// reserved peers' quota for them (B477), else the open one.
 #[derive(Debug)]
-pub struct SubmitBudget(Budget<String>);
+pub struct SubmitBudget {
+    open: Budget<String>,
+    reserved: Budget<String>,
+}
 
 impl Default for SubmitBudget {
     fn default() -> Self {
-        Self(Budget::new(TX_SUBMIT_BYTES_PER_SEC, TX_SUBMIT_BYTE_BURST))
+        Self {
+            open: Budget::new(TX_SUBMIT_BYTES_PER_SEC, TX_SUBMIT_BYTE_BURST),
+            reserved: Budget::new(RESERVED_TX_SUBMIT_BYTES_PER_SEC, TX_SUBMIT_BYTE_BURST),
+        }
     }
 }
 
 impl SubmitBudget {
-    /// Spend `wire`'s length from `key`'s quota at `now`; false when it
-    /// holds less.
-    pub fn admit(&mut self, key: &str, wire: &str, now: std::time::Instant) -> bool {
-        self.0
-            .spend_amount(&key.to_string(), wire.len() as f64, now)
+    /// Spend `wire`'s length from `key`'s quota at `now`, a reserved
+    /// peer's (`reserved`) or the open one; false when it holds less.
+    pub fn admit(
+        &mut self,
+        key: &str,
+        wire: &str,
+        reserved: bool,
+        now: std::time::Instant,
+    ) -> bool {
+        let quota = if reserved {
+            &mut self.reserved
+        } else {
+            &mut self.open
+        };
+        quota.spend_amount(&key.to_string(), wire.len() as f64, now)
     }
 }
 
@@ -1009,6 +1041,112 @@ pub fn charge_then_hold<K: std::hash::Hash + Eq>(
 ) -> bool {
     budget.charge(&key.to_string(), answer_tokens(len), now);
     held.admit(id, group, len)
+}
+
+/// A non-member's sync request being answered: the busy reply its kind has
+/// (B30) and its requester's network group (B75), for the held-answer bound.
+pub struct OpenServe {
+    pub busy: Option<String>,
+    pub group: String,
+}
+
+/// A sync request being answered off the network task (G4 S1).
+struct Serve<C> {
+    /// The channel its answer goes out on; `None` once its requester went.
+    channel: Option<C>,
+    /// The budget key its answer is charged to (B60, B88).
+    key: String,
+    open: Option<OpenServe>,
+}
+
+/// What the network task does with an answer that came (`Serving::answered`).
+pub enum Answered<C> {
+    /// Send it on the channel.
+    Send(C, String),
+    /// The held-answer bound refused it: send the busy reply, or drop the
+    /// channel when there is none.
+    Refused(C, Option<String>),
+    /// Nothing to send: no answer, or its requester went.
+    Nothing,
+}
+
+/// The sync requests the network task is answering, by request id, and who
+/// each answer is charged to. B312: an answer is charged its bytes when it
+/// comes even if its requester went first. A requester that closed its
+/// connection with its requests unanswered had every answer built in full
+/// for a token: B60's byte charge (and B88's, for a member) never applied.
+pub struct Serving<Id, C> {
+    serves: HashMap<Id, Serve<C>>,
+}
+
+impl<Id: std::hash::Hash + Eq + Clone, C> Default for Serving<Id, C> {
+    fn default() -> Self {
+        Self {
+            serves: HashMap::new(),
+        }
+    }
+}
+
+impl<Id: std::hash::Hash + Eq + Clone, C> Serving<Id, C> {
+    /// A request handed to the serving loop; its answer goes on `channel`,
+    /// charged to `key`; `open` for a non-member's.
+    pub fn begin(&mut self, id: Id, channel: C, key: String, open: Option<OpenServe>) {
+        self.serves.insert(
+            id,
+            Serve {
+                channel: Some(channel),
+                key,
+                open,
+            },
+        );
+    }
+
+    /// Its requester went (the connection closed) before the answer came:
+    /// the channel goes, the charge stays.
+    pub fn abandon(&mut self, id: &Id) {
+        if let Some(serve) = self.serves.get_mut(id) {
+            serve.channel = None;
+        }
+    }
+
+    /// The answer to `id` came (`None`: there is none). It is charged its
+    /// bytes whether it is sent, refused by the held-answer bound (B299)
+    /// or its requester went (B312).
+    pub fn answered(
+        &mut self,
+        id: Id,
+        answer: Option<String>,
+        budget: &mut Budget<String>,
+        held: &mut HeldAnswers<Id>,
+        now: std::time::Instant,
+    ) -> Answered<C> {
+        let (Some(serve), Some(answer)) = (self.serves.remove(&id), answer) else {
+            return Answered::Nothing;
+        };
+        let len = answer.len();
+        match (serve.channel, serve.open) {
+            (Some(channel), Some(open)) => {
+                if charge_then_hold(budget, held, id, &serve.key, &open.group, len, now) {
+                    Answered::Send(channel, answer)
+                } else {
+                    Answered::Refused(channel, open.busy)
+                }
+            }
+            (channel, _) => {
+                budget.charge(&serve.key, answer_tokens(len), now);
+                channel.map_or(Answered::Nothing, |c| Answered::Send(c, answer))
+            }
+        }
+    }
+
+    /// Requests being answered.
+    pub fn len(&self) -> usize {
+        self.serves.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.serves.is_empty()
+    }
 }
 
 /// B24: how long a connection may take to finish Noise and yamux. A
@@ -1177,6 +1315,80 @@ impl KeptIps {
     }
 }
 
+/// B367: committee members' identify reports, each handled at most once a
+/// `KEPT_IP_HOLD` unless its addresses changed. identify emits the whole
+/// stored report again on every push a peer sends (an empty push merges
+/// into it), and each of a report's ~350 addresses rebuilt the kept IPs and
+/// refreshed the address book in the swarm task: one member pushing on its
+/// connections delayed every other connection's events.
+#[derive(Debug, Default)]
+pub struct IdentifyGate {
+    handled: HashMap<PeerId, (u64, std::time::Instant)>,
+}
+
+/// B372: a member's identify reports are handled at most this often,
+/// changed or not: one alternating two address lists was handled on every
+/// push. A changed report refused within it is not lost: identify keeps the
+/// whole report and the member's next one (a push or the periodic identify)
+/// carries it.
+pub const IDENTIFY_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
+impl IdentifyGate {
+    /// Whether member `peer`'s report of `addrs` at `now` is handled: its
+    /// first, or one `IDENTIFY_EVERY` after the last handled that changed or
+    /// comes `KEPT_IP_HOLD` after it. `is_member` drops those that left once
+    /// the gate holds two committees' worth.
+    pub fn admit(
+        &mut self,
+        peer: PeerId,
+        addrs: &[libp2p::Multiaddr],
+        now: std::time::Instant,
+        is_member: impl Fn(&PeerId) -> bool,
+    ) -> bool {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        addrs.hash(&mut hasher);
+        let digest = hasher.finish();
+        if !self.handled.contains_key(&peer)
+            && self.handled.len() >= 2 * blockchain::committee::MAX_COMMITTEE
+        {
+            self.handled.retain(|p, _| is_member(p));
+        }
+        match self.handled.get(&peer) {
+            Some((held, at))
+                if now.saturating_duration_since(*at) < IDENTIFY_EVERY
+                    || (*held == digest && now.saturating_duration_since(*at) < KEPT_IP_HOLD) =>
+            {
+                false
+            }
+            _ => {
+                self.handled.insert(peer, (digest, now));
+                true
+            }
+        }
+    }
+}
+
+/// B367: the addresses of a member's report this node keeps: at most
+/// `ADDRESSES_PER_PEER` usable ones (`learned_address_ok`, or on this host
+/// `learned_address_ok_on_this_host` with an IP literal), in its order.
+pub fn usable_reported(
+    addrs: Vec<libp2p::Multiaddr>,
+    on_this_host: bool,
+) -> Vec<libp2p::Multiaddr> {
+    addrs
+        .into_iter()
+        .filter(|addr| {
+            if on_this_host {
+                ip_of(addr).is_some() && learned_address_ok_on_this_host(addr)
+            } else {
+                learned_address_ok(addr)
+            }
+        })
+        .take(ADDRESSES_PER_PEER)
+        .collect()
+}
+
 /// B132: the boot list's host names to resolve (`/dns*` multiaddrs and
 /// `host:port`), with their ports. A host name had no kept slots (only IP
 /// literals did), and the documented mainnet bootnodes are host names.
@@ -1308,10 +1520,11 @@ pub type MemberIps = Arc<RwLock<KeptIps>>;
 /// before the handshake starts.
 #[derive(Debug)]
 pub struct InboundGate {
-    /// Unfinished handshakes: the IP, and whether it took a kept IP's slots
+    /// Unfinished handshakes: the IP, whether it took a kept IP's slots
     /// (B199: counted in that bucket until it finishes, whatever the kept
-    /// set becomes meanwhile).
-    pending: HashMap<libp2p::swarm::ConnectionId, (std::net::IpAddr, bool)>,
+    /// set becomes meanwhile), and (B334) its network group, computed once
+    /// (empty for a kept IP).
+    pending: HashMap<libp2p::swarm::ConnectionId, (std::net::IpAddr, bool, String)>,
     admit: Budget<std::net::IpAddr>,
     /// B221: kept IPs' own admission rate, by exact IP.
     admit_kept: Budget<std::net::IpAddr>,
@@ -1384,10 +1597,25 @@ impl libp2p::swarm::NetworkBehaviour for InboundGate {
         // IP moved its unfinished handshakes into the shared slots).
         let key = host_key(ip);
         let kept_ip = self.member_ips.read().is_ok_and(|kept| kept.contains(&ip));
+        // B111: a member's IP is not held to the per-IP admission rate (once
+        // that budget's key map was full, a reconnecting member's IP could be
+        // refused like any stranger's). B221: but to a rate of its own. B334:
+        // the rate is checked first, so a refused connect costs no scan of
+        // the unfinished handshakes (three ran before it on the swarm task,
+        // the last allocating two strings an entry).
+        let now = std::time::Instant::now();
+        let admitted = if kept_ip {
+            self.admit_kept.spend(&ip, now)
+        } else {
+            self.admit.spend(&key, now)
+        };
+        if !admitted {
+            return Err(denied("this IP opens connections too fast"));
+        }
         if self
             .pending
             .values()
-            .filter(|(p, kept)| {
+            .filter(|(p, kept, _)| {
                 if kept_ip {
                     *kept && *p == ip
                 } else {
@@ -1406,44 +1634,32 @@ impl libp2p::swarm::NetworkBehaviour for InboundGate {
         }
         // B56: other IPs share all but the slots kept for members'; B116:
         // and one network group holds at most PENDING_PER_GROUP of them.
+        let group = if kept_ip {
+            String::new()
+        } else {
+            net_group(&ip.to_string())
+        };
         if !kept_ip {
-            let others: Vec<&std::net::IpAddr> = self
+            let (others, in_group) = self
                 .pending
                 .values()
-                .filter(|(_, kept)| !*kept)
-                .map(|(p, _)| p)
-                .collect();
+                .filter(|(_, kept, _)| !*kept)
+                .fold((0usize, 0usize), |(others, in_group), (_, _, g)| {
+                    (others + 1, in_group + usize::from(*g == group))
+                });
             let limit = MAX_PENDING_INBOUND as usize - PENDING_KEPT_FOR_MEMBERS;
-            if others.len() >= limit {
+            if others >= limit {
                 return Err(denied(
                     "the unfinished handshakes of other IPs are at their bound",
                 ));
             }
-            let group = net_group(&ip.to_string());
-            if others
-                .iter()
-                .filter(|p| net_group(&p.to_string()) == group)
-                .count()
-                >= PENDING_PER_GROUP
-            {
+            if in_group >= PENDING_PER_GROUP {
                 return Err(denied(
                     "too many unfinished handshakes from this network group",
                 ));
             }
         }
-        // B111: a member's IP is not held to the per-IP admission rate (once
-        // that budget's key map was full, a reconnecting member's IP could be
-        // refused like any stranger's). B221: but to a rate of its own.
-        let now = std::time::Instant::now();
-        let admitted = if kept_ip {
-            self.admit_kept.spend(&ip, now)
-        } else {
-            self.admit.spend(&key, now)
-        };
-        if !admitted {
-            return Err(denied("this IP opens connections too fast"));
-        }
-        self.pending.insert(connection_id, (ip, kept_ip));
+        self.pending.insert(connection_id, (ip, kept_ip, group));
         Ok(())
     }
 
@@ -1960,19 +2176,61 @@ pub fn boot_dial_list(bootnodes: &[String], saved: &[String]) -> Vec<String> {
     out
 }
 
+/// B394: the sessions a QC_WANT may ask: the connected members, and apart
+/// from them every other connected session (an archive node holds a QC the
+/// members pruned with its block, and a book whose members all left holds
+/// none at all: a pending vote whose QC formed elsewhere was never retired).
+pub fn qc_want_candidates(
+    members: impl IntoIterator<Item = PeerId>,
+    connected: impl IntoIterator<Item = PeerId>,
+) -> QcWantCandidates {
+    let mut out = QcWantCandidates::default();
+    for peer in members {
+        if !out.members.contains(&peer) {
+            out.members.push(peer);
+        }
+    }
+    for peer in connected {
+        if !out.members.contains(&peer) && !out.others.contains(&peer) {
+            out.others.push(peer);
+        }
+    }
+    out
+}
+
+/// B402: the two groups a QC_WANT asks, kept apart, so the sessions a
+/// stranger can open (50 inbound) never dilute the members' turns.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QcWantCandidates {
+    pub members: Vec<PeerId>,
+    pub others: Vec<PeerId>,
+}
+
 /// B198: the members a QC_WANT asks over sync at its `turn`: two of the
 /// connected ones, the next two in key order each turn, so every member is
 /// asked within `ceil(m / 2)` turns. It asked the first two of the book's
 /// hash order every time, which a node waiting at a boundary never rebuilt:
 /// two Byzantine members there that never answer held it in its epoch.
-pub fn qc_want_peers(mut connected: Vec<PeerId>, turn: usize) -> Vec<PeerId> {
-    if connected.is_empty() {
-        return connected;
+/// B402: and one other session, the next in key order each turn (two with
+/// no member connected). B394 sorted both groups into one rotation, so 50
+/// stranger sessions that never answer stretched a member's turn ~25 times.
+pub fn qc_want_peers(candidates: QcWantCandidates, turn: usize) -> Vec<PeerId> {
+    let others = if candidates.members.is_empty() { 2 } else { 1 };
+    let mut asked = in_turn(candidates.members, turn, 2);
+    asked.extend(in_turn(candidates.others, turn, others));
+    asked
+}
+
+/// The `per_turn` sessions of `peers` asked at `turn`: the next ones in key
+/// order, so each is asked within `ceil(len / per_turn)` turns.
+fn in_turn(mut peers: Vec<PeerId>, turn: usize, per_turn: usize) -> Vec<PeerId> {
+    if peers.is_empty() {
+        return peers;
     }
-    connected.sort_by_key(|p| p.to_bytes());
-    let start = turn.wrapping_mul(2) % connected.len();
-    let take = connected.len().min(2);
-    connected
+    peers.sort_by_key(|p| p.to_bytes());
+    let start = turn.wrapping_mul(per_turn) % peers.len();
+    let take = peers.len().min(per_turn);
+    peers
         .iter()
         .cycle()
         .skip(start)
@@ -2256,6 +2514,103 @@ mod tests {
         );
         (1..5).for_each(|id| held.release(&id));
         assert_eq!(gauge.load(Ordering::Relaxed), 0);
+    }
+
+    /// B367 witness: a member's identify report is handled at most once a
+    /// `KEPT_IP_HOLD` unless its addresses change, and at most
+    /// `ADDRESSES_PER_PEER` of them are kept. identify emits the whole report
+    /// again on every push (an empty push merges into it), and each of ~350
+    /// addresses rebuilt the kept IPs and refreshed the address book in the
+    /// swarm task, so one member pushing delayed every connection's events.
+    #[test]
+    fn a_members_identify_report_is_handled_once_a_hold_unless_changed() {
+        let peer = PeerId::random();
+        let report: Vec<libp2p::Multiaddr> = (0..350u32)
+            .map(|i| {
+                format!("/ip4/203.0.{}.{}/tcp/9101", i / 256, i % 256)
+                    .parse()
+                    .unwrap()
+            })
+            .collect();
+        let member = |_: &PeerId| true;
+        let t0 = std::time::Instant::now();
+        let mut gate = IdentifyGate::default();
+        assert!(gate.admit(peer, &report, t0, member), "a first report");
+        let soon = t0 + KEPT_IP_HOLD / 2;
+        assert!(
+            !gate.admit(peer, &report, soon, member),
+            "an unchanged push was handled again"
+        );
+        let mut changed = report.clone();
+        changed.pop();
+        assert!(gate.admit(peer, &changed, soon, member), "a changed report");
+        assert!(!gate.admit(peer, &changed, soon, member));
+        // B372: alternating reports are handled at most once a second.
+        let alternate = soon + IDENTIFY_EVERY / 2;
+        assert!(
+            !gate.admit(peer, &report, alternate, member),
+            "an alternating report within a second was handled"
+        );
+        assert!(gate.admit(peer, &report, soon + IDENTIFY_EVERY, member));
+        assert!(gate.admit(peer, &changed, soon + 2 * IDENTIFY_EVERY, member));
+        let later = soon + 2 * IDENTIFY_EVERY;
+        assert!(!gate.admit(peer, &changed, later + KEPT_IP_HOLD / 2, member));
+        assert!(
+            gate.admit(peer, &changed, later + KEPT_IP_HOLD, member),
+            "a report a hold later"
+        );
+        let kept = usable_reported(report.clone(), false);
+        assert_eq!(kept, report[..ADDRESSES_PER_PEER].to_vec());
+    }
+
+    /// B394 witness: a QC_WANT may ask every connected session, the members
+    /// first: it asked members only, so a QC they pruned with its block (an
+    /// archive node held it) or a book whose members all left kept a pending
+    /// vote open for good, and with it the next epoch and pruning.
+    #[test]
+    fn a_qc_is_asked_of_every_connected_session() {
+        let (m1, m2, archive) = (PeerId::random(), PeerId::random(), PeerId::random());
+        let asked = qc_want_candidates([m1, m2], [archive, m2, m1]);
+        assert_eq!(asked.members, vec![m1, m2]);
+        assert_eq!(asked.others, vec![archive]);
+        let alone = qc_want_candidates([], [archive]);
+        assert_eq!(alone.others, vec![archive]);
+        assert_eq!(qc_want_peers(alone, 0), vec![archive]);
+        let mut every = std::collections::HashSet::new();
+        for turn in 0..2 {
+            every.extend(qc_want_peers(asked.clone(), turn));
+        }
+        assert!(every.contains(&archive), "the archive node was never asked");
+    }
+
+    /// B402 witness: strangers outnumbering the members do not stretch a
+    /// member's turn: every turn asks two members and one other session.
+    /// One rotation over both groups asked a member once per ~13 turns here.
+    #[test]
+    fn a_member_is_asked_every_turn_however_many_strangers_connect() {
+        let members: Vec<PeerId> = (0..4).map(|_| PeerId::random()).collect();
+        let strangers: Vec<PeerId> = (0..50).map(|_| PeerId::random()).collect();
+        let candidates = qc_want_candidates(members.clone(), strangers.clone());
+        let mut asked_members = std::collections::HashSet::new();
+        let mut asked_strangers = std::collections::HashSet::new();
+        for turn in 0..50 {
+            let asked = qc_want_peers(candidates.clone(), turn);
+            assert_eq!(asked.len(), 3);
+            let of_members = asked.iter().filter(|p| members.contains(p)).count();
+            assert_eq!(of_members, 2, "turn {turn} asked {of_members} members");
+            if turn < 2 {
+                asked_members.extend(asked.iter().filter(|p| members.contains(p)).copied());
+            }
+            asked_strangers.extend(asked.iter().filter(|p| strangers.contains(p)).copied());
+        }
+        assert_eq!(
+            asked_members.len(),
+            4,
+            "a member waited past ceil(m / 2) turns"
+        );
+        assert_eq!(asked_strangers.len(), 50, "a stranger was never asked");
+        let none = qc_want_candidates([], strangers.clone());
+        assert_eq!(qc_want_peers(none, 0).len(), 2);
     }
 
     /// B90/B102 witness: the address book dials a peer at what it was told,
@@ -2723,18 +3078,54 @@ mod tests {
         for wire in [&batch, &junk] {
             let mut budget = SubmitBudget::default();
             let admitted = (0..64)
-                .filter(|_| budget.admit("host:198.51.100.7", wire, now))
+                .filter(|_| budget.admit("host:198.51.100.7", wire, false, now))
                 .count();
             assert_eq!(admitted, fits, "a submit was not charged its bytes");
             assert!(
-                SubmitBudget::default().admit("host:198.51.100.8", wire, now),
+                SubmitBudget::default().admit("host:198.51.100.8", wire, false, now),
                 "another host's quota is its own"
             );
         }
         let largest = "x".repeat(SYNC_REQUEST_CAP);
         assert!(
-            SubmitBudget::default().admit("host:198.51.100.9", &largest, now),
+            SubmitBudget::default().admit("host:198.51.100.9", &largest, false, now),
             "the largest request does not fit a fresh quota"
+        );
+    }
+
+    /// B477 witness: an operator's reserved peer (its RPC node, B114)
+    /// forwards an observer's full mempool by bytes every re-forward period,
+    /// B157's rate in the unit the pool is bounded by (B215); priced as a
+    /// stranger, at a check's 324 bytes, it carried ~5 ML-DSA-65
+    /// transactions a second to a member. A stranger keeps the check price.
+    #[test]
+    fn a_reserved_peer_forwards_a_full_pool_a_period() {
+        let request = "x".repeat(SYNC_REQUEST_CAP);
+        // The bytes one host gets in over a re-forward period once its
+        // burst is spent, asking every second at the request cap.
+        let carried = |reserved: bool| {
+            let mut budget = SubmitBudget::default();
+            let key = "host:198.51.100.10";
+            let start = std::time::Instant::now();
+            while budget.admit(key, &request, reserved, start) {}
+            let mut bytes = 0usize;
+            for second in 1..=crate::forward::FORWARD_RETRY_SECS {
+                let now = start + std::time::Duration::from_secs(second);
+                while budget.admit(key, &request, reserved, now) {
+                    bytes += request.len();
+                }
+            }
+            bytes
+        };
+        let reserved = carried(true);
+        assert!(
+            reserved + SYNC_REQUEST_CAP >= mempool::MAX_PENDING_BYTES,
+            "a reserved peer carried {reserved} bytes a period"
+        );
+        let open = carried(false);
+        assert!(
+            open < mempool::MAX_PENDING_BYTES / 4,
+            "a stranger's quota was raised: {open} bytes a period"
         );
     }
 
@@ -2763,6 +3154,53 @@ mod tests {
             "the refused answer cost nothing"
         );
         assert!(budget.spend_amount(&key, 23.0, now));
+    }
+
+    /// B312 witness: an answer whose requester went before it came is
+    /// still charged its bytes, a stranger's and a member's alike (closing
+    /// the connection made every answer cost one token); one whose
+    /// requester stays is sent, charged as before.
+    #[test]
+    fn an_abandoned_answer_is_charged_its_bytes() {
+        let now = std::time::Instant::now();
+        let mut budget: Budget<String> = Budget::new(0.0, 40.0);
+        let mut held: HeldAnswers<u32> = HeldAnswers::new(Arc::default());
+        let mut serving: Serving<u32, &str> = Serving::default();
+        let len = 16 * SYNC_ANSWER_TOKEN_BYTES;
+        let answer = || Some("x".repeat(len));
+        let open = |group: &str| {
+            Some(OpenServe {
+                busy: None,
+                group: group.to_string(),
+            })
+        };
+        for (id, key, open) in [(1, "host:10.0.0.1", open("g")), (2, "12D3KooWmember", None)] {
+            let key = key.to_string();
+            assert!(budget.spend(&key, now), "its request");
+            serving.begin(id, "channel", key.clone(), open);
+            serving.abandon(&id);
+            assert!(matches!(
+                serving.answered(id, answer(), &mut budget, &mut held, now),
+                Answered::Nothing
+            ));
+            // 40 - 1 - 16 left: 23, not 24.
+            assert!(
+                !budget.spend_amount(&key, 24.0, now),
+                "{key}: the abandoned answer cost nothing"
+            );
+            assert!(budget.spend_amount(&key, 23.0, now));
+        }
+        assert!(serving.is_empty());
+        let key = "host:10.0.0.2".to_string();
+        assert!(budget.spend(&key, now));
+        serving.begin(3, "channel", key.clone(), open("h"));
+        assert!(matches!(
+            serving.answered(3, answer(), &mut budget, &mut held, now),
+            Answered::Send("channel", _)
+        ));
+        assert!(!budget.spend_amount(&key, 24.0, now));
+        assert!(budget.spend_amount(&key, 23.0, now));
+        assert_eq!(held.bytes(), len, "the answer sent is held");
     }
 
     /// B148 witness: a member's pushes are charged their bytes, so at one
@@ -3058,9 +3496,10 @@ mod tests {
         let peers: Vec<PeerId> = (1..=5u8)
             .map(|s| local_keypair(&[s; 32]).public().to_peer_id())
             .collect();
+        let of = |members: Vec<PeerId>| qc_want_candidates(members, []);
         let mut asked = std::collections::HashSet::new();
         for turn in 0..3 {
-            let pair = qc_want_peers(peers.clone(), turn);
+            let pair = qc_want_peers(of(peers.clone()), turn);
             assert_eq!(pair.len(), 2);
             assert_ne!(pair[0], pair[1]);
             asked.extend(pair);
@@ -3069,12 +3508,15 @@ mod tests {
         let mut reversed = peers.clone();
         reversed.reverse();
         assert_eq!(
-            qc_want_peers(reversed, 1),
-            qc_want_peers(peers.clone(), 1),
+            qc_want_peers(of(reversed), 1),
+            qc_want_peers(of(peers.clone()), 1),
             "the turn depends on the book's order"
         );
-        assert_eq!(qc_want_peers(peers[..1].to_vec(), 7), peers[..1].to_vec());
-        assert!(qc_want_peers(Vec::new(), 3).is_empty());
+        assert_eq!(
+            qc_want_peers(of(peers[..1].to_vec()), 7),
+            peers[..1].to_vec()
+        );
+        assert!(qc_want_peers(of(Vec::new()), 3).is_empty());
     }
 
     /// B207 witness: a member's kept IPv6 address has handshake slots of its
@@ -3310,6 +3752,43 @@ mod tests {
             ["/ip4/192.168.18.66/tcp/9513"
                 .parse::<libp2p::Multiaddr>()
                 .unwrap()]
+        );
+    }
+
+    /// B334 witness: an IP's admission rate is charged before the unfinished
+    /// handshakes are scanned, so a connect the slots refuse is charged too:
+    /// past its burst, a freed slot does not let the IP in. The scans (three,
+    /// the last allocating two strings an entry) ran first, on the swarm
+    /// task, for every refused connect.
+    #[test]
+    fn the_admission_rate_is_charged_before_the_slots_are_scanned() {
+        use libp2p::swarm::{ConnectionId, NetworkBehaviour};
+        let mut gate = InboundGate::default();
+        let local: Multiaddr = "/ip4/10.0.0.1/tcp/9101".parse().unwrap();
+        let from: Multiaddr = "/ip4/9.9.9.9/tcp/40000".parse().unwrap();
+        let ids: Vec<ConnectionId> = (0..64).map(ConnectionId::new_unchecked).collect();
+        for id in &ids[..PENDING_PER_IP] {
+            assert!(gate
+                .handle_pending_inbound_connection(*id, &local, &from)
+                .is_ok());
+        }
+        let burst = ADMIT_BURST_PER_IP as usize;
+        for id in &ids[PENDING_PER_IP..burst] {
+            assert!(gate
+                .handle_pending_inbound_connection(*id, &local, &from)
+                .is_err());
+        }
+        gate.pending.remove(&ids[0]);
+        let refused = gate
+            .handle_pending_inbound_connection(ids[burst], &local, &from)
+            .unwrap_err();
+        let why = refused
+            .downcast_ref::<io::Error>()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            why.contains("too fast"),
+            "the connects the slots refused were not charged: {why}"
         );
     }
 

@@ -110,6 +110,43 @@ pub const FLOOR: &str = "jmt:floor";
 /// The latest applied version.
 pub const LATEST: &str = "jmt:latest";
 
+/// GC-1 `R_state` (B460): the versions below the latest that pruning keeps,
+/// pins aside (SN-4), whatever window the node keeps blocks for. A changed
+/// key leaves ~6 KB of rows (its old value and the stale nodes on its path)
+/// at the 40 GB design state: ~9 MB a block at the gas target, ~0.9 TB over
+/// the 100,000-block window. Production trees keep history briefly: geth
+/// keeps 128 blocks of trie and a full node serves no older proof; Aptos's
+/// state Merkle pruner keeps 1,000,000 versions (transactions, hours of its
+/// traffic). 1,000 blocks (~1.9 h at 6.78 s) is the observer mode's block
+/// retention: it covers a late QC's root check (RC-3) and a proof at a
+/// recent height (PF-3). A snapshot restore uses a pinned version, which
+/// pruning keeps.
+pub const HISTORY_VERSIONS: Version = 1_000;
+/// B460: how often the consensus path prunes the tree (`dag.rs`
+/// `STATE_PRUNE_EVERY`), so a row is kept at most `HISTORY_VERSIONS +
+/// PRUNE_EVERY` versions.
+pub const PRUNE_EVERY: Version = 100;
+/// B460: the rows (`prune`'s unit: a stale node or a superseded value) the
+/// default pruner removes per block: `AINCORE_BLOCK_PRUNE_BATCH` 250 x 4,000
+/// rows a call, a call every `PRUNE_EVERY` blocks (`dag.rs`
+/// `prune_history`). The write price holds a block at the gas target to it,
+/// so history never outgrows the pruner.
+pub const PRUNE_ROWS_PER_BLOCK: u64 = 10_000;
+/// B460: the rows a changed key leaves for `prune`: its superseded value,
+/// its leaf and the internal nodes its path rewrites. At the 40 GB design
+/// state (~57M keys of ~700 bytes) and the 1,428 changed keys a block at the
+/// gas target pays for, 6.2 (`history_rows_follow_the_tree_model`); 7 holds
+/// to ~8x that state. A delete may leave two more (its deletion row, and a
+/// sibling leaf that moves up), prepaid many times over when its key was
+/// created (at least 492 state bytes at 510 gas: 250,920).
+pub const HISTORY_ROWS_PER_KEY: u64 = 7;
+/// B460: the largest row a stale node leaves with its stale-index entry: a
+/// 16-child internal node at the deepest path is 1,747 bytes (a 52-byte
+/// `NodeKey` and an 817-byte node, both in hex, behind `jmt:node:`), its
+/// index entry 135; rounded up. A value row is smaller but for its value,
+/// which is priced by the byte.
+pub const MAX_HISTORY_ROW_BYTES: u64 = 1_900;
+
 /// The hash a state key is stored under. Clients derive it themselves from
 /// the canonical key (PF-2); a server-supplied key hash is never trusted.
 pub fn key_hash(key: &str) -> KeyHash {
@@ -563,7 +600,8 @@ pub struct PruneStats {
     pub more: bool,
 }
 
-/// GC-1: prune the tree below `target_floor`, at most `max_rows` rows per
+/// GC-1: prune the tree below `target_floor`, or below `latest -
+/// HISTORY_VERSIONS` when that is higher (B460), at most `max_rows` rows per
 /// call. Node-local and root-neutral (GC-2): only `jmt:*` rows go.
 ///
 /// - The floor is raised first, in its own write, so a version about to lose
@@ -582,7 +620,11 @@ pub fn prune(
     max_rows: usize,
 ) -> Result<PruneStats> {
     let latest = latest_version(db)?.context("no state tree")?;
-    let target = target_floor.min(latest);
+    // B460: never more than HISTORY_VERSIONS behind the latest, however long
+    // the caller keeps blocks: the write price pays for that long.
+    let target = target_floor
+        .max(latest.saturating_sub(HISTORY_VERSIONS))
+        .min(latest);
     let current = floor(db)?;
     if target > current {
         db.put(FLOOR, &target.to_string())?;
@@ -715,6 +757,24 @@ fn prune_deleted(view: &StateDB, floor: Version, budget: usize) -> Result<PruneS
         view.write_batch(batch)?;
     }
     Ok(stats)
+}
+
+/// B460: the rows `version` left for `prune`: the nodes it made stale, the
+/// values it superseded and its deletions. What `HISTORY_ROWS_PER_KEY`
+/// prices.
+pub fn history_rows(db: &StateDB, version: Version) -> Result<u64> {
+    let mut rows = 0u64;
+    for index in [STALE, VSTALE, VDEAD] {
+        let prefix = format!("{index}{version:020}:");
+        for row in db.db.prefix_iterator(prefix.as_bytes()) {
+            let (k, _) = row?;
+            if !k.starts_with(prefix.as_bytes()) {
+                break;
+            }
+            rows += 1;
+        }
+    }
+    Ok(rows)
 }
 
 /// SN-4: the pinned versions for a tip. They are epoch boundaries (multiples

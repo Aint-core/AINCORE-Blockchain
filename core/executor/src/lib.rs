@@ -287,6 +287,20 @@ fn extract_add_stake(call: &vm_move::EntryFunctionCall, sender: &str) -> Option<
     Some(sender.to_string())
 }
 
+/// G5 PA-3 (B464): detect a `0x1::staking::reactivate` entry call. Move
+/// takes the validator off the inactive list; the executor then resyncs its
+/// weight in `sys:validator_set:v1` from the Move ValidatorSet, as after an
+/// `add_stake`, so it weighs its stake again at once. Returns the sender.
+fn extract_reactivate(call: &vm_move::EntryFunctionCall, sender: &str) -> Option<String> {
+    if *call.module.address() != system_address()
+        || call.module.name().as_str() != "staking"
+        || call.function != "reactivate"
+    {
+        return None;
+    }
+    Some(sender.to_string())
+}
+
 /// Authoritative pre-dispatch gate for `0x1::staking::join_validator_set`.
 ///
 /// Move cannot run the BLS pairing check, so the proof-of-possession binding
@@ -348,7 +362,12 @@ fn verify_join_validator_pop(
         ));
     }
 
-    match crypto::bls::BLSEngine::consensus().verify_possession(&bls_public_key, &bls_pop) {
+    // B354: bound to the joining validator's Ed25519 key, the sender's.
+    match crypto::bls::BLSEngine::consensus().verify_possession(
+        &bls_public_key,
+        &bls_pop,
+        &tx_public_key,
+    ) {
         Ok(true) => Ok(()),
         Ok(false) => Err("join_validator_set: BLS proof-of-possession failed verification".into()),
         Err(e) => Err(format!(
@@ -760,6 +779,137 @@ pub fn epoch_participation(
     }
 }
 
+/// G5 PA-1 (B464): participation is in parts per million, BW-6's unit.
+pub const PARTICIPATION_SCALE: u64 = BOOTSTRAP_SCORE_SCALE;
+
+/// G5 PA-3 (B464): a member that authored committed vertices in fewer than
+/// half the rounds of each of two committee epochs in a row leaves the
+/// committee until it reactivates. Half is the Cosmos SDK's default
+/// `MinSignedPerWindow` and BW-6's bar: an outage must cover half of both
+/// epochs, at least one epoch's length across their boundary (~1.9 h at
+/// launch), and honest members author nearly every round (on
+/// AINCORE-TESTNET-V4 they committed 88-92 % even of their leader slots,
+/// which also need the anchor's votes). Two epochs let a member abstain for
+/// one whole epoch (RC-3, B441) and keep its seat.
+pub const PARTICIPATION_FLOOR: u64 = 500_000;
+
+/// G5 PA-1 (B464): mirror of the Move `0x1::staking::Participation` (BCS
+/// field order): the rounds the blocks of committee epoch `epoch` closed and
+/// the committed vertices each member authored, in the committee's address
+/// order, for the epoch and for the reward period since the last payout;
+/// and the members of the last closed epoch that took part in under
+/// `PARTICIPATION_FLOOR` of its rounds.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Participation {
+    pub epoch: u64,
+    pub rounds: u64,
+    pub authored: Vec<u64>,
+    pub period_rounds: u64,
+    pub period_authored: Vec<u64>,
+    pub low: Vec<move_core_types::account_address::AccountAddress>,
+}
+
+pub fn participation_key() -> String {
+    vm_move::state_keys::resource_key_str(&system_address(), "0x1::staking::Participation")
+}
+
+/// G5 PA-1 (B464): the participation counts, if anything was counted.
+pub fn read_participation(db: &StateDB) -> Option<Participation> {
+    db.get(&participation_key())
+        .expect("CRITICAL: the participation count could not be read")
+        .map(|raw| {
+            bcs::from_bytes(&hex::decode(raw).expect("CRITICAL: chain state is not hex"))
+                .expect("CRITICAL: 0x1::staking::Participation is corrupt")
+        })
+}
+
+/// G5 PA-2 (B464): mirror of the Move `0x1::staking::PeriodParticipation`:
+/// each member's participation in the last reward period paid, in parts per
+/// million, by which the next period's fees are shared.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeriodParticipation {
+    pub members: Vec<move_core_types::account_address::AccountAddress>,
+    pub ppm: Vec<u64>,
+}
+
+pub fn period_participation_key() -> String {
+    vm_move::state_keys::resource_key_str(&system_address(), "0x1::staking::PeriodParticipation")
+}
+
+/// G5 PA-3 (B464): mirror of the Move `0x1::staking::InactiveMember`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InactiveMember {
+    pub validator: move_core_types::account_address::AccountAddress,
+    /// The first committee epoch it is out of.
+    pub from_epoch: u64,
+}
+
+/// G5 PA-3 (B464): mirror of the Move `0x1::staking::Inactive`: the
+/// validators out of the committee for non-participation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InactiveSet {
+    pub members: Vec<InactiveMember>,
+}
+
+pub fn inactive_key() -> String {
+    vm_move::state_keys::resource_key_str(&system_address(), "0x1::staking::Inactive")
+}
+
+/// G5 PA-3 (B464): the validators out for non-participation, by address,
+/// with the first committee epoch each is out of.
+pub fn inactive_members(db: &StateDB) -> BTreeMap<String, u64> {
+    db.get(&inactive_key())
+        .expect("CRITICAL: the inactive list could not be read")
+        .map(|raw| {
+            bcs::from_bytes::<InactiveSet>(
+                &hex::decode(raw).expect("CRITICAL: chain state is not hex"),
+            )
+            .expect("CRITICAL: 0x1::staking::Inactive is corrupt")
+        })
+        .unwrap_or_default()
+        .members
+        .iter()
+        .map(|m| (hex::encode(m.validator.into_bytes()), m.from_epoch))
+        .collect()
+}
+
+/// G5 PA-1 (B464): each member's participation in parts per million, the
+/// committed vertices it authored over the `rounds` counted, for the
+/// committee `members` the counts are kept in (address order). Empty when
+/// no round was counted: there is nothing to scale by.
+pub fn participation_of(
+    rounds: u64,
+    authored: &[u64],
+    members: &[(String, u64)],
+) -> BTreeMap<String, u64> {
+    members
+        .iter()
+        .zip(authored)
+        .filter_map(|((address, _), &n)| participation_ppm(n, rounds).map(|p| (address.clone(), p)))
+        .collect()
+}
+
+/// G5 PA-2 (B464): each member's weight times its participation (at most
+/// one million parts per million), rounded down; a member not measured
+/// counts in full.
+pub fn participating_weights(
+    committee: &[(String, u64)],
+    participation: &BTreeMap<String, u64>,
+) -> Vec<(String, u64)> {
+    committee
+        .iter()
+        .map(|(address, weight)| {
+            let ppm = participation
+                .get(address)
+                .copied()
+                .unwrap_or(PARTICIPATION_SCALE)
+                .min(PARTICIPATION_SCALE);
+            let scaled = *weight as u128 * ppm as u128 / PARTICIPATION_SCALE as u128;
+            (address.clone(), scaled as u64)
+        })
+        .collect()
+}
+
 /// BW-4: the owned stake P that secures consensus: the owned weight of the
 /// members the next committee would hold, ranked as `top_by_stake` ranks
 /// them (owned plus the operators' current bootstrap weight).
@@ -838,7 +988,10 @@ pub fn bootstrap_report(db: &StateDB) -> Option<BootstrapReport> {
         .expect("CRITICAL: the live validator set could not be read")
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or_default();
-    let (owned, _, _) = owned_weights_of(db, &live);
+    let (mut owned, _, _) = owned_weights_of(db, &live);
+    // G5 PA-3 (B464): as BW-4 counts it, without the members that are out.
+    let inactive = inactive_members(db);
+    owned.retain(|address, _| !inactive.contains_key(address));
     let owned_stake = committee_owned_stake(&owned, &state);
     Some(BootstrapReport {
         target: (state.s_min as u128).saturating_sub(owned_stake),
@@ -974,7 +1127,8 @@ pub fn cap_below_a_third(members: &[(String, u64, u64)]) -> BTreeMap<String, u64
 }
 
 /// BW-12: the Move resource `0x1::staking::BootstrapProtected`: validators
-/// a full set never displaces.
+/// a full set never displaces (B374: the bootstrap operators and the
+/// committee elected at the last boundary, `protected_list`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BootstrapProtected {
     pub validators: Vec<move_core_types::account_address::AccountAddress>,
@@ -993,6 +1147,79 @@ pub fn bootstrap_protected_of(state: &BootstrapState) -> BootstrapProtected {
             .filter_map(|o| parse_move_address(&o.address))
             .collect(),
     }
+}
+
+/// BW-12, B374: the validators a full set never displaces: a bootstrap's
+/// operators and every member of `committee`, in address order. Move picks
+/// the member to displace by its own stake alone, which the committee does
+/// not rank by (it counts open pools and bootstrap weight): a member with
+/// the least own stake and a large pool, near the top of the committee, was
+/// displaced, its pool's weight with it, by any joiner with a little more.
+pub fn protected_list(
+    bootstrap: Option<&BootstrapState>,
+    committee: &[String],
+) -> BootstrapProtected {
+    let mut validators: Vec<_> = bootstrap
+        .map(|state| bootstrap_protected_of(state).validators)
+        .unwrap_or_default();
+    validators.extend(committee.iter().filter_map(|a| parse_move_address(a)));
+    validators.sort();
+    validators.dedup();
+    BootstrapProtected { validators }
+}
+
+/// B389: the size of a full Move set (`0x1::staking::MAX_VALIDATORS`).
+const MOVE_MAX_VALIDATORS: usize = 1_000;
+
+/// B400: the least stake a join takes (`0x1::staking::MIN_STAKE`, 1,000 AIN).
+const MOVE_MIN_STAKE: u128 = 1_000 * COIN_SCALE;
+
+/// B412: the member count of a stored Move set (hex BCS), read from the
+/// ULEB128 length prefix of its `validators` alone, without decoding the set.
+fn move_set_member_count(raw: &str) -> Option<u64> {
+    let head = hex::decode(raw.get(..raw.len().min(10))?).ok()?;
+    let mut count = 0u64;
+    for (i, byte) in head.iter().enumerate() {
+        count |= u64::from(byte & 0x7f) << (7 * i);
+        if byte & 0x80 == 0 {
+            return Some(count);
+        }
+    }
+    None
+}
+
+/// BW-12, B374, B389: the protected list as the weights stand now: the
+/// bootstrap's operators and the top of the live set by owned weight (own
+/// stake and open pool) plus bootstrap weight, as the next boundary would
+/// elect them. `None` without a live set.
+fn protected_now(db: &StateDB) -> Option<BootstrapProtected> {
+    let live: Vec<ValidatorSetV1Entry> = db
+        .get(validator_set_v1_key())
+        .expect("CRITICAL: the live validator set could not be read")
+        .and_then(|raw| serde_json::from_str(&raw).ok())?;
+    let (owned, _, _) = owned_weights_of(db, &live);
+    let bootstrap = read_bootstrap(db);
+    let weighed: Vec<blockchain::committee::ValidatorInfo> = live
+        .iter()
+        .filter_map(|entry| {
+            let own = owned.get(&entry.address)?;
+            let boot = bootstrap
+                .as_ref()
+                .map_or(0, |state| state.weight_of(&entry.address));
+            Some(blockchain::committee::ValidatorInfo {
+                address: entry.address.clone(),
+                stake: own.saturating_add(boot),
+                ed25519_public_key: entry.ed25519_public_key.clone(),
+                bls_public_key: entry.bls_public_key.clone(),
+                bls_pop: entry.bls_pop.clone(),
+            })
+        })
+        .collect();
+    let elected: Vec<String> = blockchain::committee::top_by_stake(&weighed)
+        .into_iter()
+        .map(|member| member.address)
+        .collect();
+    Some(protected_list(bootstrap.as_ref(), &elected))
 }
 
 /// Mirror of the Move `0x1::chain::Params` resource (BCS field order).
@@ -1110,6 +1337,24 @@ pub fn committed_chain_clock(db: &StateDB) -> ChainClock {
     .flatten()
     .and_then(|raw| hex::decode(raw).ok())
     .and_then(|bytes| bcs::from_bytes(&bytes).ok())
+    .unwrap_or_default()
+}
+
+/// B413: the committed `0x1::chain::Clock` for execution and evidence
+/// checks. Fail closed, as [`next_chain_clock`] reads it: a read error or a
+/// row that does not decode panics, where [`committed_chain_clock`] (the
+/// RPC's reader) gave time 0 and so admitted stale evidence. Only a missing
+/// row (a fixture before its first block) reads as zero.
+fn executing_chain_clock(db: &StateDB) -> ChainClock {
+    db.get(&vm_move::state_keys::resource_key_str(
+        &system_address(),
+        "0x1::chain::Clock",
+    ))
+    .expect("CRITICAL: the committed chain clock could not be read")
+    .map(|raw| {
+        let bytes = hex::decode(raw).expect("CRITICAL: the committed chain clock is not hex");
+        bcs::from_bytes(&bytes).expect("CRITICAL: the committed chain clock is corrupt")
+    })
     .unwrap_or_default()
 }
 
@@ -1267,6 +1512,33 @@ fn tx_hash_hex(tx_json: &str) -> String {
     hex::encode(Sha256::digest(tx_json.as_bytes()))
 }
 
+/// B342/B448: the most characters of a transaction's abort reason that its
+/// log lines, its receipt and an estimate keep. A reason echoes the names
+/// the payload chose (move-vm's "Invalid identifier '...'", a function or
+/// type it cannot load), up to the ~50 KB a payload holds, none of them
+/// checked before the VM: whole, every node logged it twice and stored it in
+/// the receipt (Chain class, which the byte gas does not price), each
+/// control character written as six bytes.
+const MAX_ABORT_REASON_CHARS: usize = 200;
+
+/// B448: the most characters of a type argument a dex receipt echoes. Every
+/// type the dex accepts (AIN and WBTC, `dex::is_coin`) is far shorter, so a
+/// dex call that succeeds echoes its types whole. A longer argument (a
+/// generic instantiation such as `0xA::m::W<0xB::n::C>`, or a name no module
+/// could publish) is cut; such a call aborts. 600 is above the longest
+/// non-generic struct type a module can publish (`0x`, 64 hex digits and two
+/// names of at most 255 bytes, B316: 580 with the separators).
+const MAX_ECHOED_TYPE_CHARS: usize = 600;
+
+/// B448: `text`'s first `max` characters.
+fn first_chars(mut text: String, max: usize) -> String {
+    let end = text.char_indices().nth(max).map(|(end, _)| end);
+    if let Some(end) = end {
+        text.truncate(end);
+    }
+    text
+}
+
 fn receipt_update(
     db: &StateDB,
     tx_json: &str,
@@ -1384,9 +1656,25 @@ fn decode_dex_receipt_context(tx_json: &str) -> Option<DexReceiptContext> {
     if *call.module.address() != system_address() || call.module.name().as_str() != "dex" {
         return None;
     }
+    // B448: only a call of one of the dex's entry functions, with its two
+    // type arguments `<X, Y>`, has dex metadata. Any other call of `0x1::dex`
+    // aborts, and its receipt echoed the function name and every type
+    // argument the payload chose (up to ~50 KB), inside `receipts_root`.
+    if !DEX_ENTRY_FUNCTIONS.contains(&call.function.as_str()) || call.ty_args.len() != 2 {
+        return None;
+    }
 
     Some(DexReceiptContext { tx, call })
 }
+
+/// B448: the entry functions of `0x1::dex` (`dex.move`), each `<X, Y>`.
+const DEX_ENTRY_FUNCTIONS: [&str; 5] = [
+    "create_pool",
+    "add_liquidity",
+    "remove_liquidity",
+    "swap_x_to_y",
+    "swap_y_to_x",
+];
 
 fn read_updated_value<'a>(
     db: &'a StateDB,
@@ -1544,7 +1832,12 @@ fn receipt_metadata(
 ) -> Option<serde_json::Value> {
     let DexReceiptContext { tx, call } = decode_dex_receipt_context(tx_json)?;
 
-    let type_args: Vec<String> = call.ty_args.iter().map(|arg| arg.to_string()).collect();
+    // B448: a type argument's names are the payload's, unchecked: cut.
+    let type_args: Vec<String> = call
+        .ty_args
+        .iter()
+        .map(|arg| first_chars(arg.to_string(), MAX_ECHOED_TYPE_CHARS))
+        .collect();
     let sender_addr = parse_move_address(&tx.sender)?;
     let pool_addr = if call.function == "create_pool" {
         Some(sender_addr)
@@ -1971,6 +2264,26 @@ impl Executor {
             .take()
     }
 
+    /// B449: `key`'s value as `updates` last staged it, else as committed.
+    /// A read error is an error, never an absent row.
+    fn staged_or_committed(
+        &self,
+        updates: &[(String, Option<String>)],
+        key: &str,
+    ) -> Result<Option<String>, String> {
+        match updates
+            .iter()
+            .rev()
+            .find_map(|(k, v)| if k == key { v.as_deref() } else { None })
+        {
+            Some(json) => Ok(Some(json.to_string())),
+            None => self
+                .db
+                .get(key)
+                .map_err(|e| format!("{key} could not be read: {e}")),
+        }
+    }
+
     /// B1: keep `sys:validator_set:v1` live when a validator joins at runtime.
     /// Appends (or replaces by address) the new validator's finality identity and
     /// stages it in the transaction update set. Also stages the legacy
@@ -1986,35 +2299,30 @@ impl Executor {
     ) -> Result<(), String> {
         let legacy_entry = (entry.address.clone(), entry.stake);
         let key = validator_set_v1_key();
-        let existing_json = updates
-            .iter()
-            .rev()
-            .find_map(|(k, v)| if k == key { v.as_deref() } else { None })
-            .map(str::to_string)
-            .or_else(|| self.db.get(key).ok().flatten());
-
-        let mut set: Vec<ValidatorSetV1Entry> = existing_json
-            .as_deref()
-            .and_then(|json| serde_json::from_str(json).ok())
-            .unwrap_or_default();
+        let legacy_key = "sys:validators";
+        // B449: a live set (or its mirror) that cannot be read or does not
+        // decode refuses the join (a charged abort; nothing is staged). It
+        // read as empty: the joiner alone became the live set, and at the
+        // next boundary the committee, one key. Only an absent row (a
+        // fixture) is empty.
+        let mut set: Vec<ValidatorSetV1Entry> = match self.staged_or_committed(updates, key)? {
+            Some(json) => {
+                serde_json::from_str(&json).map_err(|e| format!("{key} does not decode: {e}"))?
+            }
+            None => Vec::new(),
+        };
+        let mut legacy_set: Vec<(String, u64)> =
+            match self.staged_or_committed(updates, legacy_key)? {
+                Some(json) => serde_json::from_str(&json)
+                    .map_err(|e| format!("{legacy_key} does not decode: {e}"))?,
+                None => Vec::new(),
+            };
         set.retain(|v| v.address != entry.address);
         set.push(entry);
         let json = serde_json::to_string(&set)
             .map_err(|e| format!("serialize sys:validator_set:v1 failed: {e}"))?;
         updates.push((key.to_string(), Some(json)));
 
-        let legacy_key = "sys:validators";
-        let existing_legacy_json = updates
-            .iter()
-            .rev()
-            .find_map(|(k, v)| if k == legacy_key { v.as_deref() } else { None })
-            .map(str::to_string)
-            .or_else(|| self.db.get(legacy_key).ok().flatten());
-
-        let mut legacy_set: Vec<(String, u64)> = existing_legacy_json
-            .as_deref()
-            .and_then(|json| serde_json::from_str(json).ok())
-            .unwrap_or_default();
         legacy_set.retain(|(addr, _)| addr != &legacy_entry.0);
         legacy_set.push(legacy_entry);
         legacy_set.sort_by(|a, b| a.0.cmp(&b.0));
@@ -2442,12 +2750,13 @@ impl Executor {
         println!("⏳ Epoch advanced at block {}", next_height);
     }
 
-    /// G5 EM-1, EM-2, DL-2: at every reward-period height (h mod R = 0) pay
-    /// the emission for the consensus time since the last payout to the
-    /// committee of h's epoch, jailed members excluded, each member's weight
-    /// split into its own and its pool's part as recorded with the committee.
-    /// A payout that aborts is caught up by the next one (Move keeps the time
-    /// of the last payout).
+    /// G5 EM-1, EM-2, DL-2, PA-2: at every reward-period height (h mod R =
+    /// 0) pay the emission for the consensus time since the last payout to
+    /// the committee of h's epoch, jailed members excluded, each member's
+    /// weight split into its own and its pool's part as recorded with the
+    /// committee, and its share scaled by its participation in the period
+    /// paid. A payout that aborts is caught up by the next one (Move keeps
+    /// the time of the last payout), scaled by the next period's count.
     fn maybe_pay_rewards(&self, height: u64) {
         let Some(params) = chain_params(&self.db) else {
             return;
@@ -2455,11 +2764,13 @@ impl Executor {
         if height == 0 || !height.is_multiple_of(params.reward_period) {
             return;
         }
-        let split =
-            self.delegated_split_of_epoch(height.saturating_sub(1) / self.epoch_block_interval());
+        let epoch = height.saturating_sub(1) / self.epoch_block_interval();
+        let participation = self.close_participation_period(epoch);
+        let split = self.delegated_split_of_epoch(epoch);
         let mut members = Vec::new();
         let mut self_weights = Vec::new();
         let mut delegated_weights = Vec::new();
+        let mut took_part = Vec::new();
         for (address, stake) in self.paid_committee(height) {
             let Some(member) = parse_move_address(&address) else {
                 continue;
@@ -2468,6 +2779,12 @@ impl Executor {
             members.push(member);
             self_weights.push(stake - delegated);
             delegated_weights.push(delegated);
+            took_part.push(
+                participation
+                    .get(&address)
+                    .copied()
+                    .unwrap_or(PARTICIPATION_SCALE),
+            );
         }
         let action = MoveAction::CallEntryFunction(EntryFunctionCall {
             module: move_core_types::language_storage::ModuleId::new(
@@ -2482,6 +2799,9 @@ impl Executor {
                 bcs::to_bytes(&members).expect("addresses are BCS"),
                 bcs::to_bytes(&self_weights).expect("weights are BCS"),
                 bcs::to_bytes(&delegated_weights).expect("weights are BCS"),
+                // G5 PA-2 (B464): what a member did not take part for stays
+                // in the reserve.
+                bcs::to_bytes(&took_part).expect("participation is BCS"),
                 // G5 A4 BW-7: pay against at least s_min, so a forfeited or
                 // capped weight's share stays in the reserve.
                 bcs::to_bytes(&read_bootstrap(&self.db).map_or(0u64, |b| b.s_min))
@@ -2567,6 +2887,101 @@ impl Executor {
             .unwrap_or_default()
     }
 
+    /// The committee of epoch `epoch` as (address, stake) in address order:
+    /// the order the leader schedule draws over and participation is counted
+    /// in (G5 PA-1).
+    fn sorted_committee(&self, epoch: u64) -> Vec<(String, u64)> {
+        let mut stakes: Vec<(String, u64)> = self
+            .committee_of_epoch(epoch)
+            .into_iter()
+            .map(|m| (m.address, m.stake))
+            .collect();
+        stakes.sort_by(|a, b| a.0.cmp(&b.0));
+        stakes
+    }
+
+    /// G5 PA-2 (B464): at a payout of committee epoch `epoch`, each member's
+    /// participation in the period it pays (the blocks since the last
+    /// payout), in parts per million. The period's count starts afresh, and
+    /// the result is recorded for the fees of the next period. Empty when
+    /// the period counted no round: nothing to scale by.
+    ///
+    /// The vertices of a period's last anchor round other than the anchor
+    /// are committed in the next period's first block, so the anchor's
+    /// leader authored one vertex more than the period's rounds and one
+    /// fewer in the next. One vertex a member authored beyond the rounds
+    /// carries into the next period, so it is not lost (about s / 47 of the
+    /// pay of a member of weight share s: R = 20 blocks of ~2.35 rounds,
+    /// with ~15 % of anchors skipped on V4); no more, so late vertices
+    /// cannot be banked for an absence.
+    fn close_participation_period(&self, epoch: u64) -> BTreeMap<String, u64> {
+        let Some(mut count) = read_participation(&self.db) else {
+            return BTreeMap::new();
+        };
+        let measured = if count.epoch == epoch {
+            participation_of(
+                count.period_rounds,
+                &count.period_authored,
+                &self.sorted_committee(epoch),
+            )
+        } else {
+            BTreeMap::new()
+        };
+        let before = count.clone();
+        let rounds = count.period_rounds;
+        for n in count.period_authored.iter_mut() {
+            *n = n.saturating_sub(rounds).min(1);
+        }
+        count.period_rounds = 0;
+        if count != before {
+            self.db
+                .put(
+                    &participation_key(),
+                    &hex::encode(bcs::to_bytes(&count).expect("the participation count is BCS")),
+                )
+                .expect("CRITICAL: the participation count write failed");
+        }
+        let (members, ppm): (Vec<_>, Vec<u64>) = measured
+            .iter()
+            .filter_map(|(address, &p)| parse_move_address(address).map(|m| (m, p)))
+            .unzip();
+        let paid = PeriodParticipation { members, ppm };
+        let key = period_participation_key();
+        let held = self
+            .db
+            .get(&key)
+            .expect("CRITICAL: the period participation could not be read");
+        let encoded = hex::encode(bcs::to_bytes(&paid).expect("the period participation is BCS"));
+        if held.as_deref() != Some(encoded.as_str()) {
+            self.db
+                .put(&key, &encoded)
+                .expect("CRITICAL: the period participation write failed");
+        }
+        measured
+    }
+
+    /// G5 PA-2 (B464): each member's participation in the last reward period
+    /// paid, by address, by which this period's fees are shared.
+    fn fee_participation(&self) -> BTreeMap<String, u64> {
+        self.db
+            .get(&period_participation_key())
+            .expect("CRITICAL: the period participation could not be read")
+            .map(|raw| {
+                bcs::from_bytes::<PeriodParticipation>(
+                    &hex::decode(raw).expect("CRITICAL: chain state is not hex"),
+                )
+                .expect("CRITICAL: 0x1::staking::PeriodParticipation is corrupt")
+            })
+            .map(|paid| {
+                paid.members
+                    .iter()
+                    .zip(&paid.ppm)
+                    .map(|(m, &p)| (hex::encode(m.into_bytes()), p))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// G5 SL-5: what an offense by `validator` in `epoch` weighs, from the
     /// records of that epoch: its weight and delegated part in C_{epoch}, the
     /// committee's total weight and the consensus time the epoch began. None
@@ -2630,6 +3045,9 @@ impl Executor {
 
     /// The committee epoch of the executing block, E(h) = (h - 1) / I, from
     /// the clock written before its slashes and transactions (G5 CL-2).
+    /// B457: tests only (the pending-slash shim); evidence takes its epoch
+    /// from the clock it is judged at (`check_evidence_age`).
+    #[cfg(test)]
     fn executing_epoch(&self) -> u64 {
         let key = vm_move::state_keys::resource_key_str(&system_address(), "0x1::chain::Clock");
         let height = self
@@ -2670,7 +3088,9 @@ impl Executor {
     /// The Move set is the authority (G5 review): a member it does not hold
     /// is dropped from both, so a seat never outlives its stake whatever path
     /// changed the Move set. Only a fixture without any Move set keeps its
-    /// weights. Also returns each member's bootstrap weight (G5 A4).
+    /// weights. A member out for non-participation (G5 PA-3) weighs 0 and
+    /// keeps its entry, for its return. Also returns each member's bootstrap
+    /// weight (G5 A4).
     fn refresh_bonded_weights(
         &self,
         new_epoch: u64,
@@ -2687,14 +3107,23 @@ impl Executor {
         let mut bonded = BTreeMap::new();
         let (owned_weights, pools, gone) = owned_weights_of(&self.db, &live);
         delegated.extend(pools);
+        // G5 PA-3 (B464): the members out for non-participation weigh
+        // nothing in the next committee; BW-4 and BW-11 count the others.
+        let inactive = self.settle_participation(new_epoch, &owned_weights);
+        let mut active = owned_weights.clone();
+        active.retain(|address, _| !inactive.contains_key(address));
         // G5 A4: bootstrap weight is settled after owned weights (BW-4) and
         // added to them; it never enters the pool split (BW-7).
-        let bootstrap = self.settle_bootstrap(new_epoch, &owned_weights);
+        let bootstrap = self.settle_bootstrap(new_epoch, &active, &inactive);
         for entry in live.iter_mut() {
             let Some(owned) = owned_weights.get(&entry.address) else {
                 continue;
             };
-            let weight = owned.saturating_add(bootstrap.get(&entry.address).copied().unwrap_or(0));
+            let weight = if inactive.contains_key(&entry.address) {
+                0
+            } else {
+                owned.saturating_add(bootstrap.get(&entry.address).copied().unwrap_or(0))
+            };
             if entry.stake != weight {
                 entry.stake = weight;
                 bonded.insert(entry.address.clone(), weight);
@@ -2704,6 +3133,33 @@ impl Executor {
             eprintln!("⚠️  [G5] committee members without Move stake dropped: {gone:?}");
             live.retain(|entry| !gone.contains(&entry.address));
         }
+        // BW-12, B374: the members the next committee takes from this set
+        // (EP-2's top by stake) and the bootstrap's operators are what a full
+        // set never displaces.
+        let elected: Vec<String> = blockchain::committee::top_by_stake(
+            &live
+                .iter()
+                .map(|entry| blockchain::committee::ValidatorInfo {
+                    address: entry.address.clone(),
+                    stake: entry.stake,
+                    ed25519_public_key: entry.ed25519_public_key.clone(),
+                    bls_public_key: entry.bls_public_key.clone(),
+                    bls_pop: entry.bls_pop.clone(),
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_iter()
+        .map(|member| member.address)
+        .collect();
+        self.db
+            .put(
+                &bootstrap_protected_key(),
+                &hex::encode(
+                    bcs::to_bytes(&protected_list(read_bootstrap(&self.db).as_ref(), &elected))
+                        .expect("the protected list is BCS"),
+                ),
+            )
+            .expect("CRITICAL: the protected list write failed");
         if bonded.is_empty() && gone.is_empty() {
             return (delegated, bootstrap);
         }
@@ -2740,18 +3196,28 @@ impl Executor {
         (delegated, bootstrap)
     }
 
-    /// G5 A4 BW-6: count the leader slots of the anchor rounds this block
-    /// closes, (previous block's anchor round, `anchor_round`], against the
-    /// committee of its epoch with consensus's own leader schedule, and
-    /// whether the block's anchor is its leader's. Only operators are
-    /// counted, and only on a chain with bootstrap operators.
-    fn count_bootstrap_slots(
+    /// G5 PA-1 (B464), A4 BW-6, B4: count the participation block `height`
+    /// shows, against the committee of its epoch: the rounds it closes,
+    /// (the previous block's anchor round, `anchor_round`], in each of which
+    /// every member could author one vertex, and the committed vertices
+    /// each member authored (`committed_authors`, bound in the header).
+    /// Every member is counted on a chain with `0x1::chain::Params` (boot
+    /// refuses a chain without; only a test fixture lacks them, as it lacks
+    /// payouts); a bootstrap operator's leader slots and vertices also go to
+    /// BW-6's counts. A block whose anchor round is not past the last counts
+    /// nothing.
+    fn count_participation(
         &self,
         height: u64,
         anchor_round: u64,
         proposer_hex: &str,
         committed_authors: &[String],
     ) {
+        let members_counted = chain_params(&self.db).is_some();
+        let operators_counted = read_bootstrap(&self.db).is_some_and(|b| !b.operators.is_empty());
+        if height == 0 || (!members_counted && !operators_counted) {
+            return;
+        }
         let last = self
             .db
             .get(BOOTSTRAP_ROUND_KEY)
@@ -2759,14 +3225,8 @@ impl Executor {
             .map(|raw| {
                 raw.parse::<u64>()
                     .expect("CRITICAL: the bootstrap round is corrupt")
-            });
-        let Some(state) = read_bootstrap(&self.db).filter(|b| !b.operators.is_empty()) else {
-            return;
-        };
-        let last = last.unwrap_or(0);
-        if height == 0 {
-            return;
-        }
+            })
+            .unwrap_or(0);
         if anchor_round <= last {
             // Consensus never places an anchor at or below the last one.
             eprintln!(
@@ -2779,12 +3239,77 @@ impl Executor {
             .put(BOOTSTRAP_ROUND_KEY, &anchor_round.to_string())
             .expect("CRITICAL: the bootstrap round write failed");
         let epoch = (height - 1) / self.epoch_block_interval();
-        let mut stakes: Vec<(String, u64)> = self
-            .committee_of_epoch(epoch)
-            .into_iter()
-            .map(|m| (m.address, m.stake))
-            .collect();
-        stakes.sort_by(|a, b| a.0.cmp(&b.0));
+        let stakes = self.sorted_committee(epoch);
+        // B4: the rounds the leader scan covers.
+        let first = anchor_round
+            .saturating_sub(2 * (BOOTSTRAP_MAX_ROUND_SCAN - 1))
+            .max(last + 1);
+        let mut authored: BTreeMap<&str, u64> = BTreeMap::new();
+        for author in committed_authors {
+            *authored.entry(author.as_str()).or_insert(0) += 1;
+        }
+        if members_counted {
+            self.count_member_vertices(epoch, &stakes, anchor_round + 1 - first, &authored);
+        }
+        self.count_bootstrap_slots(epoch, anchor_round, first, &stakes, proposer_hex, &authored);
+    }
+
+    /// G5 PA-1 (B464): add a block's `rounds` and each member's committed
+    /// vertices to the counts of its epoch and of the reward period, in the
+    /// committee's address order. A new epoch starts both afresh; the
+    /// members found under half in the last closed epoch (`low`) stay.
+    fn count_member_vertices(
+        &self,
+        epoch: u64,
+        members: &[(String, u64)],
+        rounds: u64,
+        authored: &BTreeMap<&str, u64>,
+    ) {
+        if members.is_empty() {
+            return;
+        }
+        let mut count = read_participation(&self.db).unwrap_or_default();
+        if count.epoch != epoch {
+            count.epoch = epoch;
+            count.rounds = 0;
+            count.authored.clear();
+            count.period_rounds = 0;
+            count.period_authored.clear();
+        }
+        count.authored.resize(members.len(), 0);
+        count.period_authored.resize(members.len(), 0);
+        count.rounds = count.rounds.saturating_add(rounds);
+        count.period_rounds = count.period_rounds.saturating_add(rounds);
+        for (i, (address, _)) in members.iter().enumerate() {
+            let n = authored.get(address.as_str()).copied().unwrap_or(0);
+            count.authored[i] = count.authored[i].saturating_add(n);
+            count.period_authored[i] = count.period_authored[i].saturating_add(n);
+        }
+        self.db
+            .put(
+                &participation_key(),
+                &hex::encode(bcs::to_bytes(&count).expect("the participation count is BCS")),
+            )
+            .expect("CRITICAL: the participation count write failed");
+    }
+
+    /// G5 A4 BW-6: count the leader slots of the anchor rounds a block
+    /// closes, the even rounds from `first` to `anchor_round`, against the
+    /// committee of its epoch (`stakes`, address order) with consensus's own
+    /// leader schedule, and whether the block's anchor is its leader's. Only
+    /// operators are counted, and only on a chain with bootstrap operators.
+    fn count_bootstrap_slots(
+        &self,
+        epoch: u64,
+        anchor_round: u64,
+        first: u64,
+        stakes: &[(String, u64)],
+        proposer_hex: &str,
+        authored: &BTreeMap<&str, u64>,
+    ) {
+        let Some(state) = read_bootstrap(&self.db).filter(|b| !b.operators.is_empty()) else {
+            return;
+        };
         let leader_of_block = if proposer_hex.len() > crypto::ADDRESS_HEX_LEN {
             &proposer_hex[..crypto::ADDRESS_HEX_LEN]
         } else {
@@ -2801,12 +3326,9 @@ impl Executor {
             .unwrap_or_default();
         let before = slots.clone();
         // Anchors live on even rounds.
-        let mut round = anchor_round
-            .saturating_sub(2 * (BOOTSTRAP_MAX_ROUND_SCAN - 1))
-            .max(last + 1);
-        round += round % 2;
+        let mut round = first + first % 2;
         while round <= anchor_round {
-            let leader = blockchain::committee::leader_for_round(round, &stakes, 0);
+            let leader = blockchain::committee::leader_for_round(round, stakes, 0);
             if state.operators.iter().any(|o| o.address == leader) {
                 let entry = slots.entry(leader.clone()).or_insert((0, 0));
                 entry.0 += 1;
@@ -2828,14 +3350,7 @@ impl Executor {
         // B4: each operator in the committee could author one vertex per
         // round the block closes (the rounds the leader scan covers), and is
         // credited every committed vertex of the block it authored.
-        let first = anchor_round
-            .saturating_sub(2 * (BOOTSTRAP_MAX_ROUND_SCAN - 1))
-            .max(last + 1);
         let rounds = anchor_round + 1 - first;
-        let mut authored: BTreeMap<&str, u64> = BTreeMap::new();
-        for author in committed_authors {
-            *authored.entry(author.as_str()).or_insert(0) += 1;
-        }
         let key = bootstrap_vertices_key(epoch);
         let mut vertices: BTreeMap<String, (u64, u64)> = self
             .db
@@ -2863,15 +3378,106 @@ impl Executor {
         }
     }
 
-    /// G5 A4 at the boundary opening `new_epoch`, given each live member's
-    /// owned weight: score the closed epoch (BW-6), forfeit (BW-5), scale to
-    /// B = max(0, s_min - P) within the ceilings (BW-4), cap below a third
-    /// (BW-11), and write the state and the protected list (BW-12). Returns
-    /// each operator's bootstrap weight; empty on a chain without bootstrap.
+    /// G5 PA-3 (B464): at the boundary opening `new_epoch`, take out of the
+    /// committee every live member with stake (`owned`) that authored
+    /// committed vertices in fewer than half the rounds of the closing epoch
+    /// and of the epoch before it, as a member of both (the counts give the
+    /// first, `low` the second). It is out from `new_epoch` until
+    /// `staking::reactivate`: it weighs 0 in the live set and its stake
+    /// stays bonded; nothing is slashed or unbonded (downtime is not
+    /// slashed). The closing epoch's members under half become the new
+    /// `low`, and the inactive list keeps only members still live with
+    /// stake. Returns the members out, with the first epoch each is out of.
+    fn settle_participation(
+        &self,
+        new_epoch: u64,
+        owned: &BTreeMap<String, u64>,
+    ) -> BTreeMap<String, u64> {
+        let closed = new_epoch.saturating_sub(1);
+        let held = inactive_members(&self.db);
+        let mut out: BTreeMap<String, u64> = held
+            .iter()
+            .filter(|(address, _)| owned.contains_key(*address))
+            .map(|(address, &from)| (address.clone(), from))
+            .collect();
+        if let Some(mut count) = read_participation(&self.db) {
+            let low: Vec<move_core_types::account_address::AccountAddress> =
+                if count.epoch == closed {
+                    participation_of(
+                        count.rounds,
+                        &count.authored,
+                        &self.sorted_committee(closed),
+                    )
+                    .into_iter()
+                    .filter(|(_, p)| *p < PARTICIPATION_FLOOR)
+                    .filter_map(|(address, _)| parse_move_address(&address))
+                    .collect()
+                } else {
+                    Vec::new()
+                };
+            for member in &low {
+                let address = hex::encode(member.into_bytes());
+                if count.low.contains(member)
+                    && owned.contains_key(&address)
+                    && !out.contains_key(&address)
+                {
+                    eprintln!(
+                        "⏸️  [INACTIVE] epoch {new_epoch}: {address} authored committed vertices \
+                         in under half the rounds of epochs {} and {closed}; out of the committee \
+                         until it reactivates",
+                        closed.saturating_sub(1)
+                    );
+                    out.insert(address, new_epoch);
+                }
+            }
+            if count.low != low {
+                count.low = low;
+                self.db
+                    .put(
+                        &participation_key(),
+                        &hex::encode(
+                            bcs::to_bytes(&count).expect("the participation count is BCS"),
+                        ),
+                    )
+                    .expect("CRITICAL: the participation count write failed");
+            }
+        }
+        if out != held {
+            let members: Vec<InactiveMember> = out
+                .iter()
+                .filter_map(|(address, &from_epoch)| {
+                    parse_move_address(address).map(|validator| InactiveMember {
+                        validator,
+                        from_epoch,
+                    })
+                })
+                .collect();
+            self.db
+                .put(
+                    &inactive_key(),
+                    &hex::encode(
+                        bcs::to_bytes(&InactiveSet { members }).expect("the inactive list is BCS"),
+                    ),
+                )
+                .expect("CRITICAL: the inactive list write failed");
+        }
+        out
+    }
+
+    /// G5 A4 at the boundary opening `new_epoch`, given the owned weight of
+    /// each live member that may be elected (`owned`) and the members out
+    /// for non-participation (`inactive`, G5 PA-3): score the closed epoch
+    /// (BW-6), forfeit (BW-5), scale to B = max(0, s_min - P) within the
+    /// ceilings (BW-4), cap below a third (BW-11), and write the state (its
+    /// protected list is written with the committee's,
+    /// `refresh_bonded_weights`). An operator that is out keeps its ceiling
+    /// and scores 0 for each epoch that closes while it is out. Returns each
+    /// operator's bootstrap weight; empty on a chain without bootstrap.
     fn settle_bootstrap(
         &self,
         new_epoch: u64,
         owned: &BTreeMap<String, u64>,
+        inactive: &BTreeMap<String, u64>,
     ) -> BTreeMap<String, u64> {
         let Some(mut state) = read_bootstrap(&self.db) else {
             return BTreeMap::new();
@@ -2895,19 +3501,24 @@ impl Executor {
                 serde_json::from_str(&raw).expect("CRITICAL: a bootstrap vertex count is corrupt")
             })
             .unwrap_or_default();
-        // BW-6, B4: score the closed epoch.
+        // BW-6, B4: score the closed epoch. G5 PA-3 (B464): an epoch spent
+        // out of the committee for non-participation scores 0, so a dark
+        // operator forfeits on BW-6's schedule whether or not it is out.
         for op in state.operators.iter_mut() {
-            op.score = fold_bootstrap_score(
-                op.score,
+            let ratio = if inactive.get(&op.address).is_some_and(|&from| from <= closed) {
+                Some(0)
+            } else {
                 epoch_participation(
                     slots.get(&op.address).copied(),
                     vertices.get(&op.address).copied(),
-                ),
-            );
+                )
+            };
+            op.score = fold_bootstrap_score(op.score, ratio);
         }
-        // BW-5: forfeit for good.
+        // BW-5: forfeit for good. Being out for non-participation is not
+        // leaving the Move set (PA-3).
         for op in state.operators.iter_mut() {
-            if !owned.contains_key(&op.address)
+            if (!owned.contains_key(&op.address) && !inactive.contains_key(&op.address))
                 || self.is_jailed(&op.address)
                 || self.is_convicted_in_full(&op.address)
                 || op.score < BOOTSTRAP_SCORE_FLOOR
@@ -2950,7 +3561,7 @@ impl Executor {
         }
         // BW-4: the bootstrap ends for good once owned stake has held s_min
         // in the elected committee for U.
-        let now = committed_chain_clock(&self.db).time;
+        let now = executing_chain_clock(&self.db).time;
         let weights: BTreeMap<String, u64> = state
             .operators
             .iter()
@@ -2987,15 +3598,6 @@ impl Executor {
                 &serde_json::to_string(&state).expect("the bootstrap state is JSON"),
             )
             .expect("CRITICAL: the bootstrap state write failed");
-        self.db
-            .put(
-                &bootstrap_protected_key(),
-                &hex::encode(
-                    bcs::to_bytes(&bootstrap_protected_of(&state))
-                        .expect("the protected list is BCS"),
-                ),
-            )
-            .expect("CRITICAL: the protected list write failed");
         if !slots.is_empty() {
             self.db
                 .delete(&slots_key)
@@ -3162,7 +3764,7 @@ impl Executor {
             &format!("consensus:epoch_start_height:{}", new_epoch),
             &boundary_height.saturating_add(1).to_string(),
         );
-        let now = committed_chain_clock(&self.db).time;
+        let now = executing_chain_clock(&self.db).time;
         self.db
             .put(&epoch_time_key(new_epoch), &now.to_string())
             .expect("CRITICAL: the epoch time record write failed");
@@ -3282,20 +3884,31 @@ impl Executor {
     /// reward is fully consumed and never lost.
     ///
     /// Fallback: if the committee is empty, ALL goes to the leader.
-    fn compute_block_payouts(
+    ///
+    /// B393: the pool is split against at least `floor` (BW-7's s_min, 0
+    /// without a bootstrap), as emission is (`pay_rewards`): fees were split
+    /// against the committee's own weight, so a forfeit raised every
+    /// survivor's fee share (~17 % for one operator at launch) and left the
+    /// motive BW-7 removed for emission. The part of the pool a weight below
+    /// the floor leaves unpaid is returned, to be burned.
+    fn block_payouts(
         anchor_leader: &str,
         total_reward: u128,
         validators: &[(String, u64)],
-    ) -> Vec<(String, u128)> {
+        floor: u64,
+    ) -> (Vec<(String, u128)>, u128) {
         // Fallback: no validator set → legacy single-miner path.
         if validators.is_empty() {
-            return vec![(anchor_leader.to_string(), total_reward)];
+            return (vec![(anchor_leader.to_string(), total_reward)], 0);
         }
 
-        let total_stake: u128 = validators.iter().map(|(_, s)| *s as u128).sum();
-        if total_stake == 0 {
-            return vec![(anchor_leader.to_string(), total_reward)];
+        let weight: u128 = validators.iter().map(|(_, s)| *s as u128).sum();
+        // B464: weights scaled by participation may all be 0 against a
+        // floor; then nothing is paid and everything is burned.
+        if weight == 0 && floor == 0 {
+            return (vec![(anchor_leader.to_string(), total_reward)], 0);
         }
+        let total_stake = weight.max(floor as u128);
 
         // Step 2: split into bonus + pool buckets.
         // 20% leader bonus, 80% stake-weighted pool.
@@ -3312,12 +3925,17 @@ impl Executor {
         // G5 EM-2: a leader outside the paid committee (jailed since it was
         // elected) gets nothing; its bonus stays in the pool.
         let leader_paid = validators.iter().any(|(a, _)| a == anchor_leader);
-        let leader_bonus = if leader_paid {
+        let full_bonus = if leader_paid {
             total_reward.saturating_mul(LEADER_BONUS_PCT) / 100
         } else {
             0
         };
-        let pool = total_reward.saturating_sub(leader_bonus);
+        let pool = total_reward.saturating_sub(full_bonus);
+        // B403: the bonus against the floor too. Leaders are drawn by stake
+        // from the committee, so below s_min a survivor leads w/W of the
+        // blocks, not w/s_min: its bonus income rose by s_min/W after a
+        // rival's forfeit, the motive B393 removed from the pool.
+        let leader_bonus = full_bonus.saturating_mul(weight) / total_stake;
 
         // Step 3: stake-weighted distribution of the pool.
         use std::collections::BTreeMap;
@@ -3338,7 +3956,12 @@ impl Executor {
         // Phase 5C.4 / NEW-003: saturating_add on the `+=` too — the
         // unchecked `+=` would wrap if leader_bonus + remainder + their
         // own pool share crossed u128::MAX.
-        let remainder = pool.saturating_sub(distributed_pool);
+        // B393: the floor's unpaid part is not a rounding remainder.
+        let paid_pool = pool.saturating_mul(weight) / total_stake;
+        let unpaid = pool
+            .saturating_sub(paid_pool)
+            .saturating_add(full_bonus.saturating_sub(leader_bonus));
+        let remainder = paid_pool.saturating_sub(distributed_pool);
         let leader_credit = leader_bonus.saturating_add(remainder);
         // The remainder goes to the leader, or to the committee's first
         // member (canonical order) when the leader is not paid.
@@ -3350,7 +3973,43 @@ impl Executor {
         let entry = payouts.entry(credited.to_string()).or_insert(0);
         *entry = entry.saturating_add(leader_credit);
 
-        payouts.into_iter().collect()
+        (payouts.into_iter().collect(), unpaid)
+    }
+
+    /// G5 PA-2 (B464): a block's fee payouts (`block_payouts`) with each
+    /// member of `committee` weighed by its participation in the last
+    /// reward period paid (`participating_weights`), against the whole
+    /// committee's weight or `s_min`, whichever is more. The part a member
+    /// did not take part for is unpaid, to be burned, and nobody earns more
+    /// for it (BW-7's rule). The leader's bonus scales with the weight that
+    /// took part: absent members' anchors are skipped, so the members that
+    /// lead take more of the blocks.
+    fn fee_payouts(
+        anchor_leader: &str,
+        total_reward: u128,
+        committee: &[(String, u64)],
+        participation: &BTreeMap<String, u64>,
+        s_min: u64,
+    ) -> (Vec<(String, u128)>, u128) {
+        let weight = committee
+            .iter()
+            .fold(0u64, |total, (_, stake)| total.saturating_add(*stake));
+        Self::block_payouts(
+            anchor_leader,
+            total_reward,
+            &participating_weights(committee, participation),
+            s_min.max(weight),
+        )
+    }
+
+    /// `block_payouts` without a floor.
+    #[cfg(test)]
+    fn compute_block_payouts(
+        anchor_leader: &str,
+        total_reward: u128,
+        validators: &[(String, u64)],
+    ) -> Vec<(String, u128)> {
+        Self::block_payouts(anchor_leader, total_reward, validators, 0).0
     }
 
     fn deposit_fee_reward(&self, miner_addr: &str, amount: u128) -> Result<(), String> {
@@ -3767,11 +4426,18 @@ impl Executor {
         if let Some(hook) = self.block_boundary_hook {
             hook(0, &self.db);
         }
+        // B457: the evidence is judged at the clock the parent committed,
+        // read before this block's is written: the one its builder judged it
+        // at (`verify_slash_evidence`, on the parent's state). At this
+        // block's, an item whose W ended within the block's clock growth
+        // passed the builder, took one of the block's slots and was refused
+        // on every node.
+        let evidence_clock = executing_chain_clock(&self.db);
         // G5 CL-2: the height and consensus time of this block, before
         // anything of it runs, so every deadline a transaction or a system
         // call checks is this block's.
         self.write_chain_clock(block_height, block_timestamp);
-        self.apply_slash_evidence(slash_evidence);
+        self.apply_slash_evidence(slash_evidence, evidence_clock);
 
         // 1. Parse all transactions. The per-block object limit (N-2) is
         // spent at execution, by what can pay (B16, step 3).
@@ -3920,18 +4586,26 @@ impl Executor {
                 u64,
                 usize,
                 Option<(Vec<(String, Option<String>)>, u128)>,
-            )> = runnable
-                .par_iter()
-                .map(|(tx, (raw, place))| {
-                    (
-                        tx_hash_hex(raw),
-                        (raw.clone(), *place),
-                        tx.gas_limit,
-                        tx.input_objects.len(),
-                        self.execute_transaction(raw),
-                    )
-                })
-                .collect();
+            )> = vm_move::on_vm_threads(|| {
+                // B434: the batch runs on the VM's own threads, so each
+                // transaction's session runs inline on its 64 MiB stack. On
+                // rayon's global pool (2 MiB) each worker waiting for a
+                // session on another pool ran the batch's other items on
+                // the same stack meanwhile, nesting them until it
+                // overflowed (B430's regression).
+                runnable
+                    .par_iter()
+                    .map(|(tx, (raw, place))| {
+                        (
+                            tx_hash_hex(raw),
+                            (raw.clone(), *place),
+                            tx.gas_limit,
+                            tx.input_objects.len(),
+                            self.execute_transaction(raw),
+                        )
+                    })
+                    .collect()
+            });
             results.sort_by(|left, right| left.0.cmp(&right.0));
 
             // 4. Commit Batch Atomically
@@ -4074,11 +4748,24 @@ impl Executor {
         };
 
         if reward_amount > 0 {
-            let payouts = Self::compute_block_payouts(
+            // B393, B403: the pool and the leader's bonus against at least
+            // s_min, as emission is (BW-7). B464: each part by its member's
+            // participation in the last reward period paid (G5 PA-2).
+            let s_min = read_bootstrap(&self.db).map_or(0, |b| b.s_min);
+            let (payouts, unpaid) = Self::fee_payouts(
                 miner_addr,
                 reward_amount,
                 &self.paid_committee(block_height),
+                &self.fee_participation(),
+                s_min,
             );
+            if unpaid > 0 {
+                println!(
+                    "🔥 BURNING {unpaid} Fees: the part left unpaid below s_min or for members \
+                     that took no part"
+                );
+                self.burn_supply_trackers(unpaid);
+            }
 
             println!(
                 "💰 Distributing Block Fees ({} AIN total) across {} recipient(s)",
@@ -4149,9 +4836,10 @@ impl Executor {
         // being executed (see execute_block_parallel_at doc).
         // G5 EM-3: the reward payout for (h - R, h] pays C_{E(h)} before a
         // boundary block records C_{E+1}.
-        // G5 A4 BW-6: the block's slots count toward its epoch before a
-        // boundary scores that epoch.
-        self.count_bootstrap_slots(block_height, anchor_round, proposer_hex, committed_authors);
+        // G5 A4 BW-6, PA-1: the block's slots and vertices count toward its
+        // epoch and reward period before a payout pays the period and a
+        // boundary scores the epoch.
+        self.count_participation(block_height, anchor_round, proposer_hex, committed_authors);
         self.maybe_pay_rewards(block_height);
         self.maybe_advance_epoch(block_height);
 
@@ -4380,12 +5068,26 @@ impl Executor {
     /// certificate conflict (CE-3), each against the committee of its epoch
     /// (G5 SL-3). The V3 and downtime kinds were deleted with the V3 DAG (G5
     /// S4c): nothing produces them, and the state transition takes no others.
+    ///
+    /// B457: judged at the committed clock. A block builder verifies on its
+    /// parent's state, and execution judges the block's evidence at the same
+    /// clock (`verify_slash_evidence_at`), so what one carries the other
+    /// accepts.
     pub fn verify_slash_evidence(&self, item: &str) -> Result<VerifiedEvidence, String> {
+        self.verify_slash_evidence_at(item, executing_chain_clock(&self.db))
+    }
+
+    /// `verify_slash_evidence` with its age judged at `clock` (G5 SL-3).
+    fn verify_slash_evidence_at(
+        &self,
+        item: &str,
+        clock: ChainClock,
+    ) -> Result<VerifiedEvidence, String> {
         let ev: serde_json::Value =
             serde_json::from_str(item).map_err(|e| format!("bad json: {e}"))?;
         match ev.get("kind").and_then(|k| k.as_str()) {
-            Some("equivocation_v4") => self.verify_v4_twins(&ev),
-            Some("certificate_conflict") => self.verify_certificate_conflict(&ev),
+            Some("equivocation_v4") => self.verify_v4_twins(&ev, clock),
+            Some("certificate_conflict") => self.verify_certificate_conflict(&ev, clock),
             other => Err(format!("unknown evidence kind {other:?}")),
         }
     }
@@ -4395,7 +5097,11 @@ impl Executor {
     /// under this chain's domain, each signed with the author's key in C_E
     /// (never the live set). Refused once tau > tau_start(E+1) + W, or once
     /// C_E's record is gone.
-    fn verify_v4_twins(&self, ev: &serde_json::Value) -> Result<VerifiedEvidence, String> {
+    fn verify_v4_twins(
+        &self,
+        ev: &serde_json::Value,
+        clock: ChainClock,
+    ) -> Result<VerifiedEvidence, String> {
         let offender = ev
             .get("offender")
             .and_then(|v| v.as_str())
@@ -4411,7 +5117,7 @@ impl Executor {
             .ok_or("missing round")?;
         // Age first (G5 review, A3b): evidence of a pruned or expired epoch
         // is refused as such, before its committee is looked up.
-        self.check_evidence_age(epoch)?;
+        self.check_evidence_age(epoch, clock)?;
         let vertex = |field: &str| -> Result<blockchain::Vertex, String> {
             serde_json::from_value(ev.get(field).cloned().unwrap_or_default())
                 .map_err(|e| format!("{field}: {e}"))
@@ -4430,10 +5136,13 @@ impl Executor {
         if self.is_jailed(&offender) {
             return Err(format!("{offender} is jailed already"));
         }
+        // B404: a read error fails closed, as the committee, jail and
+        // retention reads above do. As an Err it was data: the builder
+        // dropped the item and built a block no other node built.
         let genesis_identity = self
             .db
             .get("genesis_identity")
-            .map_err(|e| e.to_string())?
+            .expect("CRITICAL: the genesis identity could not be read")
             .ok_or("no genesis identity")?;
         let chain_id = blockchain::chain_id();
         for v in [&a, &b] {
@@ -4481,8 +5190,9 @@ impl Executor {
     /// begun if it is not after the executing epoch, so its missing start
     /// time means the records are gone, not that E is current. Epoch 0's
     /// committee is the genesis record, never pruned, so its retention is
-    /// read from the marker.
-    fn check_evidence_age(&self, epoch: u64) -> Result<(), String> {
+    /// read from the marker. B457: at `clock` (time and executing epoch), the
+    /// clock the block's parent committed, on both paths.
+    fn check_evidence_age(&self, epoch: u64, clock: ChainClock) -> Result<(), String> {
         let retained_from = self
             .db
             .get(RETAINED_FROM_KEY)
@@ -4501,14 +5211,11 @@ impl Executor {
             return Err(format!("no epoch follows {epoch}"));
         };
         match self.epoch_began(next_epoch) {
-            Some(next)
-                if committed_chain_clock(&self.db).time
-                    > next.saturating_add(EVIDENCE_MAX_AGE_SECS) =>
-            {
+            Some(next) if clock.time > next.saturating_add(EVIDENCE_MAX_AGE_SECS) => {
                 return Err(format!("evidence of epoch {epoch} is older than W"));
             }
             Some(_) => {}
-            None if epoch < self.executing_epoch() => {
+            None if epoch < clock.height.saturating_sub(1) / self.epoch_block_interval() => {
                 return Err(format!("the records of epoch {next_epoch} are pruned"));
             }
             None => {}
@@ -4525,6 +5232,7 @@ impl Executor {
     fn verify_certificate_conflict(
         &self,
         ev: &serde_json::Value,
+        clock: ChainClock,
     ) -> Result<VerifiedEvidence, String> {
         use blockchain::attest::{bit_set, VertexCertificate, CERT_VERSION};
         let author = ev
@@ -4545,16 +5253,19 @@ impl Executor {
                 .map_err(|e| format!("{field}: {e}"))
         };
         let (a, b) = (cert("cert_a")?, cert("cert_b")?);
-        self.check_evidence_age(epoch)?;
+        self.check_evidence_age(epoch, clock)?;
         let committee = self.committee_of_epoch(epoch);
         if committee.is_empty() {
             return Err(format!("no committee record for epoch {epoch}"));
         }
         let ordered = blockchain::committee::canonical_order(&committee);
+        // B404: a read error fails closed, as the committee, jail and
+        // retention reads above do. As an Err it was data: the builder
+        // dropped the item and built a block no other node built.
         let genesis_identity = self
             .db
             .get("genesis_identity")
-            .map_err(|e| e.to_string())?
+            .expect("CRITICAL: the genesis identity could not be read")
             .ok_or("no genesis identity")?;
         let committee_hash = blockchain::committee::validator_set_hash(&committee);
         let bitmap_len = ordered.len().div_ceil(8);
@@ -4626,11 +5337,12 @@ impl Executor {
     /// execute. Invalid items are ignored (logged) — a proposer cannot slash
     /// anyone without evidence every node can check. If any offense was
     /// recorded, settlement runs in this block (a fraction already at 100 %
-    /// settles at once, G5 SL-5).
-    fn apply_slash_evidence(&self, items: &[String]) {
+    /// settles at once, G5 SL-5). B457: each item's age is judged at
+    /// `clock`, the parent's, as the builder judged it.
+    fn apply_slash_evidence(&self, items: &[String], clock: ChainClock) {
         let mut recorded = false;
         for item in items.iter().take(5) {
-            match self.verify_slash_evidence(item) {
+            match self.verify_slash_evidence_at(item, clock) {
                 Ok(VerifiedEvidence {
                     offenders,
                     kind,
@@ -4982,6 +5694,89 @@ impl Executor {
         };
         println!("🪪 Auto-registering CoinStore for new recipient {}", recipient);
         vec![(key, Some(hex::encode(empty)))]
+    }
+
+    /// B412: the gas of the B389 refresh a join would run, or `None` when it
+    /// would not run. It is charged with the join's dependencies, before any
+    /// of it runs: the refresh decodes the whole Move set twice (the fullness
+    /// check, then the owned weights), parses the live set and the bootstrap
+    /// state, and reads a pool a member. B400's pre-filter only narrowed who
+    /// ran it unpaid: a join of the least stake into a full set cannot
+    /// displace anyone, but passed, and Move refused it after the refresh.
+    /// Priced as B69 prices a module: a load per read (`OBJECT_LOAD_GAS`) and
+    /// a gas per `DEPENDENCY_BYTES_PER_GAS` bytes of the rows it decodes.
+    fn protected_refresh_gas(
+        &self,
+        call: &vm_move::EntryFunctionCall,
+        sender: &str,
+    ) -> Option<u64> {
+        if *call.module.address() != system_address()
+            || call.module.name().as_str() != "staking"
+            || call.function != "join_validator_set"
+        {
+            return None;
+        }
+        // B400: stake at least the minimum and held by the sender (two point
+        // reads): Move refuses any other join at once.
+        let stake = bcs_arg::<u128>(&call.args, 1).unwrap_or(0);
+        if stake < MOVE_MIN_STAKE
+            || committed_ain_balance(&self.db, sender).is_none_or(|held| held < stake)
+        {
+            return None;
+        }
+        // Full from the set's length prefix alone, with no decode.
+        let set = self
+            .db
+            .get(&validator_set_key())
+            .expect("CRITICAL: the Move validator set could not be read")?;
+        let members = move_set_member_count(&set)?;
+        if members < MOVE_MAX_VALIDATORS as u64 {
+            return None;
+        }
+        // Without a live set `protected_now` refreshes nothing.
+        let live = self
+            .db
+            .get(validator_set_v1_key())
+            .expect("CRITICAL: the live validator set could not be read")?;
+        let bootstrap = self
+            .db
+            .get(BOOTSTRAP_KEY)
+            .expect("CRITICAL: the bootstrap state could not be read")
+            .map_or(0, |raw| raw.len() as u64);
+        let bytes = (set.len() as u64)
+            .saturating_mul(2)
+            .saturating_add(live.len() as u64)
+            .saturating_add(bootstrap);
+        Some(
+            members
+                .saturating_add(3)
+                .saturating_mul(OBJECT_LOAD_GAS)
+                .saturating_add(bytes.div_ceil(deps::DEPENDENCY_BYTES_PER_GAS)),
+        )
+    }
+
+    /// B389: before a join into a full Move set, the protected list as the
+    /// weights stand now (`protected_now`), staged ahead of the call. Written
+    /// only at boundaries, it left a member that joined in this epoch, or
+    /// whose pool grew in it, to be displaced by own stake alone, its pool's
+    /// weight with it. Run only for a join `protected_refresh_gas` priced
+    /// (B412), after the charge.
+    fn protected_refresh_writes(&self) -> Vec<(String, Option<String>)> {
+        let full = self
+            .db
+            .get(&validator_set_key())
+            .expect("CRITICAL: the Move validator set could not be read")
+            .and_then(|raw| decode_validator_set_hex(&raw))
+            .is_some_and(|set| set.validators.len() >= MOVE_MAX_VALIDATORS);
+        if !full {
+            return Vec::new();
+        }
+        protected_now(&self.db)
+            .map(|list| {
+                let bytes = bcs::to_bytes(&list).expect("the protected list is BCS");
+                vec![(bootstrap_protected_key(), Some(hex::encode(bytes)))]
+            })
+            .unwrap_or_default()
     }
 
     fn analyze_tx(&self, tx: &Transaction) -> (Vec<String>, bool) {
@@ -5380,14 +6175,21 @@ impl Executor {
         checked.tx.gas_limit = MAX_BLOCK_GAS_LIMIT;
         checked.execution_gas =
             MAX_BLOCK_GAS_LIMIT.saturating_sub(admission::intrinsic_gas(tx_json.len()));
-        let report = std::cell::RefCell::new(GasEstimate::default());
-        match self.execute_checked(checked, tx_json, Some(&report)) {
-            Some(_) => Ok(report.into_inner()),
-            None => Err(
+        let run = move || {
+            let report = std::cell::RefCell::new(GasEstimate::default());
+            let executed = self.execute_checked(checked, tx_json, Some(&report));
+            executed.map(|_| report.into_inner())
+        };
+        // B447: on a thread of its own, never on the VM's threads, where a
+        // block's sessions run (`vm_move::on_dry_run_thread`).
+        match vm_move::on_dry_run_thread(run) {
+            Ok(Some(estimate)) => Ok(estimate),
+            Ok(None) => Err(
                 "the transaction would not execute: a wrong sequence number, \
                  a payer that cannot pay, or a refused payload"
                     .to_string(),
             ),
+            Err(e) => Err(format!("no thread for the estimate; retry ({e})")),
         }
     }
 
@@ -5401,6 +6203,17 @@ impl Executor {
         tx_json: &str,
         report: Option<&std::cell::RefCell<GasEstimate>>,
     ) -> Option<(Vec<(String, Option<String>)>, u128)> {
+        // B327: an estimate (`report` given: a free RPC call) logs nothing.
+        // Each printed a line or two, about a gigabyte a day from one client
+        // at the rate limit.
+        let quiet = report.is_some();
+        macro_rules! log {
+            ($($arg:tt)*) => {
+                if !quiet {
+                    println!($($arg)*);
+                }
+            };
+        }
         let mut updates = Vec::new();
         let admission::CheckedTx {
             tx,
@@ -5412,9 +6225,10 @@ impl Executor {
         // estimate runs at the lowest price).
         let base_fee = committed_base_fee(&self.db);
         if report.is_none() && tx.gas_price < base_fee {
-            println!(
+            log!(
                 "❌ REJECTED: gas price {} below the base fee {}",
-                tx.gas_price, base_fee
+                tx.gas_price,
+                base_fee
             );
             return None;
         }
@@ -5423,13 +6237,13 @@ impl Executor {
         // `charge_account_writes`. The signatures and any ZK proof were
         // checked by `admission::check_stateless`.
         if self.db.get_object(&tx.sender).is_none() {
-            println!(
+            log!(
                 "🆕 Implicitly creating account {} on its first transaction",
                 tx.sender
             );
         }
         let Some(account_writes) = self.charge_account_writes(&tx, &payer) else {
-            println!("❌ Invalid Sequence Number (or an unreadable account record)");
+            log!("❌ Invalid Sequence Number (or an unreadable account record)");
             return None;
         };
         updates.extend(account_writes);
@@ -5438,7 +6252,7 @@ impl Executor {
         // N-2 FIX: Charge gas for object loading upfront
         let object_load_gas = (tx.input_objects.len() as u64) * OBJECT_LOAD_GAS;
         if object_load_gas > execution_gas {
-            println!(
+            log!(
                 "❌ Insufficient gas for object loading: {} objects × {} gas = {} > execution gas {}",
                 tx.input_objects.len(),
                 OBJECT_LOAD_GAS,
@@ -5450,9 +6264,10 @@ impl Executor {
         let gas_cost: u128 = match (tx.gas_limit as u128).checked_mul(tx.gas_price) {
             Some(cost) => cost,
             None => {
-                println!(
+                log!(
                     "❌ Gas cost overflow: gas_limit={} gas_price={}",
-                    tx.gas_limit, tx.gas_price
+                    tx.gas_limit,
+                    tx.gas_price
                 );
                 return None;
             }
@@ -5472,7 +6287,7 @@ impl Executor {
             let payer_move_addr = match parse_move_address(&payer_addr) {
                 Some(addr) => addr,
                 None => {
-                    println!("❌ Invalid gas payer address");
+                    log!("❌ Invalid gas payer address");
                     return None;
                 }
             };
@@ -5514,7 +6329,7 @@ impl Executor {
         // is charged.
         let charge_gas = self.charge_gas(&tx, &updates);
         if charge_gas > execution_gas {
-            println!(
+            log!(
                 "❌ REJECTED: the charge's own writes and object loads need {charge_gas} gas, the limit leaves {execution_gas}"
             );
             return None;
@@ -5545,11 +6360,12 @@ impl Executor {
                 self.append_supply_tracker_updates(&mut updates);
                 if !$status.success {
                     tx_status = "aborted".to_string();
-                    tx_error = Some(
-                        $status
-                            .error
-                            .unwrap_or_else(|| "Move execution aborted".to_string()),
-                    );
+                    // B448: cut where it is made: the log lines below, the
+                    // receipt and an estimate all take it from here.
+                    let reason = $status
+                        .error
+                        .unwrap_or_else(|| "Move execution aborted".to_string());
+                    tx_error = Some(first_chars(reason, MAX_ABORT_REASON_CHARS));
                     false
                 } else {
                     true
@@ -5561,7 +6377,7 @@ impl Executor {
         let sender_addr = match parse_move_address(&tx.sender) {
             Some(addr) => addr,
             None => {
-                println!("❌ Invalid sender address format");
+                log!("❌ Invalid sender address format");
                 return None;
             }
         };
@@ -5573,7 +6389,9 @@ impl Executor {
         // every other effect is dropped. Only a transaction the VM cannot
         // even charge is refused, which `can_pay` rules out.
         let staged = updates.clone();
-        let charged_abort = |reason: String| -> Option<(Vec<(String, Option<String>)>, u128)> {
+        let charged_abort = |cause: String| -> Option<(Vec<(String, Option<String>)>, u128)> {
+            // B342/B448: bounded once, for its log line, receipt and estimate.
+            let reason = first_chars(cause, MAX_ABORT_REASON_CHARS);
             let mut out = staged.clone();
             match self
                 .vm
@@ -5591,7 +6409,7 @@ impl Executor {
             if let Some(report) = report {
                 report.borrow_mut().aborted = Some(reason.clone());
             }
-            println!("❌ {} charged and aborted: {reason}", tx.sender);
+            log!("❌ {} charged and aborted: {}", tx.sender, reason);
             out.push(receipt_update(
                 &self.db,
                 tx_json,
@@ -5612,7 +6430,7 @@ impl Executor {
                 // but the objective says: "Hapus semua if tx.payload.starts_with...".
                 // However, we MUST NOT break the entire chain right now before we fix the CLI.
                 // Actually, the instruction was clear: Replace it entirely to enforce structured ABI.
-                println!(
+                log!(
                     "⚠️ REJECTED: Unrecognized payload format from {}. Must be hex-encoded BCS TransactionPayload. Err: {}",
                     tx.sender, e
                 );
@@ -5666,8 +6484,11 @@ impl Executor {
                 let leave_addr = extract_leave_validator(&call, &tx.sender);
                 // AUDIT-#5: capture an add_stake BEFORE the call is moved, so we
                 // can resync the staker's QC weight from the Move ValidatorSet
-                // after a successful stake increase.
-                let add_stake_addr = extract_add_stake(&call, &tx.sender);
+                // after a successful stake increase. G5 PA-3 (B464): and a
+                // reactivation, whose weight returns at once, so its node
+                // seeks its proof of boot before the boundary elects it.
+                let add_stake_addr = extract_add_stake(&call, &tx.sender)
+                    .or_else(|| extract_reactivate(&call, &tx.sender));
                 // ONBOARDING: a coin::transfer to an address that has never held
                 // AIN would abort inside coin::deposit, and that address can never
                 // fix it itself (registering costs gas, and gas is only taken from
@@ -5680,8 +6501,14 @@ impl Executor {
                 for tag in &call.ty_args {
                     deps::type_modules(tag, &mut roots);
                 }
+                // B412: and so is the protected-list refresh a join into a
+                // full set runs before the VM.
+                let refresh_gas = self.protected_refresh_gas(&call, &tx.sender);
                 let dependency_gas = match self.closure_in_block(roots) {
-                    Ok(closure) => closure.gas().saturating_add(pop_gas),
+                    Ok(closure) => closure
+                        .gas()
+                        .saturating_add(pop_gas)
+                        .saturating_add(refresh_gas.unwrap_or(0)),
                     Err(e) => return charged_abort(e),
                 };
                 let Some(vm_budget) = vm_limit.checked_sub(dependency_gas) else {
@@ -5689,7 +6516,10 @@ impl Executor {
                         "loading its modules costs {dependency_gas} gas, the limit leaves {vm_limit}"
                     ));
                 };
-                let prestaged = self.auto_register_writes(&call);
+                let mut prestaged = self.auto_register_writes(&call);
+                if refresh_gas.is_some() {
+                    prestaged.extend(self.protected_refresh_writes());
+                }
                 let mut actions = pre_actions.clone();
                 // SECURITY (FIX #1): the user's entry call may only act as the
                 // authenticated tx sender. bind_signer_args overwrites the
@@ -5709,7 +6539,7 @@ impl Executor {
                     Ok((gas_used, vm_changes, status)) => {
                         vm_gas_used = gas_used.saturating_add(dependency_gas);
                         if absorb_vm_result!(vm_changes, status, charged_abort) {
-                            println!("✅ Move EntryFunction executed by {}", tx.sender);
+                            log!("✅ Move EntryFunction executed by {}", tx.sender);
                             // B1: keep sys:validator_set:v1 live on runtime join.
                             if let Some(info) = join_v1_entry {
                                 if let Err(e) =
@@ -5732,7 +6562,7 @@ impl Executor {
                                         "validator removal on leave not staged: {e}"
                                     ));
                                 }
-                                println!(
+                                log!(
                                     "   🔻 Pruned departed validator {} from QC trust root",
                                     addr
                                 );
@@ -5748,7 +6578,7 @@ impl Executor {
                                 }
                             }
                         } else {
-                            println!(
+                            log!(
                                 "❌ EntryFunction aborted after gas charge: {}",
                                 tx_error
                                     .clone()
@@ -5789,7 +6619,10 @@ impl Executor {
                 // refused).
                 let dependency_gas = match deps::bundle_roots(&modules)
                     .and_then(|roots| self.closure_in_block(roots))
-                {
+                    // B343: and no struct it defines nests too deep.
+                    .and_then(|closure| {
+                        deps::check_struct_depths(&self.db, &modules).map(|()| closure)
+                    }) {
                     Ok(closure) => closure.gas(),
                     Err(e) => return charged_abort(e),
                 };
@@ -5814,9 +6647,9 @@ impl Executor {
                     Ok((gas_used, vm_changes, status)) => {
                         vm_gas_used = gas_used.saturating_add(dependency_gas);
                         if absorb_vm_result!(vm_changes, status, charged_abort) {
-                            println!("✅ Move module published by {}", tx.sender);
+                            log!("✅ Move module published by {}", tx.sender);
                         } else {
-                            println!(
+                            log!(
                                 "❌ Publish aborted after gas charge: {}",
                                 tx_error
                                     .clone()
@@ -5830,13 +6663,14 @@ impl Executor {
                 }
             }
             Ok(vm_move::TransactionPayload::Script(_)) => {
-                println!("🚫 [SECURITY] Raw script execution BLOCKED");
+                log!("🚫 [SECURITY] Raw script execution BLOCKED");
                 return None;
             }
             Err(e) => {
-                println!(
+                log!(
                     "⚠️ REJECTED: Failed to deserialize BCS TransactionPayload from {}: {}",
-                    tx.sender, e
+                    tx.sender,
+                    e
                 );
                 // Invalid format -> no gas charged
                 return None;
@@ -5846,7 +6680,29 @@ impl Executor {
         // B65: the writes cost their I/O and the state bytes they add, on
         // top of what Move execution used; a limit that does not cover both
         // aborts, charged.
-        let writes = state_gas::write_cost(&self.db, &updates);
+        let mut writes = state_gas::write_cost(&self.db, &updates);
+        if report.is_some() {
+            // Simulation deducts zero gas so it need not fund a block-sized
+            // limit. A real deduction changes the payer's CoinStore: include
+            // its history even when the simulated final value is unchanged.
+            // If the payload already changed it, write_cost counted it once.
+            let key = coin_store_key(parse_move_address(&payer_addr)?);
+            let old = self
+                .db
+                .get(&key)
+                .expect("CRITICAL: payer state read failed");
+            if old.is_some()
+                && updates
+                    .iter()
+                    .rev()
+                    .find(|(k, _)| k == &key)
+                    .is_some_and(|(_, value)| value.as_deref() == old.as_deref())
+            {
+                writes.io_gas = writes
+                    .io_gas
+                    .saturating_add(state_gas::history_gas(old.as_deref()));
+            }
+        }
         let needed = vm_gas_used
             .saturating_add(object_load_gas)
             .saturating_add(writes.gas(byte_gas));
@@ -5910,7 +6766,7 @@ mod tests {
         let mut seed = [0u8; 32];
         seed[0] = 7;
         let bls_pk = bls.pubkey_raw(&seed);
-        let bls_pop = bls.prove_possession_raw(&seed);
+        let bls_pop = bls.prove_possession_raw(&seed, &[1u8; 32]);
         assert_eq!(bls_pk.len(), 48);
         assert_eq!(bls_pop.len(), 96);
 
@@ -5949,7 +6805,8 @@ mod tests {
         assert!(bls
             .verify_possession(
                 &decoded2.validators[0].bls_public_key,
-                &decoded2.validators[0].bls_pop
+                &decoded2.validators[0].bls_pop,
+                &decoded2.validators[0].public_key
             )
             .unwrap());
     }
@@ -5990,11 +6847,52 @@ mod tests {
         assert_eq!(legacy, vec![(entry.address, entry.stake)]);
     }
 
+    /// B449 witness: a join never replaces a live set that does not decode
+    /// (nor its `sys:validators` mirror): it is refused, nothing staged. The
+    /// row read as empty, so the joiner alone became the live set, and at
+    /// the next boundary the committee: one key.
+    #[test]
+    fn a_join_never_replaces_a_live_set_that_does_not_decode() {
+        let db = temp_db("b449_undecodable_live_set");
+        let executor = Executor::new(db.clone());
+        let entry = ValidatorSetV1Entry {
+            address: "11111111111111111111111111111111".to_string(),
+            stake: 1000,
+            ed25519_public_key: "ed25519".to_string(),
+            bls_public_key: "bls_pk".to_string(),
+            bls_pop: "bls_pop".to_string(),
+        };
+        let _seed = db.seeding();
+        let mut updates = Vec::new();
+        db.put(validator_set_v1_key(), "not a validator set")
+            .unwrap();
+        let refused = executor
+            .append_validator_set_v1_update(&mut updates, entry.clone())
+            .expect_err("a live set that does not decode refuses the join");
+        assert!(refused.contains("does not decode"), "{refused}");
+        assert!(updates.is_empty(), "staged: {updates:?}");
+
+        db.put(validator_set_v1_key(), "[]").unwrap();
+        db.put("sys:validators", "{\"not\": \"a list\"}").unwrap();
+        let refused = executor
+            .append_validator_set_v1_update(&mut updates, entry.clone())
+            .expect_err("a mirror that does not decode refuses the join");
+        assert!(refused.contains("does not decode"), "{refused}");
+        assert!(updates.is_empty(), "staged: {updates:?}");
+
+        // Rows that decode take the joiner (the control).
+        db.put("sys:validators", "[]").unwrap();
+        executor
+            .append_validator_set_v1_update(&mut updates, entry)
+            .expect("the join is staged");
+        assert_eq!(updates.len(), 2);
+    }
+
     #[test]
     fn test_join_validator_requires_payload_public_key_to_match_tx_public_key() {
         let tx_public_key = vec![7u8; 32];
         let forged_public_key = vec![8u8; 32];
-        let (bls_public_key, bls_pop) = test_bls_identity(9);
+        let (bls_public_key, bls_pop) = test_bls_identity(9, &tx_public_key);
         let call = vm_move::EntryFunctionCall {
             module: move_core_types::language_storage::ModuleId::new(
                 system_address(),
@@ -6130,12 +7028,13 @@ mod tests {
     }
 
     /// Deterministic valid (bls_public_key, bls_pop) for test validator fixtures.
-    fn test_bls_identity(seed: u8) -> (Vec<u8>, Vec<u8>) {
+    /// B354: `owner` is the validator's Ed25519 key, which the PoP binds.
+    fn test_bls_identity(seed: u8, owner: &[u8]) -> (Vec<u8>, Vec<u8>) {
         let bls = crypto::bls::BLSEngine::consensus();
         let mut ikm = [0u8; 32];
         ikm[0] = seed;
         ikm[31] = seed.wrapping_add(3);
-        (bls.pubkey_raw(&ikm), bls.prove_possession_raw(&ikm))
+        (bls.pubkey_raw(&ikm), bls.prove_possession_raw(&ikm, owner))
     }
 
     #[derive(Serialize, Deserialize)]
@@ -6459,11 +7358,46 @@ mod tests {
         assert!(db.get("sys:validator_set:epoch:2").unwrap().is_some());
     }
 
+    /// B413 witness: the evidence age check reads the chain clock fail
+    /// closed. A clock row that does not decode read as time 0, so evidence
+    /// older than W passed the check on this node alone (a different
+    /// evidence root in its header). The RPC's reader stays fail-open.
+    /// B457: the clock is read where the check is asked (here, as a block
+    /// builder asks it), and passed to it.
+    #[test]
+    #[should_panic(expected = "the committed chain clock is corrupt")]
+    fn a_corrupt_clock_row_stops_the_evidence_age_check() {
+        let db = temp_db("b413_corrupt_clock");
+        let exec = Executor::new(Arc::clone(&db));
+        let _seed = db.seeding();
+        let clock_key =
+            vm_move::state_keys::resource_key_str(&system_address(), "0x1::chain::Clock");
+        // Epoch 1 began at tau 0: evidence of epoch 0 is too old past W.
+        db.put(&epoch_time_key(1), "0").unwrap();
+        let stale = ChainClock {
+            height: 0,
+            time: EVIDENCE_MAX_AGE_SECS + 1,
+            block_timestamp: 0,
+        };
+        db.put(&clock_key, &hex::encode(bcs::to_bytes(&stale).unwrap()))
+            .unwrap();
+        // An item of epoch 0: its age is checked before anything else of it.
+        let item = r#"{"kind":"equivocation_v4","offender":"x","epoch":0,"round":1}"#;
+        let err = exec
+            .verify_slash_evidence(item)
+            .expect_err("stale evidence");
+        assert!(err.contains("older than W"), "{err}");
+        // Hex, but one byte: not a ChainClock.
+        db.put(&clock_key, "00").unwrap();
+        assert_eq!(committed_chain_clock(&db).time, 0, "the RPC reads zero");
+        let _ = exec.verify_slash_evidence(item);
+    }
+
     /// A committee member with real keys: its Ed25519 key derives its address
     /// and its BLS proof of possession verifies.
     fn committee_member(seed: u8, stake: u64) -> blockchain::committee::ValidatorInfo {
         let key = SigningKey::from_bytes(&[seed; 32]);
-        let (bls_public_key, bls_pop) = test_bls_identity(seed);
+        let (bls_public_key, bls_pop) = test_bls_identity(seed, key.verifying_key().as_bytes());
         blockchain::committee::ValidatorInfo {
             address: crypto::derive_address(key.verifying_key().as_bytes()).unwrap(),
             stake,
@@ -7002,7 +7936,7 @@ mod tests {
     fn set_validator_set(db: &StateDB, validator: &str, stake: u128, total_supply: u128) {
         let _seed = db.seeding();
         let validator_addr = parse_move_address(validator).expect("validator move address");
-        let (bls_public_key, bls_pop) = test_bls_identity(1);
+        let (bls_public_key, bls_pop) = test_bls_identity(1, &[1, 2, 3]);
         let set = TestValidatorSet {
             validators: vec![TestValidatorConfig {
                 validator_addr,
@@ -7271,7 +8205,7 @@ mod tests {
         };
         let payload_struct = vm_move::TransactionPayload::EntryFunction(call);
         let payload = hex::encode(bcs::to_bytes(&payload_struct).unwrap());
-        let tx_json = signed_tx(&sender_key, &sender, &payload, 0, 100_000, 1);
+        let tx_json = signed_tx(&sender_key, &sender, &payload, 0, 300_000, 1);
         let (updates, gas) = executor
             .execute_transaction(&tx_json)
             .expect("transaction accepted");
@@ -7368,12 +8302,12 @@ mod tests {
         let _seed = db.seeding();
         db.set_federation_key("00000000000000000000000000000000")
             .unwrap();
-        set_coin_store(&db, &sender, 500_000);
+        set_coin_store(&db, &sender, 2_000_000);
 
         let executor = Executor::new(db.clone());
-        // Over-balance transfer -> payload aborts (see the note on the test above).
+        // Cover precharge/history so the over-balance payload itself aborts.
         let payload = coin_transfer_payload(&sender, &recipient, 999_999_999);
-        let tx_inline_1 = signed_tx(&sender_key, &sender, &payload, 0, 50_000, 1);
+        let tx_inline_1 = signed_tx(&sender_key, &sender, &payload, 0, 300_000, 1);
         let (updates, _gas) = executor
             .execute_transaction(&tx_inline_1)
             .expect("aborted transaction is still kept and charged");
@@ -7381,7 +8315,7 @@ mod tests {
 
         assert_eq!(
             coin_balance(&db, &sender),
-            500_000 - gas_of(&tx_inline_1) as u128,
+            2_000_000 - gas_of(&tx_inline_1) as u128,
             "gas must be deducted exactly once even though the payload aborted"
         );
     }
@@ -7445,6 +8379,190 @@ mod tests {
         );
     }
 
+    /// B447 witness: an estimate (a free RPC dry run) needs none of the VM's
+    /// threads, where a block's sessions run: with every one of them held, it
+    /// still returns. Its sessions ran there (B430), so two estimates held
+    /// them from blocks on a host with one or two.
+    #[test]
+    fn an_estimate_runs_off_the_block_threads() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Condvar, Mutex};
+        use std::time::{Duration, Instant};
+        let db = temp_db("b447_estimate_off_the_vm_threads");
+        load_stdlib(&db);
+        let sender_key = SigningKey::from_bytes(&[34u8; 32]);
+        let recipient_key = SigningKey::from_bytes(&[35u8; 32]);
+        let sender = create_account(&db, &sender_key);
+        let recipient = create_account(&db, &recipient_key);
+        let _seed = db.seeding();
+        db.set_federation_key("00000000000000000000000000000000")
+            .unwrap();
+        set_coin_store(&db, &sender, 1_000_000);
+        set_coin_store(&db, &recipient, 0);
+        let executor = Executor::new(db.clone());
+        let payload = coin_transfer_payload(&sender, &recipient, 100);
+        let tx = signed_tx(&sender_key, &sender, &payload, 0, 0, 1);
+
+        let vm_threads = vm_move::on_vm_threads(rayon::current_num_threads);
+        let released = (Mutex::new(false), Condvar::new());
+        let held = AtomicUsize::new(0);
+        let (all_held, estimate) = std::thread::scope(|scope| {
+            for _ in 0..vm_threads {
+                scope.spawn(|| {
+                    vm_move::on_vm_threads(|| {
+                        held.fetch_add(1, Ordering::SeqCst);
+                        let mut done = released.0.lock().unwrap_or_else(|e| e.into_inner());
+                        while !*done {
+                            done = released.1.wait(done).unwrap_or_else(|e| e.into_inner());
+                        }
+                    })
+                });
+            }
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while held.load(Ordering::SeqCst) < vm_threads && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let all_held = held.load(Ordering::SeqCst) == vm_threads;
+            let (answer, receiver) = std::sync::mpsc::channel();
+            let (executor, tx) = (&executor, &tx);
+            scope.spawn(move || {
+                let _ = answer.send(executor.estimate_gas(tx));
+            });
+            let estimate = receiver.recv_timeout(Duration::from_secs(30));
+            // Released before anything is asserted: a failure holds nothing.
+            *released.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            released.1.notify_all();
+            (all_held, estimate)
+        });
+        assert!(all_held, "vacuous: the VM's threads were not all held");
+        let estimate = estimate
+            .expect("the estimate waited for the VM's threads")
+            .expect("an estimate");
+        assert!(
+            estimate.aborted.is_none(),
+            "vacuous: {:?}",
+            estimate.aborted
+        );
+        assert!(estimate.execution_gas() > 0, "vacuous: nothing ran");
+    }
+
+    /// B448 witness: the names a payload chose come back cut. A call whose
+    /// function is 10,000 characters that are no identifier aborts with
+    /// move-vm's "Invalid identifier '...'", which came back whole in the
+    /// estimate, in the receipt and in two log lines on every node (the
+    /// lines print what the estimate reports). A call of `0x1::dex` echoed
+    /// its function and its type arguments in its receipt's metadata too,
+    /// inside `receipts_root`.
+    #[test]
+    fn names_a_payload_chose_come_back_cut() {
+        use move_core_types::identifier::Identifier;
+        use move_core_types::language_storage::{StructTag, TypeTag};
+        let db = temp_db("b448_echoed_names");
+        load_stdlib(&db);
+        let key = SigningKey::from_bytes(&[36u8; 32]);
+        let sender = create_account(&db, &key);
+        let _seed = db.seeding();
+        db.set_federation_key("00000000000000000000000000000000")
+            .unwrap();
+        set_coin_store(&db, &sender, 1_000_000_000);
+        let executor = Executor::new(db.clone());
+        let run = |payload: &str, seq: u64| -> (Option<String>, serde_json::Value) {
+            let estimate = executor
+                .estimate_gas(&signed_tx(&key, &sender, payload, seq, 0, 1))
+                .expect("an estimate");
+            let tx = signed_tx(&key, &sender, payload, seq, estimate.execution_gas(), 1);
+            let (updates, _) = executor
+                .execute_transaction(&tx)
+                .expect("charged and aborted");
+            apply_updates(&db, updates);
+            let receipt = db
+                .get(&format!("tx_receipt:{}", tx_hash_hex(&tx)))
+                .unwrap()
+                .expect("a receipt");
+            (estimate.aborted, serde_json::from_str(&receipt).unwrap())
+        };
+        let cut = |receipt: &serde_json::Value| {
+            assert_eq!(receipt["status"], "aborted", "{:.200}", receipt.to_string());
+            let error = receipt["error"].as_str().expect("an error");
+            assert!(
+                error.chars().count() <= MAX_ABORT_REASON_CHARS,
+                "an abort reason of {} characters",
+                error.chars().count()
+            );
+        };
+        let junk = "!".repeat(10_000);
+        let coin = entry_payload("coin", &junk, vec![aincore_coin_type()], vec![]);
+        let (aborted, receipt) = run(&coin, 0);
+        let aborted = aborted.expect("the call aborts");
+        assert!(
+            aborted.starts_with("invalid function identifier"),
+            "vacuous: {aborted:.80}"
+        );
+        assert!(
+            aborted.chars().count() <= MAX_ABORT_REASON_CHARS,
+            "an estimate's abort reason of {} characters",
+            aborted.chars().count()
+        );
+        cut(&receipt);
+        assert!(
+            receipt["metadata"].is_null(),
+            "{:.200}",
+            receipt.to_string()
+        );
+
+        // A dex call of no entry function has no dex metadata.
+        let dex = entry_payload(
+            "dex",
+            &junk,
+            vec![aincore_coin_type(), aincore_coin_type()],
+            vec![],
+        );
+        let (_, receipt) = run(&dex, 1);
+        cut(&receipt);
+        assert!(
+            receipt["metadata"].is_null(),
+            "{:.200}",
+            receipt.to_string()
+        );
+
+        // A swap's type arguments are echoed, each at most its bound.
+        let long = TypeTag::Struct(Box::new(StructTag {
+            address: system_address(),
+            module: Identifier::new("m").unwrap(),
+            name: Identifier::new("N".repeat(10_000)).unwrap(),
+            type_params: vec![],
+        }));
+        let to = bcs::to_bytes(&parse_move_address(&sender).unwrap()).unwrap();
+        let swap = entry_payload(
+            "dex",
+            "swap_x_to_y",
+            vec![long, aincore_coin_type()],
+            vec![
+                to.clone(),
+                to,
+                bcs::to_bytes(&1_000u128).unwrap(),
+                bcs::to_bytes(&900u128).unwrap(),
+            ],
+        );
+        let (_, receipt) = run(&swap, 2);
+        cut(&receipt);
+        assert_eq!(
+            receipt["metadata"]["function"],
+            "swap_x_to_y",
+            "{:.200}",
+            receipt.to_string()
+        );
+        let echoed = receipt["metadata"]["type_args"][0]
+            .as_str()
+            .expect("the first type argument");
+        assert!(echoed.starts_with("0x1::m::NNN"), "vacuous: {echoed:.80}");
+        assert_eq!(echoed.chars().count(), MAX_ECHOED_TYPE_CHARS);
+        assert_eq!(
+            receipt["metadata"]["type_args"][1],
+            "0x1::staking::AincoreCoin"
+        );
+    }
+
     /// The auto-registration must never touch an EXISTING balance — it may only
     /// create a store that is genuinely absent, and only ever with value 0.
     #[test]
@@ -7463,7 +8581,7 @@ mod tests {
 
         let executor = Executor::new(db.clone());
         let payload = coin_transfer_payload(&sender, &recipient, 23);
-        let tx_inline_2 = signed_tx(&sender_key, &sender, &payload, 0, 100_000, 1);
+        let tx_inline_2 = signed_tx(&sender_key, &sender, &payload, 0, 300_000, 1);
         let (updates, _gas) = executor
             .execute_transaction(&tx_inline_2)
             .expect("transaction accepted");
@@ -7937,7 +9055,7 @@ mod tests {
                 .iter()
                 .zip(1u8..)
                 .map(|((address, stake), bls_seed)| {
-                    let (bls_public_key, bls_pop) = test_bls_identity(bls_seed);
+                    let (bls_public_key, bls_pop) = test_bls_identity(bls_seed, &[1, 2, 3]);
                     TestValidatorConfig {
                         validator_addr: parse_move_address(address).unwrap(),
                         stake: TestCoin { value: *stake },
@@ -8513,6 +9631,105 @@ mod tests {
         g5_paid_block(&mut chain, validator, DAY, 1_000, 3_000, 1_200);
     }
 
+    /// B451 (G5 DL-2) through real blocks (R = 1, 7 s blocks): a pool's
+    /// part is sized by its frozen weight d, but only the principal still in
+    /// the pool earns it. A delegates 3,000 AIN in epoch 0, so epoch 1
+    /// splits 1,000 : 3,000 at 10 %; at 22 A takes 2,000 out, leaving
+    /// C = 1,000 AIN. The payout at 23 pays the pool r_e = floor(r_d x 1,000
+    /// / 3,000) less the commission on r_e, the validator its own part plus
+    /// that commission, and the reserve keeps the rest. Before, the 1,000
+    /// AIN left took all of r_d, three times the frozen rate, and the
+    /// commission was charged on all of it. A Move test cannot draw the
+    /// emission, so this is the only witness of the call in `pay_member`.
+    #[test]
+    fn g5_a_pool_pays_only_the_principal_still_at_stake() {
+        let ain = G5_AIN;
+        let (mut chain, validators, delegators) = delegation_chain(
+            "g5_dl_leavers",
+            1,
+            14,
+            &[(126, 1_000)],
+            &[(127, 10_000 * ain)],
+        );
+        let (validator_key, validator) = &validators[0];
+        let (a_key, _) = &delegators[0];
+        let db = chain.db.clone();
+
+        let enable = chain.tx(
+            validator_key,
+            "delegation",
+            "enable_delegation",
+            vec![bcs::to_bytes(&1_000u64).unwrap()],
+        );
+        chain.block(7, vec![enable]);
+        let join = chain.tx(
+            a_key,
+            "delegation",
+            "delegate",
+            vec![
+                move_addr_arg(validator),
+                bcs::to_bytes(&(3_000 * ain)).unwrap(),
+            ],
+        );
+        chain.block(14, vec![join]);
+        chain.run_blocks(18, 7);
+        assert_eq!(chain.height, 20);
+        assert_eq!(
+            g5_split_record(&db, 1),
+            Some(BTreeMap::from([(validator.clone(), 3_000)]))
+        );
+        // 21: the pool holds its weight and is paid the whole part.
+        g5_paid_block(&mut chain, validator, 7, 1_000, 3_000, 1_000);
+
+        // 22: A takes 2,000 of its 3,000 out (P = C, so exactly 2,000).
+        let leave = chain.tx(
+            a_key,
+            "delegation",
+            "undelegate",
+            vec![
+                move_addr_arg(validator),
+                bcs::to_bytes(&(2_000 * ain)).unwrap(),
+            ],
+        );
+        chain.block(chain.timestamp + 7, vec![leave]);
+        assert_eq!(pool_of(&db, validator).active_coins, 1_000 * ain);
+        assert_eq!(
+            g5_split_record(&db, 1),
+            Some(BTreeMap::from([(validator.clone(), 3_000)])),
+            "the split stays frozen for the epoch"
+        );
+
+        // 23, empty: the part is still sized by d = 3,000, and earned on
+        // the 1,000 AIN at stake only.
+        let e = g5_expected_emission(g5_minted(&db), 7);
+        let own = e * 1_000 / 4_000;
+        let part = e * 3_000 / 4_000;
+        let earned = g5_mul_div(part, 1_000 * ain, 3_000 * ain);
+        let commission = earned * 1_000 / 10_000;
+        assert!(earned > 0 && earned < part / 2, "the cap binds");
+        let (balance, rewards, supply) = (
+            coin_balance(&db, validator),
+            pool_of(&db, validator).rewards,
+            validator_set(&db).total_supply,
+        );
+        chain.run_blocks(1, 7);
+        assert_eq!(
+            coin_balance(&db, validator) - balance,
+            own + commission,
+            "own part and the commission on what the pool earned"
+        );
+        assert_eq!(
+            pool_of(&db, validator).rewards - rewards,
+            earned - commission,
+            "the pool is paid on its principal at stake"
+        );
+        assert_eq!(
+            validator_set(&db).total_supply - supply,
+            own + earned,
+            "the leavers' part stays in the reserve"
+        );
+    }
+
     /// Mirror of the Move `0x1::delegation::Offense` (G5 SL-5).
     #[derive(Serialize, Deserialize, Debug, Clone)]
     struct TestOffense {
@@ -8753,7 +9970,7 @@ mod tests {
         });
         let db = chain.db.clone();
         let join = |key: &SigningKey, sender: &str, seed: u8, stake: u128| {
-            let (bls_public_key, bls_pop) = test_bls_identity(seed);
+            let (bls_public_key, bls_pop) = test_bls_identity(seed, key.verifying_key().as_bytes());
             let payload = entry_payload(
                 "staking",
                 "join_validator_set",
@@ -8798,6 +10015,13 @@ mod tests {
     /// validator holding bootstrap weight, whatever its Move stake (0 for an
     /// operator that owns nothing). The joiner takes the smallest unprotected
     /// member's place; with every smaller member protected it is refused.
+    /// B389: once a live set exists, a join into a full set first rewrites
+    /// the list as the weights stand (`protected_now`: the bootstrap's
+    /// operators and the committee the live set elects), so the operators
+    /// are named by a bootstrap state, as genesis names them; a list written
+    /// by hand is replaced. Every member protected is left out: Move's scan
+    /// of a 1,000-entry list costs about 11.5 M gas, over `MAX_GAS_LIMIT`, so
+    /// such a join runs out of gas before its `found` check decides it.
     #[test]
     fn g5_a_full_set_never_displaces_a_bootstrap_operator() {
         let ain = G5_AIN;
@@ -8818,6 +10042,7 @@ mod tests {
             keys.push(G5Chain::account(db, 214, 10_000 * ain));
             keys.push(G5Chain::account(db, 215, 10_000 * ain));
             keys.push(G5Chain::account(db, 218, 10_000 * ain));
+            keys.push(G5Chain::account(db, 220, 10_000 * ain));
             let _seed = db.seeding();
             let set = TestValidatorSet {
                 validators: (0..1_000u32)
@@ -8845,20 +10070,34 @@ mod tests {
                 &hex::encode(bcs::to_bytes(&set).unwrap()),
             )
             .unwrap();
+            // 417 and 418 hold bootstrap weight, 500 AIN each: 417 owns
+            // nothing, and neither weighs as much as a 2,000 AIN member, so
+            // their seats are theirs as operators. The list is the one
+            // genesis writes: the operators.
+            let operator = |i: u32| BootstrapOperator {
+                address: hex::encode(address(i).into_bytes()),
+                entity: hex::encode(address(i).into_bytes()),
+                ceiling: 500,
+                weight: 500,
+                score: BOOTSTRAP_SCORE_SCALE,
+            };
+            let state = BootstrapState {
+                s_min: 1_000,
+                genesis_ceilings: 1_000,
+                full_since: None,
+                operators: vec![operator(417), operator(418)],
+            };
+            db.put(BOOTSTRAP_KEY, &serde_json::to_string(&state).unwrap())
+                .unwrap();
             db.put(
                 &bootstrap_protected_key(),
-                &hex::encode(
-                    bcs::to_bytes(&BootstrapProtected {
-                        validators: vec![address(417), address(418)],
-                    })
-                    .unwrap(),
-                ),
+                &hex::encode(bcs::to_bytes(&bootstrap_protected_of(&state)).unwrap()),
             )
             .unwrap();
         });
         let db = chain.db.clone();
         let join = |key: &SigningKey, sender: &str, seed: u8, stake: u128| {
-            let (bls_public_key, bls_pop) = test_bls_identity(seed);
+            let (bls_public_key, bls_pop) = test_bls_identity(seed, key.verifying_key().as_bytes());
             let payload = entry_payload(
                 "staking",
                 "join_validator_set",
@@ -8881,8 +10120,29 @@ mod tests {
                 .map(|c| c.validator_addr)
                 .collect()
         };
-        // 1,100 beats the protected 0 and 1,000 but not the unprotected 1,200.
-        chain.run_to(1, vec![join(&small_key, &small, 216, 1_100 * ain)]);
+        // Refused by the full-set check (`EMAX_VALIDATORS`, invalid_state
+        // 9), not by gas or any other abort.
+        let refused = |raw: &str| {
+            let receipt: serde_json::Value = serde_json::from_str(
+                &db.get(&format!("tx_receipt:{}", tx_hash_hex(raw)))
+                    .unwrap()
+                    .expect("a receipt"),
+            )
+            .unwrap();
+            assert_eq!(receipt["status"], "aborted", "{receipt}");
+            assert!(
+                receipt["error"]
+                    .as_str()
+                    .is_some_and(|e| e.contains("ABORTED with sub status 196617 at")),
+                "{receipt}"
+            );
+        };
+        // No live set yet (a join writes it), so Move reads the list genesis
+        // wrote. 1,100 beats the protected 0 and 1,000 but not the
+        // unprotected 1,200.
+        let small_join = join(&small_key, &small, 216, 1_100 * ain);
+        chain.run_to(1, vec![small_join.clone()]);
+        refused(&small_join);
         assert!(!members(&db).contains(&parse_move_address(&small).unwrap()));
         assert_eq!(members(&db).len(), 1_000);
         // 1,500 takes the place of 419, the smallest unprotected member.
@@ -8891,24 +10151,211 @@ mod tests {
         assert!(now.contains(&parse_move_address(&larger).unwrap()));
         assert!(now.contains(&address(417)) && now.contains(&address(418)));
         assert!(!now.contains(&address(419)));
-        // With every member protected, a joiner is refused whatever its stake.
-        {
+        // That join wrote the live set, so from here a join into the full
+        // set refreshes the list first (B389): the operators, and the
+        // committee the live set elects, `larger`. 1,600 beats only members
+        // it protects (0, 1,000 and 1,500): refused.
+        let (mid_key, mid) = keys[3].clone();
+        let mid_join = join(&mid_key, &mid, 221, 1_600 * ain);
+        chain.run_to(3, vec![mid_join.clone()]);
+        refused(&mid_join);
+        assert_eq!(members(&db), now, "nobody displaced");
+        // A joiner with more than any member still takes only an unprotected
+        // seat: the first 2,000 AIN member's, never an operator's.
+        let (rich_key, rich) = keys[2].clone();
+        chain.run_to(4, vec![join(&rich_key, &rich, 219, 5_000 * ain)]);
+        let after = members(&db);
+        assert_eq!(after.len(), 1_000);
+        assert!(after.contains(&parse_move_address(&rich).unwrap()));
+        assert!(after.contains(&address(417)) && after.contains(&address(418)));
+        assert!(after.contains(&parse_move_address(&larger).unwrap()));
+        let queue = validator_set(&db).unbonding_queue;
+        assert_eq!(queue.len(), 2);
+        assert_eq!(
+            (queue[1].validator_addr, queue[1].stake),
+            (address(0), 2_000 * ain)
+        );
+        // The list that join refreshed before it ran: the operators and the
+        // member the live set elected.
+        let mut expected = [
+            address(417),
+            address(418),
+            parse_move_address(&larger).unwrap(),
+        ];
+        expected.sort();
+        let expected: Vec<String> = expected
+            .iter()
+            .map(|a| hex::encode(a.into_bytes()))
+            .collect();
+        assert_eq!(protected_of(&db), expected);
+    }
+
+    /// B389 witness: a join into a full set never displaces a member the
+    /// next boundary would elect on its pool, though the protected list was
+    /// written before its pool grew. 419 owns the least unprotected stake
+    /// (1,200) but holds a 5M AIN pool: the 1,500 AIN joiner displaced it.
+    #[test]
+    fn g5_a_full_set_never_displaces_a_member_its_pool_would_elect() {
+        let ain = G5_AIN;
+        let address = |i: u32| {
+            let mut a = [0u8; 32];
+            a[..4].copy_from_slice(&i.to_le_bytes());
+            a[31] = 0xef;
+            move_core_types::account_address::AccountAddress::new(a)
+        };
+        let stake_of = |i: u32| match i {
+            417 => 0,
+            418 => 1_000,
+            419 => 1_200,
+            _ => 2_000,
+        };
+        let pooled = hex::encode(address(419).into_bytes());
+        let mut keys = vec![];
+        let mut chain = G5Chain::new("b389_pool_protected", DAY, |db| {
+            keys.push(G5Chain::account(db, 215, 10_000 * ain));
             let _seed = db.seeding();
+            let set = TestValidatorSet {
+                validators: (0..1_000u32)
+                    .map(|i| TestValidatorConfig {
+                        validator_addr: address(i),
+                        stake: TestCoin {
+                            value: stake_of(i) * ain,
+                        },
+                        public_key: vec![1, 2, 3],
+                        bls_public_key: {
+                            let mut k = vec![0u8; 48];
+                            k[..4].copy_from_slice(&i.to_le_bytes());
+                            k[47] = 1;
+                            k
+                        },
+                        bls_pop: vec![0u8; 96],
+                    })
+                    .collect(),
+                unbonding_queue: vec![],
+                total_supply: 10_000_000 * ain,
+                current_epoch: 0,
+            };
+            db.put(
+                &validator_set_key(),
+                &hex::encode(bcs::to_bytes(&set).unwrap()),
+            )
+            .unwrap();
+            // The list the last boundary wrote: 419's pool grew since.
             db.put(
                 &bootstrap_protected_key(),
                 &hex::encode(
                     bcs::to_bytes(&BootstrapProtected {
-                        validators: now.clone(),
+                        validators: vec![address(417), address(418)],
                     })
                     .unwrap(),
                 ),
             )
             .unwrap();
-        }
-        let (rich_key, rich) = keys[2].clone();
-        chain.run_to(3, vec![join(&rich_key, &rich, 219, 5_000 * ain)]);
-        assert!(!members(&db).contains(&parse_move_address(&rich).unwrap()));
-        assert_eq!(members(&db), now, "nobody displaced");
+            let live = vec![ValidatorSetV1Entry {
+                address: pooled.clone(),
+                stake: 1_200,
+                ed25519_public_key: "ab".repeat(32),
+                bls_public_key: "cd".repeat(48),
+                bls_pop: "ef".repeat(96),
+            }];
+            db.put(
+                validator_set_v1_key(),
+                &serde_json::to_string(&live).unwrap(),
+            )
+            .unwrap();
+            set_pool(db, &pooled, &open_pool(5_000_000 * ain));
+        });
+        let db = chain.db.clone();
+        let (key, joiner) = keys[0].clone();
+        let (bls_public_key, bls_pop) = test_bls_identity(217, key.verifying_key().as_bytes());
+        let join_with = |stake: u128, nonce: u64, execution: u64| {
+            let payload = entry_payload(
+                "staking",
+                "join_validator_set",
+                vec![],
+                vec![
+                    bcs::to_bytes(&parse_move_address(&joiner).unwrap()).unwrap(),
+                    bcs::to_bytes(&stake).unwrap(),
+                    bcs::to_bytes(&key.verifying_key().to_bytes().to_vec()).unwrap(),
+                    bcs::to_bytes(&bls_public_key).unwrap(),
+                    bcs::to_bytes(&bls_pop).unwrap(),
+                ],
+            );
+            signed_tx(&key, &joiner, &payload, nonce, execution, 1)
+        };
+        let join = |stake: u128, nonce: u64| join_with(stake, nonce, 10_000_000);
+        // B400 witness: a join that cannot displace anyone (no stake, or
+        // more than the sender holds; Move refuses both at once) does no
+        // refresh. It ran for every such join, paid by no gas, and its write
+        // outlived the abort.
+        let before = protected_of(&db);
+        chain.run_to(1, vec![join(0, 0)]);
+        chain.run_to(2, vec![join(20_000 * ain, 1)]);
+        assert_eq!(
+            protected_of(&db),
+            before,
+            "a join that cannot displace anyone refreshed the list"
+        );
+        chain.run_to(3, vec![join(1_500 * ain, 2)]);
+        let members: Vec<_> = validator_set(&db)
+            .validators
+            .iter()
+            .map(|c| c.validator_addr)
+            .collect();
+        assert!(
+            members.contains(&address(419)),
+            "the member its pool would elect was displaced"
+        );
+        assert!(protected_of(&db).contains(&pooled));
+
+        // B412 witness: the refresh is charged with the join's dependencies,
+        // before it runs. The set is still full and the joiner holds 1,500
+        // AIN, so another join of 1,500 passes B400's filter; it cannot
+        // displace anyone (it is a member now), and its refresh was unpaid.
+        // A limit that covers the modules and the PoP check but not the
+        // refresh charges and aborts it; a join with no stake runs no
+        // refresh and is not charged one.
+        assert_eq!(validator_set(&db).validators.len(), 1_000);
+        let row = |key: &str| db.get(key).unwrap().map_or(0, |raw| raw.len() as u64);
+        let read = 2 * row(&validator_set_key()) + row(validator_set_v1_key()) + row(BOOTSTRAP_KEY);
+        let refresh = (1_000 + 3) * OBJECT_LOAD_GAS + read.div_ceil(deps::DEPENDENCY_BYTES_PER_GAS);
+        let staking = move_core_types::language_storage::ModuleId::new(
+            move_core_types::account_address::AccountAddress::ONE,
+            move_core_types::identifier::Identifier::new("staking").unwrap(),
+        );
+        let needed = chain.executor.closure_in_block([staking]).unwrap().gas() + admission::POP_GAS;
+        let error = |raw: &str| -> String {
+            let receipt: serde_json::Value = serde_json::from_str(
+                &db.get(&format!("tx_receipt:{}", tx_hash_hex(raw)))
+                    .unwrap()
+                    .expect("a receipt"),
+            )
+            .unwrap();
+            assert_eq!(receipt["status"], "aborted", "{receipt}");
+            receipt["error"].as_str().unwrap_or_default().to_string()
+        };
+        let before = protected_of(&db);
+        let short = join_with(1_500 * ain, 3, needed + refresh - 1);
+        // Pay the history precharge, but still leave one gas too little
+        // for a refresh. Zero stake must reach Move's stake guard instead.
+        let unstaked = join_with(0, 4, needed + refresh - 1);
+        chain.run_to(4, vec![short.clone()]);
+        chain.run_to(5, vec![unstaked.clone()]);
+        let why = error(&short);
+        assert!(
+            why.contains(&format!("costs {} gas", needed + refresh)),
+            "the refresh is charged: {why}"
+        );
+        let why = error(&unstaked);
+        assert!(
+            why.contains("ABORTED with sub status 65539 at"),
+            "zero stake reaches the Move guard, not the refresh charge: {why}"
+        );
+        assert_eq!(
+            protected_of(&db),
+            before,
+            "a charged abort refreshes nothing"
+        );
     }
 
     /// G5 SL-4 across epochs (review: only same-epoch correlation was
@@ -9328,6 +10775,58 @@ mod tests {
         );
     }
 
+    /// B392 witness: the own side of a slash is cut from what the operator
+    /// had at stake in the offense's epoch (1,000 AIN and the part of an AIN
+    /// its whole-AIN weight drops), not from its stake now: 5,000 AIN added
+    /// after the epoch began was burned with it (own fraction 100 %).
+    #[test]
+    fn g5_own_stake_is_cut_by_what_it_had_at_stake() {
+        let ain = G5_AIN;
+        let mut seeds: Vec<(u8, u64)> = (180..185).map(|seed| (seed, 3_000)).collect();
+        seeds.push((185u8, 1_000u64));
+        let (mut chain, validators, delegators) =
+            delegation_chain("b392_own_cut", 1, DAY, &seeds, &[(186, 3_100 * ain)]);
+        let db = chain.db.clone();
+        let (v6_key, v6) = &validators[5];
+        let (a_key, _) = &delegators[0];
+        let open = chain.tx(
+            v6_key,
+            "delegation",
+            "enable_delegation",
+            vec![bcs::to_bytes(&0u64).unwrap()],
+        );
+        chain.run_to(1, vec![open]);
+        let delegate = chain.tx(
+            a_key,
+            "delegation",
+            "delegate",
+            vec![move_addr_arg(v6), bcs::to_bytes(&(3_000 * ain)).unwrap()],
+        );
+        chain.run_to(2, vec![delegate]);
+        chain.run_to(20, vec![]);
+        // Epoch 1 has begun: this stake weighs nothing in its committee.
+        set_coin_store(&db, v6, 5_100 * ain);
+        let add = chain.tx(
+            v6_key,
+            "staking",
+            "add_stake",
+            vec![bcs::to_bytes(&(5_000 * ain)).unwrap()],
+        );
+        chain.run_to(21, vec![add]);
+        g5_report(&chain, v6, 1, 21);
+        chain.run_to(49, vec![]);
+        assert!(g5_offense(&db, v6).settled, "vacuous: not settled");
+        let left: u128 = g5_own_unbonding(&db, v6)
+            .iter()
+            .map(|(_, stake)| *stake)
+            .sum();
+        assert_eq!(
+            left,
+            (6_000 - 1_001) * ain,
+            "own stake added after the epoch began was cut"
+        );
+    }
+
     /// B161 witness: a certificate conflict that moves an offense's scope to
     /// an earlier epoch takes that epoch's split, what the pool had at stake
     /// there (it kept the later offense's: a pool that grew between the two
@@ -9371,6 +10870,62 @@ mod tests {
             raised.delegated_weight, 0,
             "the raise kept the later epoch's split"
         );
+    }
+
+    /// B374 witness: a boundary protects every member of the committee it
+    /// elects, not only the bootstrap's operators. Move displaces the member
+    /// with the least own stake; one with 1,000 AIN of its own and a 3,000
+    /// AIN pool, in the committee at 4,000, was displaced by any joiner with
+    /// a little more than 1,000 (its pool's weight left with it).
+    #[test]
+    fn g5_a_boundary_protects_the_committee_it_elects() {
+        let ain = G5_AIN;
+        let mut seeds: Vec<(u8, u64)> = (197..202).map(|seed| (seed, 3_000)).collect();
+        seeds.push((202u8, 1_000u64));
+        let (mut chain, validators, delegators) =
+            delegation_chain("b374_protect", 1, DAY, &seeds, &[(203, 3_100 * ain)]);
+        let db = chain.db.clone();
+        let (v6_key, v6) = &validators[5];
+        let (d_key, _) = &delegators[0];
+        let open = chain.tx(
+            v6_key,
+            "delegation",
+            "enable_delegation",
+            vec![bcs::to_bytes(&0u64).unwrap()],
+        );
+        chain.run_to(1, vec![open]);
+        let delegate = chain.tx(
+            d_key,
+            "delegation",
+            "delegate",
+            vec![move_addr_arg(v6), bcs::to_bytes(&(3_000 * ain)).unwrap()],
+        );
+        chain.run_to(2, vec![delegate]);
+        chain.run_to(21, vec![]);
+        let weight = g5_committee(&db, 1)
+            .into_iter()
+            .find(|(a, _)| a == v6)
+            .map(|(_, w)| w);
+        assert_eq!(weight, Some(4_000), "vacuous: the pool did not weigh");
+        let own = |a: &str| {
+            validator_set(&db)
+                .validators
+                .iter()
+                .find(|c| hex::encode(c.validator_addr.into_bytes()) == a)
+                .map(|c| c.stake.value)
+        };
+        assert!(
+            validators.iter().all(|(_, a)| own(a) >= own(v6)),
+            "vacuous: another member owns less"
+        );
+        let protected = protected_of(&db);
+        assert!(
+            protected.contains(v6),
+            "the pool-heavy member is unprotected"
+        );
+        assert!(g5_committee(&db, 1)
+            .iter()
+            .all(|(a, _)| protected.contains(a)));
     }
 
     /// G5 SL-3 and SL-5 (tombstone and refusals): a second offense by the
@@ -9424,7 +10979,7 @@ mod tests {
             .any(|c| c.validator_addr == parse_move_address(v1).unwrap()));
 
         let join = |chain: &mut G5Chain, key: &SigningKey, seed: u8| {
-            let (bls_public_key, bls_pop) = test_bls_identity(seed);
+            let (bls_public_key, bls_pop) = test_bls_identity(seed, key.verifying_key().as_bytes());
             chain.tx(
                 key,
                 "staking",
@@ -9655,6 +11210,60 @@ mod tests {
             .verify_slash_evidence(&item(&a1, &b1))
             .unwrap_err();
         assert!(refused.contains("jailed already"), "{refused}");
+    }
+
+    /// B457 witness: a block's evidence is judged at the clock its builder
+    /// judged it at, its parent's. Epoch 1 begins at 20 d, so evidence of
+    /// epoch 0 is good until 27 d exactly: the builder of the next block,
+    /// on the state at 27 d, carries it, and that block (at 28 d) applies
+    /// it. Judged at the block's own clock, it took one of the block's
+    /// evidence slots and was refused on every node.
+    #[test]
+    fn evidence_is_judged_at_the_clock_its_builder_judged_it_at() {
+        let seeds: Vec<(u8, u64)> = (190..194).map(|seed| (seed, 1_000)).collect();
+        let (mut chain, validators, _) =
+            delegation_chain("b457_evidence_clock", 20, DAY, &seeds, &[]);
+        let db = chain.db.clone();
+        let gi = "b457-evidence-clock-genesis";
+        {
+            let _seed = db.seeding();
+            db.put("genesis_identity", gi).unwrap();
+        }
+        let (key, offender) = (&validators[1].0, validators[1].1.clone());
+        let item = consensus_evidence_item(
+            &g5_v4_vertex(key, 0, 5, "a", gi),
+            &g5_v4_vertex(key, 0, 5, "b", gi),
+        );
+        chain.run_to(27, vec![]);
+        assert_eq!(chain.clock().time, 27 * DAY);
+        // The builder's verdict, on its parent's state.
+        assert!(chain.executor.verify_slash_evidence(&item).is_ok());
+        let height = chain.height + 1;
+        chain.height = height;
+        chain.timestamp += DAY;
+        let proposer = chain.proposer.clone();
+        match chain.executor.execute_block_parallel_at(
+            vec![],
+            &proposer,
+            height,
+            chain.timestamp,
+            0,
+            &[item],
+            &[],
+        ) {
+            BlockExecOutcome::Executed(_) => {}
+            other => panic!("the block must execute: {other:?}"),
+        }
+        assert_eq!(
+            chain.clock().time,
+            28 * DAY,
+            "vacuous: the block's own clock is past W"
+        );
+        assert_eq!(g5_offense(&db, &offender).epoch, 0);
+        assert!(db
+            .get(&format!("validator:jailed:{offender}"))
+            .unwrap()
+            .is_some());
     }
 
     /// G5 review: a block's evidence is deduplicated by whom it convicts, not
@@ -9897,7 +11506,7 @@ mod tests {
         assert!(err.contains("BLS key"), "{err}");
         let (joiner_key, joiner) = &delegators[0];
         let active_key = validator_set(&db).validators[0].bls_public_key.clone();
-        let (_, pop) = test_bls_identity(1);
+        let (_, pop) = test_bls_identity(1, joiner_key.verifying_key().as_bytes());
         let join = chain.tx(
             joiner_key,
             "staking",
@@ -9920,11 +11529,9 @@ mod tests {
         let _ = validators;
     }
 
-    /// The item a V4 node carries for twins (consensus `v4::evidence`).
     /// B184 witness: a join pays at execution for its proof-of-possession
-    /// check with the modules it loads: one gas short of both, it aborts,
-    /// charged, before the VM runs (the check's gas was not counted, so a
-    /// join ran on the gas of its modules alone).
+    /// check with the modules it loads. One gas short never executes: the
+    /// history precharge may refuse it even before the charged-abort path.
     #[test]
     fn a_join_pays_for_its_proof_of_possession_check() {
         let ain = G5_AIN;
@@ -9933,7 +11540,7 @@ mod tests {
             keys.push(G5Chain::account(db, 214, 10_000 * ain));
         });
         let (key, sender) = keys[0].clone();
-        let (bls_public_key, bls_pop) = test_bls_identity(214);
+        let (bls_public_key, bls_pop) = test_bls_identity(214, key.verifying_key().as_bytes());
         let payload = entry_payload(
             "staking",
             "join_validator_set",
@@ -9953,6 +11560,24 @@ mod tests {
         let modules = chain.executor.closure_in_block([staking]).unwrap().gas();
         let needed = modules + admission::POP_GAS;
         let short = signed_tx(&key, &sender, &payload, 0, needed - 1, 1);
+        let estimate = chain.executor.estimate_gas(&short).expect("simulation runs");
+        assert!(
+            estimate.vm_gas >= needed,
+            "execution must include modules and the PoP check: {estimate:?}"
+        );
+        let parsed: Transaction = serde_json::from_str(&short).unwrap();
+        if precharge_gas(&chain.db, &parsed).unwrap() > needed - 1 {
+            let before = coin_balance(&chain.db, &sender);
+            assert!(chain.executor.execute_transaction(&short).is_none());
+            assert_eq!(coin_balance(&chain.db, &sender), before);
+            assert_eq!(committed_sequence_number(&chain.db, &sender), 0);
+            assert!(chain
+                .db
+                .get(&format!("tx_receipt:{}", tx_hash_hex(&short)))
+                .unwrap()
+                .is_none());
+            return;
+        }
         chain.run_to(1, vec![short.clone()]);
         let receipt: serde_json::Value = serde_json::from_str(
             &chain
@@ -10317,7 +11942,7 @@ mod tests {
             .iter()
             .zip(1u8..)
             .map(|((_, address), bls_seed)| {
-                let (bls_public_key, bls_pop) = test_bls_identity(bls_seed);
+                let (bls_public_key, bls_pop) = test_bls_identity(bls_seed, &[1, 2, 3]);
                 TestValidatorConfig {
                     validator_addr: parse_move_address(address).unwrap(),
                     stake: TestCoin { value: stake },
@@ -10815,7 +12440,7 @@ mod tests {
         // Whole AIN held, gas (a fraction of one AIN) rounded away.
         let held = |db: &StateDB, who: &str| coin_balance(db, who).div_ceil(ain);
         let join = |chain: &mut G5Chain, key: &SigningKey, seed: u8, stake: u128| {
-            let (bls_public_key, bls_pop) = test_bls_identity(seed);
+            let (bls_public_key, bls_pop) = test_bls_identity(seed, key.verifying_key().as_bytes());
             chain.tx(
                 key,
                 "staking",
@@ -10984,6 +12609,33 @@ mod tests {
             .collect()
     }
 
+    /// BW-12, B374: the protected list a boundary writes: the bootstrap's
+    /// operators and the top of the live set by stake (EP-2's committee).
+    fn expected_protected(db: &StateDB) -> Vec<String> {
+        let live: Vec<ValidatorSetV1Entry> =
+            serde_json::from_str(&db.get(validator_set_v1_key()).unwrap().unwrap()).unwrap();
+        let elected: Vec<String> = blockchain::committee::top_by_stake(
+            &live
+                .iter()
+                .map(|e| blockchain::committee::ValidatorInfo {
+                    address: e.address.clone(),
+                    stake: e.stake,
+                    ed25519_public_key: e.ed25519_public_key.clone(),
+                    bls_public_key: e.bls_public_key.clone(),
+                    bls_pop: e.bls_pop.clone(),
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_iter()
+        .map(|m| m.address)
+        .collect();
+        protected_list(read_bootstrap(db).as_ref(), &elected)
+            .validators
+            .iter()
+            .map(|a| hex::encode(a.into_bytes()))
+            .collect()
+    }
+
     fn live_weight(db: &StateDB, address: &str) -> Option<u64> {
         let live: Vec<ValidatorSetV1Entry> =
             serde_json::from_str(&db.get(validator_set_v1_key()).unwrap().unwrap()).unwrap();
@@ -11109,7 +12761,7 @@ mod tests {
         assert_eq!(boot.weight_of(&addr(151)), 1_950, "regrown, against C0");
         assert_eq!(boot.total(), 7_800);
         assert!(!protected_of(&db).contains(&addr(152)));
-        assert_eq!(protected_of(&db).len(), 4);
+        assert_eq!(protected_of(&db), expected_protected(&db));
         let committee_total: u64 = g5_committee(&db, 3).iter().map(|(_, w)| *w).sum();
         assert_eq!(committee_total, 13_050, "b's whole weight left");
 
@@ -11126,7 +12778,7 @@ mod tests {
             "not ended: held for minutes, not U"
         );
         assert!(boot.full_since.is_some());
-        assert_eq!(protected_of(&db).len(), 4);
+        assert_eq!(protected_of(&db), expected_protected(&db));
         assert_eq!(weight(&db, 4, 151), 2_250);
         // d leaves before U: P = 9,125, the bootstrap regrows.
         let leaver = SigningKey::from_bytes(&[154; 32]);
@@ -11193,7 +12845,11 @@ mod tests {
         assert_eq!(bootstrap_of(&db).operators.len(), 4, "20 days is not U");
         chain.run_blocks(100 - chain.height, DAY);
         assert!(bootstrap_of(&db).operators.is_empty(), "ended after U");
-        assert!(protected_of(&db).is_empty());
+        assert_eq!(
+            protected_of(&db),
+            expected_protected(&db),
+            "only the committee once the bootstrap ended"
+        );
         let leaver = SigningKey::from_bytes(&[143; 32]);
         let tx = chain.tx(&leaver, "staking", "leave_validator_set", vec![]);
         chain.run_to(101, vec![tx]);
@@ -11587,8 +13243,8 @@ mod tests {
         );
         assert_eq!(boot.operators.len(), 3);
         let protected = protected_of(&db);
-        assert!(!protected.contains(&committee_member(161, 0).address));
         assert!(protected.contains(&committee_member(163, 0).address));
+        assert_eq!(protected, expected_protected(&db));
     }
 
     /// G5 A4 BW-6: blocks follow the leader schedule; an offline operator's
@@ -11881,6 +13537,389 @@ mod tests {
         }
         let (n, led) = expected[&offline];
         assert!(led == 1 && n > 1, "H_1 is its one commit of {n} slots");
+    }
+
+    /// B464 witness (G5 PA-2, emission): a payout pays each member pot x w
+    /// / W times its participation in the period paid, the committed
+    /// vertices it authored over the rounds the period's blocks closed; the
+    /// rest stays in the reserve. D takes no part in the period (0, 10] and
+    /// is paid nothing (it was paid in full before); in (10, 20] it is
+    /// online from block 16 and is paid that share of its part. A, B and C
+    /// author every round and are paid in full.
+    #[test]
+    fn b464_emission_pays_each_member_by_its_participation() {
+        let supply = 1_000_000 * G5_AIN;
+        let members = [
+            committee_member(211, 100),
+            committee_member(212, 100),
+            committee_member(213, 100),
+            committee_member(214, 100),
+        ];
+        let d = members[3].address.clone();
+        let mut chain = G5Chain::with_period("b464_emission", 10, 14, |db| {
+            seed_committee_chain(db, &members, supply)
+        });
+        chain.offline = Some([d.clone()].into_iter().collect());
+        let db = chain.db.clone();
+        let part = |e: u128| e * 100 / 400;
+        // The payout at 10 covers 70 s.
+        chain.run_blocks(10, 7);
+        let first = part(g5_expected_emission(supply, 70));
+        assert!(first > 0);
+        for m in &members[..3] {
+            assert_eq!(coin_balance(&db, &m.address), first);
+        }
+        assert_eq!(coin_balance(&db, &d), 0, "D took no part in the period");
+        let minted = validator_set(&db).total_supply;
+        assert_eq!(minted, supply + 3 * first, "D's part stays in the reserve");
+
+        // (10, 20]: D is online from block 16.
+        let from = chain.last_round;
+        chain.run_blocks(5, 7);
+        let joined = chain.last_round;
+        chain.offline = Some(Default::default());
+        chain.run_blocks(4, 7);
+        let before: Vec<u128> = members
+            .iter()
+            .map(|m| coin_balance(&db, &m.address))
+            .collect();
+        chain.run_blocks(1, 7);
+        let rounds = (chain.last_round - from) as u128;
+        let ppm = (chain.last_round - joined) as u128 * 1_000_000 / rounds;
+        assert!(ppm > 0 && ppm < 1_000_000, "{ppm}");
+        let second = part(g5_expected_emission(minted, 70));
+        let paid: Vec<u128> = members
+            .iter()
+            .zip(&before)
+            .map(|(m, b)| coin_balance(&db, &m.address) - b)
+            .collect();
+        assert_eq!(paid, [second, second, second, second * ppm / 1_000_000]);
+        assert_eq!(
+            validator_set(&db).total_supply,
+            minted + paid.iter().sum::<u128>()
+        );
+    }
+
+    /// B464 witness (G5 PA-2, fees): a block's fees are shared by each
+    /// member's participation in the last reward period paid. D took no
+    /// part in (0, 10], so it gets nothing of block 11's fees (before, a
+    /// quarter of the pool), while A, B and C get their shares.
+    #[test]
+    fn b464_fees_pay_each_member_by_its_last_period() {
+        let supply = 1_000_000 * G5_AIN;
+        let members = [
+            committee_member(221, 100),
+            committee_member(222, 100),
+            committee_member(223, 100),
+            committee_member(224, 100),
+        ];
+        let d = members[3].address.clone();
+        let mut keys = vec![];
+        let mut chain = G5Chain::with_period("b464_fees", 10, 14, |db| {
+            seed_committee_chain(db, &members, supply);
+            keys.push(G5Chain::account(db, 225, 10 * G5_AIN));
+        });
+        let (payer_key, payer) = keys.pop().unwrap();
+        chain.offline = Some([d.clone()].into_iter().collect());
+        let db = chain.db.clone();
+        let balances = |db: &StateDB| -> Vec<u128> {
+            members
+                .iter()
+                .map(|m| coin_balance(db, &m.address))
+                .collect()
+        };
+        chain.run_blocks(10, 7);
+        let before = balances(&db);
+        // Price 2 over the base fee of 1 leaves a tip to share (B15). D is
+        // still offline, so it does not lead block 11.
+        let pay = signed_tx(
+            &payer_key,
+            &payer,
+            &coin_transfer_payload(&payer, &chain.proposer, 1),
+            0,
+            100_000,
+            2,
+        );
+        chain.block(chain.timestamp + 7, vec![pay]);
+        let after = balances(&db);
+        assert_eq!(after[3], before[3], "D took no part in the last period");
+        for (i, (now, then)) in after.iter().zip(&before).take(3).enumerate() {
+            assert!(now > then, "member {i} earns its share of block 11's fees");
+        }
+    }
+
+    /// B464 witness (G5 PA-3): a member that authors committed vertices in
+    /// under half the rounds of two committee epochs in a row leaves the
+    /// next committee, unslashed and still bonded, and returns through
+    /// `staking::reactivate`; one low epoch (RC-3's abstention, B441) never
+    /// removes a member. D is silent in epochs 0 and 1, C in epoch 0 only,
+    /// B in epoch 1 only: at H_1 only D leaves, and C_2 holds A, B and C.
+    /// D reactivates in epoch 2: its live weight returns at once, and C_3
+    /// holds it again.
+    #[test]
+    fn b464_a_member_silent_two_epochs_leaves_the_committee_until_it_reactivates() {
+        let supply = 1_000_000 * G5_AIN;
+        let members = [
+            committee_member(231, 100),
+            committee_member(232, 100),
+            committee_member(233, 100),
+            committee_member(234, 100),
+        ];
+        let (b, c, d) = (
+            members[1].address.clone(),
+            members[2].address.clone(),
+            members[3].address.clone(),
+        );
+        let mut keys = vec![];
+        let mut chain = G5Chain::new("b464_seat", 14, |db| {
+            seed_committee_chain(db, &members, supply);
+            keys.push(G5Chain::account(db, 234, 10 * G5_AIN).0);
+            let _seed = db.seeding();
+            db.put(
+                "sys:validator_set:v1",
+                &serde_json::to_string(&members.to_vec()).unwrap(),
+            )
+            .unwrap();
+        });
+        let d_key = keys.pop().unwrap();
+        let db = chain.db.clone();
+        chain.offline = Some([c.clone(), d.clone()].into_iter().collect());
+        chain.run_blocks(20, 7);
+        assert!(
+            inactive_members(&db).is_empty(),
+            "one low epoch removes nobody"
+        );
+        chain.offline = Some([b.clone(), d.clone()].into_iter().collect());
+        chain.run_blocks(20, 7);
+        assert_eq!(chain.height, 40);
+        assert_eq!(
+            inactive_members(&db),
+            BTreeMap::from([(d.clone(), 2u64)]),
+            "only D was low in both epochs"
+        );
+        let c2 = g5_committee(&db, 2);
+        assert_eq!(c2.len(), 3);
+        assert!(c2.iter().all(|(a, _)| *a != d), "D is not in C_2");
+        assert_eq!(live_weight(&db, &d), Some(0), "D weighs nothing, its entry kept");
+        // Downtime is not slashed: D's stake is bonded and whole.
+        let set = validator_set(&db);
+        let d_move = parse_move_address(&d).unwrap();
+        assert!(set
+            .validators
+            .iter()
+            .any(|v| v.validator_addr == d_move && v.stake.value == 100 * G5_AIN));
+        assert!(set.unbonding_queue.is_empty(), "nothing is unbonding");
+        assert!(db
+            .get(&format!("validator:jailed:{d}"))
+            .unwrap()
+            .is_none());
+
+        chain.offline = Some(Default::default());
+        let reactivate = chain.tx(&d_key, "staking", "reactivate", vec![]);
+        chain.block(chain.timestamp + 7, vec![reactivate]);
+        assert!(inactive_members(&db).is_empty(), "D is off the list");
+        assert_eq!(live_weight(&db, &d), Some(100), "D weighs its stake at once");
+        chain.run_blocks(19, 7);
+        assert_eq!(chain.height, 60);
+        let c3 = g5_committee(&db, 3);
+        assert_eq!(c3.len(), 4);
+        assert!(c3.iter().any(|(a, _)| *a == d), "D is elected again");
+    }
+
+    /// B464 witness (G5 PA-3 with A4): a bootstrap operator out for
+    /// non-participation keeps its ceiling (being out is not leaving the
+    /// Move set, BW-5) and scores 0 for each epoch it spends out, so a dark
+    /// operator still forfeits on BW-6's schedule. BW-11's cap counts only
+    /// the members the next committee holds: F weighs 6,000 of 22,000 with
+    /// D, but would hold a third of the 18,000 without it, so its bootstrap
+    /// weight is cut below a third.
+    #[test]
+    fn b464_an_operator_out_keeps_its_ceiling_and_the_cap_counts_the_committee() {
+        let members = [
+            (241u8, 1_000u64, 5_000u64),
+            (242, 1_000, 3_000),
+            (243, 1_000, 3_000),
+            (244, 1_000, 3_000),
+            (245, 1_000, 3_000),
+        ];
+        let f = committee_member(241, 0).address;
+        let d = committee_member(245, 0).address;
+        let mut chain = G5Chain::new("b464_boot", 14, |db| {
+            seed_bootstrap_chain(db, &members, 1_000_000 * G5_AIN);
+        });
+        chain.offline = Some([d.clone()].into_iter().collect());
+        let db = chain.db.clone();
+        chain.run_blocks(40, 7);
+        assert_eq!(inactive_members(&db), BTreeMap::from([(d.clone(), 2u64)]));
+        let held = |state: &BootstrapState| {
+            state
+                .operators
+                .iter()
+                .find(|o| o.address == d)
+                .map(|o| (o.ceiling, o.score))
+        };
+        // Epochs 0 and 1 counted D's silence; it is out, not forfeited.
+        let two = fold_bootstrap_score(
+            fold_bootstrap_score(BOOTSTRAP_SCORE_SCALE, Some(0)),
+            Some(0),
+        );
+        assert_eq!(held(&bootstrap_of(&db)), Some((3_000, two)));
+        assert_eq!(live_weight(&db, &d), Some(0));
+        let c2 = g5_committee(&db, 2);
+        assert!(c2.iter().all(|(a, _)| *a != d), "D is not in C_2");
+        let total: u64 = c2.iter().map(|(_, w)| *w).sum();
+        let f_weight = c2
+            .iter()
+            .find(|(a, _)| *a == f)
+            .map(|(_, w)| *w)
+            .unwrap();
+        assert!(3 * f_weight < total, "F holds {f_weight} of {total}");
+        // BW-10 reports P as BW-4 counts it: without D.
+        assert_eq!(bootstrap_report(&db).unwrap().owned_stake, 4_000);
+        // Epoch 2, spent out, scores 0.
+        chain.run_blocks(20, 7);
+        assert_eq!(
+            held(&bootstrap_of(&db)),
+            Some((3_000, fold_bootstrap_score(two, Some(0))))
+        );
+    }
+
+    /// B464 (G5 PA-3): a member that is out, leaves and joins again within
+    /// one epoch starts afresh, as any joiner: the join takes it off the
+    /// inactive list, so the next boundary elects it by its new stake. Kept
+    /// on the list, it would stay out with its new stake.
+    #[test]
+    fn b464_a_member_out_that_leaves_and_joins_again_starts_afresh() {
+        let supply = 1_000_000 * G5_AIN;
+        let members = [
+            committee_member(201, 100),
+            committee_member(202, 100),
+            committee_member(203, 100),
+            committee_member(204, 100),
+        ];
+        let d = members[3].address.clone();
+        let mut keys = vec![];
+        let mut chain = G5Chain::new("b464_rejoin", 14, |db| {
+            seed_committee_chain(db, &members, supply);
+            keys.push(G5Chain::account(db, 204, 2_000 * G5_AIN).0);
+            let _seed = db.seeding();
+            db.put(
+                "sys:validator_set:v1",
+                &serde_json::to_string(&members.to_vec()).unwrap(),
+            )
+            .unwrap();
+        });
+        let d_key = keys.pop().unwrap();
+        let db = chain.db.clone();
+        chain.offline = Some([d.clone()].into_iter().collect());
+        chain.run_blocks(40, 7);
+        assert_eq!(inactive_members(&db), BTreeMap::from([(d.clone(), 2u64)]));
+
+        let leave = signed_tx(
+            &d_key,
+            &d,
+            &entry_payload("staking", "leave_validator_set", vec![], vec![move_addr_arg(&d)]),
+            0,
+            10_000_000,
+            1,
+        );
+        chain.block(chain.timestamp + 7, vec![leave]);
+        let (bls_public_key, bls_pop) =
+            test_bls_identity(204, d_key.verifying_key().as_bytes());
+        let join = signed_tx(
+            &d_key,
+            &d,
+            &entry_payload(
+                "staking",
+                "join_validator_set",
+                vec![],
+                vec![
+                    move_addr_arg(&d),
+                    bcs::to_bytes(&(1_000 * G5_AIN)).unwrap(),
+                    bcs::to_bytes(&d_key.verifying_key().to_bytes().to_vec()).unwrap(),
+                    bcs::to_bytes(&bls_public_key).unwrap(),
+                    bcs::to_bytes(&bls_pop).unwrap(),
+                ],
+            ),
+            1,
+            10_000_000,
+            1,
+        );
+        chain.block(chain.timestamp + 7, vec![join]);
+        assert!(inactive_members(&db).is_empty(), "the join took D off");
+        assert_eq!(live_weight(&db, &d), Some(1_000));
+        chain.run_blocks(18, 7);
+        assert_eq!(chain.height, 60);
+        assert!(
+            g5_committee(&db, 3).contains(&(d.clone(), 1_000)),
+            "D is elected by its new stake"
+        );
+    }
+
+    /// B464 (G5 PA-2): the vertices of a period's last anchor round are
+    /// committed in the next period's first block, so that anchor's leader
+    /// shows one vertex more than the period's rounds and one fewer in the
+    /// next. One vertex carries into the next period, so both pay it in
+    /// full; no more carries, so late vertices cannot be banked. The period
+    /// count closed at a payout is what the next period's fees are shared by.
+    #[test]
+    fn b464_one_vertex_carries_between_periods() {
+        let db = temp_db("b464_carry");
+        let exec = Executor::new(Arc::clone(&db));
+        let _seed = db.seeding();
+        let (a, b) = (committee_member(251, 100), committee_member(252, 100));
+        db.put(
+            "genesis:validator_set:v1",
+            &serde_json::to_string(&[a.clone(), b.clone()]).unwrap(),
+        )
+        .unwrap();
+        let mut order = [a.address.clone(), b.address.clone()];
+        order.sort();
+        let put = |count: &Participation| {
+            db.put(
+                &participation_key(),
+                &hex::encode(bcs::to_bytes(count).unwrap()),
+            )
+            .unwrap();
+        };
+        // The first member led the period's last anchor: 47 vertices in 46
+        // rounds.
+        put(&Participation {
+            epoch: 0,
+            rounds: 46,
+            authored: vec![47, 46],
+            period_rounds: 46,
+            period_authored: vec![47, 46],
+            low: vec![],
+        });
+        let full = BTreeMap::from([(order[0].clone(), 1_000_000), (order[1].clone(), 1_000_000)]);
+        assert_eq!(exec.close_participation_period(0), full);
+        let count = read_participation(&db).unwrap();
+        assert_eq!(count.period_rounds, 0);
+        assert_eq!(count.period_authored, [1, 0], "one vertex carries");
+        assert_eq!(exec.fee_participation(), full, "the next period's fees");
+        // The next period's first block committed its vertex of the last
+        // round: 45 more in 46 rounds, 46 with the carry.
+        put(&Participation {
+            period_rounds: 46,
+            period_authored: vec![1 + 45, 46],
+            ..count
+        });
+        assert_eq!(exec.close_participation_period(0), full);
+        // Fourteen late vertices: one carries.
+        let count = read_participation(&db).unwrap();
+        put(&Participation {
+            period_rounds: 46,
+            period_authored: vec![60, 23],
+            ..count
+        });
+        let half = BTreeMap::from([(order[0].clone(), 1_000_000), (order[1].clone(), 500_000)]);
+        assert_eq!(exec.close_participation_period(0), half);
+        assert_eq!(read_participation(&db).unwrap().period_authored, [1, 0]);
+        assert_eq!(exec.fee_participation(), half);
+        // Another epoch's count pays nobody by it.
+        assert!(exec.close_participation_period(1).is_empty());
+        assert!(exec.fee_participation().is_empty());
     }
 
     /// G5 A4 BW-8 (review HIGH): a slash cuts coins only. The offense record
@@ -13150,7 +15189,7 @@ mod tests {
         };
         let payload =
             hex::encode(bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(call)).unwrap());
-        let tx_json = signed_tx(&sender_key, &sender, &payload, 0, 100_000, 1);
+        let tx_json = signed_tx(&sender_key, &sender, &payload, 0, 300_000, 1);
 
         seed_genesis_tree(&db);
         // Seeding above wrote state on the base DB; that is the test's own
@@ -13954,7 +15993,7 @@ mod tests {
                     bcs::to_bytes(&60u64).unwrap(),
                 ],
             );
-            let raw = signed_tx(&sender_key, &sender, &payload, nonce as u64, 10_000, 1);
+            let raw = signed_tx(&sender_key, &sender, &payload, nonce as u64, 300_000, 1);
             gas += gas_of(&raw) as u128;
             let (updates, _) = executor
                 .execute_transaction(&raw)
@@ -15507,6 +17546,76 @@ mod tests {
         assert_eq!(total, 100, "rounding remainder must not be lost");
         // Leader gets at least bonus + own share
         assert!(*map.get("alice").unwrap_or(&0) >= 20 + 26);
+    }
+
+    /// B393 witness: fees are split against at least s_min, as emission is,
+    /// and the part a lighter committee leaves unpaid is burned: a forfeit
+    /// no longer raises the survivors' fee shares. Committee 100 against a
+    /// floor of 200: the pool's 800 pays 200 each, 400 unpaid. B403: the
+    /// leader's 200 bonus pays 100, the other 100 is burned too.
+    #[test]
+    fn a1_fees_are_split_against_at_least_s_min() {
+        let committee = committee_a1(&[("alice", 50), ("bob", 50)]);
+        let (payouts, unpaid) = Executor::block_payouts("alice", 1_000, &committee, 200);
+        let map: std::collections::HashMap<String, u128> = payouts.into_iter().collect();
+        assert_eq!(map.get("alice").copied(), Some(100 + 200));
+        assert_eq!(map.get("bob").copied(), Some(200));
+        assert_eq!(unpaid, 400 + 100);
+        assert_eq!(
+            map.values().sum::<u128>() + unpaid,
+            1_000,
+            "the reward was not consumed"
+        );
+        // At or above the floor nothing is left unpaid.
+        let (_, unpaid) = Executor::block_payouts("alice", 1_000, &committee, 100);
+        assert_eq!(unpaid, 0);
+    }
+
+    /// B464 witness (G5 PA-2): fees by participation. Four members of 100;
+    /// carol took part in half the last period, dave in none. Weighed 100,
+    /// 100, 50 and 0 against the committee's 400, the pool's 800 pays 200,
+    /// 200, 100 and 0, the bonus is 200 x 250 / 400 = 125, and 375 is
+    /// burned: nobody earns more for dave's absence (against the weight
+    /// that took part, 250, alice and bob would take 320 each). A member
+    /// not measured counts in full; with nobody taking part all is burned.
+    #[test]
+    fn b464_fees_are_shared_by_participation() {
+        let committee =
+            committee_a1(&[("alice", 100), ("bob", 100), ("carol", 100), ("dave", 100)]);
+        let participation: BTreeMap<String, u64> =
+            BTreeMap::from([("carol".to_string(), 500_000), ("dave".to_string(), 0)]);
+        let (payouts, unpaid) =
+            Executor::fee_payouts("alice", 1_000, &committee, &participation, 0);
+        let map: std::collections::HashMap<String, u128> = payouts.into_iter().collect();
+        assert_eq!(map.get("alice").copied(), Some(125 + 200));
+        assert_eq!(map.get("bob").copied(), Some(200));
+        assert_eq!(map.get("carol").copied(), Some(100));
+        assert_eq!(map.get("dave").copied().unwrap_or(0), 0);
+        assert_eq!(unpaid, 375);
+        assert_eq!(map.values().sum::<u128>() + unpaid, 1_000);
+        // An s_min above the committee's weight still floors it (B393):
+        // the bonus is 200 x 250 / 800 = 62 and the pool pays 250.
+        let (_, unpaid) = Executor::fee_payouts("alice", 1_000, &committee, &participation, 800);
+        assert_eq!(unpaid, (800 - 250) + (200 - 62));
+        // Everyone took part, or nobody was measured: as before B464.
+        let (full, unpaid) =
+            Executor::fee_payouts("alice", 1_000, &committee, &BTreeMap::new(), 0);
+        assert_eq!(unpaid, 0);
+        assert_eq!(full, Executor::block_payouts("alice", 1_000, &committee, 0).0);
+        // Nobody took part: nothing is paid, the leader's bonus included.
+        let none: BTreeMap<String, u64> = committee.iter().map(|(a, _)| (a.clone(), 0)).collect();
+        let (payouts, unpaid) = Executor::fee_payouts("alice", 1_000, &committee, &none, 0);
+        assert!(payouts.iter().all(|(_, share)| *share == 0), "{payouts:?}");
+        assert_eq!(unpaid, 1_000);
+        // participating_weights rounds down and caps at a full share.
+        let capped = BTreeMap::from([
+            ("alice".to_string(), 2_000_000),
+            ("bob".to_string(), 333_333),
+        ]);
+        assert_eq!(
+            participating_weights(&committee[..2], &capped),
+            committee_a1(&[("alice", 100), ("bob", 33)])
+        );
     }
 
     /// G5 EM-2 (review): a leader outside the paid committee (jailed since

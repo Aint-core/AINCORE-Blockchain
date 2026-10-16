@@ -14,13 +14,19 @@ rand = "0.8"
 blake3 = "1.5"
 
 # Post-quantum transaction signatures: ML-DSA-65 (FIPS 204), B8. Pinned
-# exactly: the verifier is consensus-critical, so a bump is a consensus change
-# (see src/tx_sig.rs).
+# exactly: a bump is a consensus change (see src/tx_sig.rs). B321: RustCrypto
+# `ml-dsa` (pure Rust, no assembly) verifies, so every CPU runs one code
+# path; aws-lc-rs makes keys and signs.
 aws-lc-rs = "=1.18.1"
+ml-dsa = "=0.1.1"
 
 # BLS12-381 via blst (Supranational) — Audited, used by Ethereum 2.0
 # Replaces bls12_381 crate which was used incorrectly as symmetric MAC
-blst = "0.3"
+# B454: `portable` picks mulx (ADX) or mulq when the node starts. Without it
+# the build host picks: a binary built where ADX exists (release.yml's x86
+# runner) runs mulx on every CPU and would die (SIGILL) at its first BLS
+# operation on one without ADX, such as the NAS's N5095.
+blst = { version = "0.3", features = ["portable"] }
 
 # Zero-Knowledge Proofs (zk-SNARKs)
 ark-snark = "0.4"
@@ -58,8 +64,6 @@ zeroize = "1.7"
 
 [dev-dependencies]
 criterion = "0.5"
-# An independent ML-DSA implementation, to cross-check aws-lc-rs.
-ml-dsa = "=0.1.1"
 
 [[bench]]
 name = "stark_bench"

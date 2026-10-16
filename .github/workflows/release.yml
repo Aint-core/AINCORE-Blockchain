@@ -22,7 +22,7 @@ jobs:
       - name: Require security witnesses, including ignored blockers
         run: python3 scripts/release_security_gate.py
       - name: Regression suite
-        run: cargo test --locked -p blockchain -p chain_sync -p consensus -p executor -p governance -p node -p storage -p vm_move -- --test-threads=1
+        run: cargo test --locked -p blockchain -p chain_sync -p consensus -p executor -p node -p storage -p vm_move -- --test-threads=1
       - name: Independent block identity vectors
         run: node scripts/tests/block_identity_v2_vectors.mjs
       - name: Strict admission-path lint

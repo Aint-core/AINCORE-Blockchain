@@ -1264,6 +1264,101 @@ fn servable_versions_are_what_pruning_keeps() {
     }
 }
 
+/// B460 witness: however long the caller keeps blocks, pruning keeps at
+/// most `HISTORY_VERSIONS` versions below the latest (the write price pays
+/// for that long), pins aside; a shorter window still wins.
+#[test]
+fn pruning_keeps_at_most_history_versions() {
+    let db = temp_db("history_versions");
+    let tip = HISTORY_VERSIONS + 50;
+    for v in 0..=tip {
+        commit(&db, v, vec![(k((v % 5) as usize), some(&format!("x{v}")))]);
+    }
+    let pin = 20;
+    let stats = prune(&db, 0, &[pin].into(), usize::MAX).unwrap();
+    assert!(
+        stats.nodes > 0 && stats.values > 0,
+        "positive control: {stats:?}"
+    );
+    assert_eq!(floor(&db).unwrap(), tip - HISTORY_VERSIONS);
+    assert!(!servable(&db, tip - HISTORY_VERSIONS - 1, None).unwrap());
+    for version in [tip - HISTORY_VERSIONS, tip] {
+        prove(&db, &k(1), version).expect("a kept version is whole");
+    }
+    assert_eq!(
+        prove(&db, &k(1), pin).unwrap().0,
+        some("x16"),
+        "a pin outlives the window"
+    );
+    prune(&db, tip - 10, &Default::default(), usize::MAX).unwrap();
+    assert_eq!(floor(&db).unwrap(), tip - 10);
+}
+
+/// B460: the internal nodes `changed` random keys of an `n`-key tree
+/// rewrite, plus each key's leaf and superseded value, per changed key. JMT
+/// keeps an internal node at every prefix two keys share, so at level `l`
+/// (16^l prefixes) a change rewrites each prefix that holds a changed key
+/// and a second key.
+fn expected_history_rows(n: f64, changed: f64) -> f64 {
+    let mut internal = 0.0;
+    for level in 0..64 {
+        let prefixes = 16f64.powi(level);
+        // ln(1 - 1/prefixes), exact for the deep levels' tiny ratios.
+        let ln_miss = (-1.0 / prefixes).ln_1p();
+        let touched = -(changed * ln_miss).exp_m1();
+        let alone = ((n - 1.0) * ln_miss).exp();
+        internal += prefixes * touched - changed * alone;
+    }
+    2.0 + internal / changed
+}
+
+/// B460: the rows a block at the gas target leaves, measured at 16,384
+/// keys, follow the tree model, and by the model stay within
+/// `HISTORY_ROWS_PER_KEY` at the 40 GB design state; every stale node with
+/// its index entry fits `MAX_HISTORY_ROW_BYTES`.
+#[test]
+fn history_rows_follow_the_tree_model() {
+    const KEYS: usize = 16_384;
+    // The changed keys a block at the gas target pays for.
+    let changed = (PRUNE_ROWS_PER_BLOCK / HISTORY_ROWS_PER_KEY) as usize;
+    let db = temp_db("history_rows_model");
+    commit(&db, 0, (0..KEYS).map(|i| (k(i), some("old"))).collect());
+    commit(&db, 1, (0..changed).map(|i| (k(i), some("new"))).collect());
+    // The model gives 3.24 here; the keys' hashes put the count within a
+    // few hundredths of it.
+    let measured = history_rows(&db, 1).unwrap() as f64 / changed as f64;
+    let model = expected_history_rows(KEYS as f64, changed as f64);
+    assert!(
+        (model * 0.9..=model * 1.1).contains(&measured),
+        "{measured} rows a key, the model {model}"
+    );
+    // The design state: 40 GB at 700 bytes a key at least (2K + 3V + 492
+    // with a ~100-byte resource key; research note, section 4).
+    let design = expected_history_rows(40e9 / 700.0, changed as f64);
+    assert!(
+        design <= HISTORY_ROWS_PER_KEY as f64,
+        "{design} rows a key at the design state"
+    );
+    // The root, with 16 internal children, is the largest kind of node.
+    let version: Version = 1;
+    let prefix = format!("{STALE}{version:020}:");
+    let mut largest = 0usize;
+    for row in db.db.prefix_iterator(prefix.as_bytes()) {
+        let (stale, _) = row.unwrap();
+        if !stale.starts_with(prefix.as_bytes()) {
+            break;
+        }
+        let node = format!(
+            "{NODE}{}",
+            std::str::from_utf8(&stale[prefix.len()..]).unwrap()
+        );
+        let value = db.get(&node).unwrap().expect("kept until pruned");
+        largest = largest.max(stale.len() + node.len() + value.len());
+    }
+    assert!(largest >= 1_700, "positive control: {largest}");
+    assert!(largest as u64 <= MAX_HISTORY_ROW_BYTES, "{largest}");
+}
+
 /// GC-1 race: a key re-created while prune decides to drop its preimage
 /// keeps the preimage. The re-creation runs on another thread between
 /// prune's checks and its writes, as the executor writes: `apply` and its

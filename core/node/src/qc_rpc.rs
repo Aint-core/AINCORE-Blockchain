@@ -165,7 +165,7 @@ mod tests {
             stake: 100,
             ed25519_public_key: "cd".repeat(32),
             bls_public_key: hex::encode(bls.pubkey_raw(&seed)),
-            bls_pop: hex::encode(bls.prove_possession_raw(&seed)),
+            bls_pop: hex::encode(bls.prove_possession_raw(&seed, &[0xcd; 32])),
         }];
         let vote = qc::FinalityVote {
             chain_id: qc::expected_chain_id(),
@@ -239,7 +239,7 @@ mod tests {
             stake: 100,
             ed25519_public_key: "00".repeat(32),
             bls_public_key: hex::encode(bls.pubkey_raw(&seed)),
-            bls_pop: hex::encode(bls.prove_possession_raw(&seed)),
+            bls_pop: hex::encode(bls.prove_possession_raw(&seed, &[0u8; 32])),
         }];
         {
             let _seed = db.seeding();

@@ -214,6 +214,7 @@ taken by the implementer under the founder's delegation:
   - A lagging honest node is within `GC_DEPTH + RETAIN_SLACK` rounds of the network, or it catches up by QC-gated block sync within block retention.
   - B255: a member keeps, and serves, every round above the floor of its lowest block without a QC less `RETAIN_SLACK` (`retention_floor`), and proposes nothing with `MAX_UNFINALIZED_BLOCKS` (50) blocks above that block. A node too far behind to rebuild from rounds GC deleted needs QC-gated block sync, and while f members withhold their votes no QC forms without it: without this rule the chain stopped finalizing for good, and halted at the next boundary.
   - B262: that floor is the one the block's decision walked down to (the floor in force before its anchor, recorded in its pending QC row as `decision_floor`), not its own anchor less `GC_DEPTH`: after a run of skipped anchors the two differ by the run's length, and a member rebuilding the block needed rounds every peer had deleted. Rounds per block are unbounded (C1), so a member also proposes nothing while that floor is below g and its round is `MAX_KEPT_ROUNDS` (`GC_DEPTH + LEAD`, 250; B283: with `RETAIN_SLACK` added, 300, the newest vertex was past the lead of a member coming back, whose cursor is one past the anchor before the block) above it; while it waits it sends its newest vertex again every 4 ticks, so a member coming back learns the whole gap at once.
+  - B469: while the pending row of that block cannot be read, does not parse, is over its bound or names another height, the floor and the cursor are 0, as while a pending key names no height (B419): every round is kept, the brakes above hold, and both are read again each tick. Read as no pending work, both went to `u64::MAX`, which released the retention and the brakes.
   - Beyond block retention it needs G3 state rejoin (H7).
 - **LA-7 (execution).** Honest nodes execute identical blocks identically (G3/G5). A violation halts QC formation and epoch activation; it never forks.
 - **LA-8 (leader schedule).**
@@ -346,7 +347,7 @@ taken by the implementer under the founder's delegation:
 | `consensus:anchor_decision:{E}:{r:020}` | `C:{digest}` or `S` (write-once) | DE-6, acceptance transaction | With blocks |
 | `consensus:cseq:{anchor_round}` | `[(digest, round)]` (extends today's format) | DE-6 | When anchor_round ≤ g |
 | `consensus:qc:{h}` | QC (existing, `qc_producer.rs:391-419`) | As today | With `block_{h}` |
-| `consensus:guard_origin` | `{cg, node_ed25519_pk, bls_pk}` | Genesis init or first key use | Never |
+| `consensus:guard_origin` | `{cg, node_ed25519_pk, bls_pk}` | Genesis init (in the launch window) or an RC-3 re-arm; never at a first key use (a joiner proves its boot, B441) | Never |
 | `sys:equiv_seen:{offender}:{E}:{round}` | Evidence (epoch added to `dag.rs:2406`) | EQ-1 | As today |
 | `alarm:vcert_conflict:{E}:{r}:{a}`, `alarm:decision_conflict:{h}`, `alarm:committee_mismatch:{E}` | Diagnostic | On detection | Never |
 
@@ -367,7 +368,7 @@ taken by the implementer under the founder's delegation:
 Verdicts:
 - **INVALID**: drop this copy. It never feeds a ban, a peer score or a slash (`DEFECT_REGISTER.md:80`). Every verdict is about the copy, never keyed by digest: a relay can alter the unhashed transport fields of an honest vertex.
 - **DROP**: timing only. The vertex can be obtained again.
-- **PENDING(epoch|cert)**: kept in a bounded buffer and re-evaluated on a trigger.
+- **PENDING(epoch|cert)**: kept in a bounded buffer and re-evaluated on a trigger. PENDING(cert) is re-evaluated once, when the last parent certificate it waits on arrives, and Layer S is not run again then: the digest binds every field it reads (B442).
 - **STALE**: used as evidence only.
 - **STAGE**.
 
@@ -477,6 +478,7 @@ This is the core of `verify_qc` (`qc.rs:338-425`) refactored into one shared ver
   - G5 amendment A3: the alarm and the evidence row (`sys:equiv_cert_v4`) commit in one transaction.
   - The node relays both certificates once, so every honest node holding either halts and keeps the evidence.
   - Recovery is an operator procedure: `docs/CERT_CONFLICT_RECOVERY_RUNBOOK.md`. Its tool is a genesis blocker.
+  - B456: the tool reads the node's rows fail-closed. A row it cannot read or parse (the committed sequence, the slot's certificate, slot or alarm row) is an error, never "absent": the pin is refused and nothing is written. Read as absent, a lost row holding the other twin let the pin go through on a node that had ordered it.
 - Then run OR-1 for the digest. A missing body → fetch (RE).
 
 ### Orderable index (OR)
@@ -720,6 +722,14 @@ restart, the flood witness (a Byzantine member, a spoofer of the honest fetcher 
   adoption.
 - DE-6 conflicts halt the same way: they write `alarm:decision_conflict:{h}`, and the halt is
   reloaded at boot.
+  - B456: the conflict alarms (`alarm:decision_conflict:*`, `alarm:committee_mismatch:*`) are
+    read through one reader that reports a read error. While they cannot be read, ordering
+    halts (no block placed, no finality vote signed, no synced anchor adopted), from the boot
+    or the tick that hit the error. The halt is temporary: the alarms are read again each tick,
+    and it lifts at the first clean read that finds none, without a restart. Sync stops while
+    they cannot be read and reads them again each pass. Read as "no alarm", a read error let
+    the node order over a recorded conflict; held until a restart, the node would stop
+    ordering while sync went on importing (B419).
 - MEDIUM: a copy of a staged body is neither verified nor harvested (it was a free BLS-cost
   lever).
 - MEDIUM: DE-6 refuses an adopted anchor that is odd or more than `MAX_DECISION_ROWS` anchor
@@ -1009,7 +1019,8 @@ HIGH, all fixed:
   two certificates for one slot.
   - It now re-arms only at the activation of an epoch whose boundary block's BFT time is later
     than its first guard-less boot plus a clock-skew margin (`consensus:guard_resume_after`,
-    `EpochStart.prev_timestamp`).
+    `EpochStart.prev_timestamp`). B405 replaced the time with a block height the chain
+    proves later than the boot (see RC-3).
 - **Pull answers could exceed the node's own pre-parse cap**, so a near-maximal body could never
   be fetched. `v4::MAX_WIRE_BYTES` is now the one bound: answers are packed to fit it, and one
   maximal body always fits.
@@ -1079,7 +1090,7 @@ Deferred:
 - **Genesis is V4.**
   - `build_genesis` writes `genesis:vertex_format = 4`. It is a state key, so root 0, and with
     it the genesis identity, binds the format.
-  - `GENESIS_VERSION` is `g1-certified-dag-v6`, so an older binary refuses the genesis.
+  - `GENESIS_VERSION` is `g1-certified-dag-v6`, so an older binary refuses the genesis (v7 since B325: rounds 16-19 changed what nodes compute together).
   - A node booting from a real genesis runs the V4 engine (witness
     `genesis_is_v4_and_binds_its_launch_time`).
 - **RC-3 launch window** (closes the deferred init-flag finding).
@@ -1282,12 +1293,14 @@ No decision reads arrival order or a minimum hash.
 **GC-3 (deletion).**
 - After each commit, a separate batch deletes by idempotent *range* every row of (E, r ≤ g − RETAIN_SLACK): `vertex:` (via `vslot`), `vslot`, `vcert`, `vcollect`, `vattest`, `vproposed`.
 - Deleting guards below g is safe because AT-1 refuses round ≤ g, and g is durable and monotone.
+- B468: so g is read fail-closed at boot. A `gc_floor` row that cannot be read or is not a number fails the boot; only an absent row is 0. Read as 0, E3 refused only round 0 (in a later epoch `begin_epoch` wrote first_round(E) − 1 back over the real g), and a slot whose guard GC-3 had deleted could be attested a second time. The engine's other boot rows (`committed_rounds`, `finalized_round`, `next_anchor_round`, `finality_digest`, `last_anchor_round` and the beacon fold rows) are read the same way.
 - Epoch, committee, `guard_origin` and `gc_floor` rows are never deleted.
 - **Serving obligation:** honest signers keep attested bodies until round ≤ g − RETAIN_SLACK.
 
 **GC-4.**
 - `committed_set` is exactly the map of committed digests to rounds with round > g.
 - It is rebuilt at boot from the `cseq` rows whose anchor_round > g, and pruned by round, not FIFO.
+- B456: a `cseq` row that cannot be read (a read error, a row that is not UTF-8) or a row above g that does not parse fails the boot. Skipped, the vertices it committed were left out of the set, and the next anchor's walk ordered them again. A `cseq` key that names no round (any g) and more rows than the scan cap fail the boot too; neither is reachable today (CL-1 writes decimal rounds only, GC-1 keeps the rows to about GC_DEPTH).
 - The FIFO window (`ordering.rs:92`, `:493-505`) and the 256-round window (`ordering.rs:84`) stop being correctness inputs.
 - This removes the undercounted window bound the recovery attack found.
 
@@ -1300,7 +1313,7 @@ No decision reads arrival order or a minimum hash.
 ### Crash recovery and boot (RC)
 
 **RC-1 (boot, V4; replaces `dag.rs:144-426`).**
-1. Load the ordering metadata, `gc_floor`, `epoch_active`, the committees and the epoch rows.
+1. Load the ordering metadata, `gc_floor`, `epoch_active`, the committees and the epoch rows. B468: the ordering metadata and `gc_floor` are read fail-closed: a row that is present but cannot be read or parse fails the boot, and only an absent row takes its default (GC-3).
 2. Load staged bodies from the `vslot` rows of the active epoch with round > g − RETAIN_SLACK. Re-run Layer S on each. There is no load-order dedup and there are no refusal loops.
 3. Load and verify the `vcert` rows.
 4. Rebuild O_E through OR-1 in increasing round.
@@ -1320,7 +1333,18 @@ Certificates and `vcollect` may be written unsynced because they can be obtained
 
 **RC-3 (guard continuity).**
 - Suppose the node's key is a member of C_{E_active} and `consensus:guard_origin` is missing or mismatched. That means a fresh, wiped or resynced database under a live key.
-- In that case the node **abstains from attesting and proposing for the rest of the epoch**, and resumes at the next activation.
+- In that case the node **abstains from attesting and proposing for the rest of the epoch**, and resumes at the activation of the first epoch whose boundary block H_E is above its proven height (`consensus:guard_resume_after`).
+- The proven height comes from a proof-of-boot transaction (B405). While it abstains, the node sends, about once a minute, a transfer from its own account to itself of a random amount, at its committed sequence number (`executor::admission::proof_of_boot_tx`). Its bytes did not exist before this boot, so any block that carries it was made after this boot. The first time one of them has a receipt, the node notes the height it holds (`epoch::note_boot_proof`, kept once). A boundary block above that height closes an epoch that ran after the guards were lost, and the epoch it opens holds no earlier signature. The open of a node without continuous guards clears the row (`begin_abstaining`): a height proven in an earlier run, or in a database copied from another key, says nothing of when this key last signed.
+  - No clock and no peer's word is read. A time point taken at boot from a clock an hour behind (a Pi on fake-hwclock before NTP) re-armed a wiped validator at a boundary it replayed while catching up, inside an epoch its old database had signed in (witness `a_wiped_validator_booting_an_hour_behind_is_not_rearmed_in_an_epoch_it_signed_in`). Two later designs failed review: a point taken at activations still failed when NTP set the clock between two of them, and a height judged level from members' height claims gave f silent members a veto and needed honest members up to date.
+  - Liveness rests on what transactions already rest on: honest leaders include what reaches them (an abstaining member forwards its mempool like a node outside, `DagConsensus::v4_signs`), so f members cannot keep the proof out.
+  - The cost: the account needs a little AIN for the gas (a node without it logs so and keeps abstaining), and the node abstains until the first boundary after its proof.
+- **Joining (B441).** No origin is written at a first key use, so a validator that joins after launch opens without one, as a wiped one does. It sends its proof of boot while its key is in the live set (`sys:validator_set:v1`, from which C_{E+1} is derived at H_E), before it is a member (`Engine::seeks_boot_proof`). A block of the epoch E it joined in carries the proof, H_E is above it, and the activation of E+1, its first member epoch, re-arms it.
+  - Before, only members of C_E sent one. Every joiner then abstained for its whole first member epoch. A wave of joiners (G5 CH-1 caps it near 10% of C_E's stake an epoch) cut the committee's fault margin from under 1/3 to about 1/3 minus their stake for that epoch, and a Byzantine coalition of that size could stall the epoch.
+  - The join procedure:
+    1. Run the node, synced, and fund its account: the stake, plus a little AIN for the proof's gas. Keep it running.
+    2. Join (`join_validator_set`, within CH-1's allowance) early in an epoch.
+    3. Once its key is in the live set, the node sends its proof. It must note the proof (`boot_proof_height`, at or above the block carrying it) below the boundary H_E of the epoch its join landed in. A proof noted at or above H_E (a join late in that epoch) re-arms one epoch later, and the node abstains in its first member epoch. A join that lands after H_E is first a member in E+2, and its proof has all of E+1 to land. Every open of a node without continuous guards clears a noted proof (`begin_abstaining`), so a restart before E+1's activation, not only before H_E, costs it, and a fresh proof is sent.
+  - A node whose key is in no live set (an RPC node) sends no proof.
 - Two situations are Byzantine under SA-4, not handled by the node: restoring a validator database from a backup, and running a copied `node.key` on a second database. The latter was a practice in earlier slashing live tests, and it must not be done with production keys.
 
 ### Safety argument (sketch; not mechanized)

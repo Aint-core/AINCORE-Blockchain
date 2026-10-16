@@ -112,7 +112,11 @@ mod tests {
 
     /// B20 witness: every test path in the workspace comes from
     /// `process_dir`, so it is reaped. The two bridge crates keep a small
-    /// JSON file each and do not depend on this crate.
+    /// JSON file each, and the indexer's, bench-tps's and the CLI's tests a
+    /// file or two each they remove; none of them depends on this crate.
+    /// The CLI's `main.rs` also holds a production path: `publish` compiles
+    /// into a new 0700 directory of the run's own under the system's
+    /// temporary directory (B363), the operator's machine, not a test's.
     #[test]
     fn no_test_path_bypasses_the_reaped_directory() {
         fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -133,6 +137,10 @@ mod tests {
             "common/storage/src/test_dir.rs",
             "depin/bridge-rust/src/nonce_store.rs",
             "depin/btc-bridge/src/storage.rs",
+            "indexer/src/main.rs",
+            "bench-tps/src/main.rs",
+            "core/cli/src/keys.rs",
+            "core/cli/src/main.rs",
         ];
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut files = Vec::new();

@@ -141,6 +141,12 @@ fn charged_once(check: impl FnOnce() -> bool) -> bool {
     passed
 }
 
+#[cfg(test)]
+thread_local! {
+    /// B442 witness support: the PENDING vertices woken on this thread.
+    pub(crate) static WAKES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// B95/B117: the bodies of one (epoch, round, author) whose payload was
 /// checked.
 #[derive(Debug, Default)]
@@ -232,11 +238,6 @@ pub struct Engine {
     can_sign: bool,
     /// RC-3: guard continuity held at boot.
     guards_continuous: bool,
-    /// RC-3: a node that booted without continuous guards re-arms only at the
-    /// activation of an epoch whose boundary block is later than this (its
-    /// boot time plus the clock-skew margin), i.e. an epoch that began after
-    /// its guards were lost. Persisted in `consensus:guard_resume_after`.
-    resume_after: Option<u64>,
     /// The staged bodies (canonical form), shared with the host as `dag`.
     dag: Arc<Mutex<HashMap<String, Vertex>>>,
     /// The certificate index: (round, author) → certificate.
@@ -317,6 +318,9 @@ pub struct Engine {
     /// B255: the anchor round of the lowest block this node holds without a
     /// QC, less GC_DEPTH (`u64::MAX`: none), refreshed every tick.
     finality_floor: u64,
+    /// B318: the cursor that block's decision started from (`u64::MAX`: no
+    /// block, or one staged before it was recorded), read with the floor.
+    finality_cursor: u64,
     /// B273: the g at which `finality_floor` was last read.
     floor_read_at: u64,
     /// The active epoch E (EP-1): its number, first round and sentinel, and
@@ -456,11 +460,19 @@ impl Engine {
             }
             None => false,
         };
-        let resume_after = if guards_continuous {
-            None
+        // B405: a node without continuous guards abstains until a block
+        // carrying one of its proof-of-boot transactions is seen in this run
+        // (`epoch::note_boot_proof`); a boot took a resume time from its clock
+        // alone, and a clock an hour behind (a Pi on fake-hwclock before NTP)
+        // re-armed a wiped validator inside an epoch it had signed in. A node
+        // whose guards are continuous drops a row left from an abstention.
+        if guards_continuous {
+            storage
+                .delete(epoch::GUARD_RESUME_KEY)
+                .map_err(|e| e.to_string())?;
         } else {
-            Some(epoch::resume_point(&storage, (now_secs)())?)
-        };
+            epoch::begin_abstaining(&storage)?;
+        }
         let genesis = epoch::EpochStart {
             epoch: EPOCH,
             first_round: FIRST_ROUND,
@@ -485,7 +497,6 @@ impl Engine {
             bls_pk,
             can_sign,
             guards_continuous,
-            resume_after,
             dag: shared.dag,
             certs: HashMap::new(),
             cert_stake: BTreeMap::new(),
@@ -515,6 +526,7 @@ impl Engine {
             budget: pull::Budget::default(),
             last_floor: 0,
             finality_floor: u64::MAX,
+            finality_cursor: u64::MAX,
             floor_read_at: u64::MAX,
             gap_high: 0,
             closed: None,
@@ -716,22 +728,56 @@ impl Engine {
     /// rounds below deleted everywhere).
     fn refresh_finality_floor(&mut self) {
         self.floor_read_at = self.gc_floor();
-        self.finality_floor = crate::qc_producer::lowest_pending_qc_height(&self.storage)
-            .and_then(|h| crate::qc_producer::pending_context(&self.storage, h))
-            .map_or(u64::MAX, |ctx| {
-                ctx.decision_floor
-                    .unwrap_or_else(|| ctx.anchor_round.saturating_sub(crate::ordering::GC_DEPTH))
+        // B419: unreadable pending work holds retention (floor and cursor
+        // 0) and is read again later; as "none" it released everything.
+        // B469: its key and its row both (a row that could not be read or
+        // parse still read as none).
+        let lowest = crate::qc_producer::try_lowest_pending_qc_height(&self.storage)
+            .and_then(|low| match low {
+                Some(h) => crate::qc_producer::pending_context(&self.storage, h),
+                None => Ok(None),
             });
+        let lowest = match lowest {
+            Ok(lowest) => lowest,
+            Err(e) => {
+                eprintln!("⚠️ [B255] pending QC work is unreadable ({e}); retention held");
+                self.finality_floor = 0;
+                self.finality_cursor = 0;
+                return;
+            }
+        };
+        self.finality_floor = lowest.as_ref().map_or(u64::MAX, |ctx| {
+            ctx.decision_floor
+                .unwrap_or_else(|| ctx.anchor_round.saturating_sub(crate::ordering::GC_DEPTH))
+        });
+        self.finality_cursor = lowest
+            .and_then(|ctx| ctx.decision_cursor)
+            .unwrap_or(u64::MAX);
     }
 
     /// B255: whether this node holds `MAX_UNFINALIZED_BLOCKS` blocks above
     /// its lowest block without a QC, or (B262) runs `MAX_KEPT_ROUNDS`
-    /// rounds above the floor kept for it while that floor is below g.
+    /// rounds above the floor kept for it while that floor is below g, or
+    /// (B318) runs past `LEAD` rounds above the cursor that block's decision
+    /// started from. A member coming back stands at that cursor and drops
+    /// every copy with a payload past its lead. At an epoch's first rounds
+    /// the cursor is the first round and the floor just below it, so the
+    /// floor rule (which takes a cursor `GC_DEPTH` above the floor) let the
+    /// frontier run 50 rounds past that lead: the member never learned the
+    /// gap, and with f members withholding votes no QC formed again.
     fn finality_lags(&self) -> bool {
         let Some(low) = crate::qc_producer::lowest_pending_qc_height(&self.storage) else {
             return false;
         };
-        self.storage.get_chain_height().saturating_sub(low) >= MAX_UNFINALIZED_BLOCKS
+        // B456: a tip that cannot be read lags (this node proposes nothing
+        // until it reads again). Read as 0, it never lagged, and the node
+        // proposed on past the bound.
+        let tip_lags = match self.storage.try_chain_height() {
+            Ok(tip) => tip.saturating_sub(low) >= MAX_UNFINALIZED_BLOCKS,
+            Err(_) => true,
+        };
+        tip_lags
+            || self.current_round() > self.finality_cursor.saturating_add(ingress_v4::LEAD)
             || (self.finality_floor < self.gc_floor()
                 && self.current_round().saturating_sub(self.finality_floor) > MAX_KEPT_ROUNDS)
     }
@@ -897,14 +943,16 @@ impl Engine {
             .or_default()
     }
 
-    /// `v` waits in the pending buffer. B202/B224: a body the buffer evicts
-    /// (an author's past `PENDING_MAX_PER_AUTHOR`) is remembered in its
-    /// slot, and its copies skip Layer S while they would be evicted again
-    /// (`evicted_again`). B202 cleared the memory every tick, so an author's
-    /// bodies past its share, re-sent every tick, ran the hash and the
-    /// signature again each tick.
-    fn keep_pending(&mut self, v: Vertex) {
-        if let Some(evicted) = self.pending.push(v) {
+    /// `v` waits in the pending buffer, on the certificates of its parent
+    /// refs `missing` (indices; none for a next-epoch vertex, judged again at
+    /// activation). B202/B224: a body the buffer evicts (an author's past
+    /// `PENDING_MAX_PER_AUTHOR`) is remembered in its slot, and its copies
+    /// skip Layer S while they would be evicted again (`evicted_again`).
+    /// B202 cleared the memory every tick, so an author's bodies past its
+    /// share, re-sent every tick, ran the hash and the signature again each
+    /// tick.
+    fn keep_pending(&mut self, v: Vertex, missing: &[usize]) {
+        if let Some(evicted) = self.pending.push_waiting(v, missing) {
             let slot = self.payload_slot(&evicted);
             if slot.evicted.len() < AUTHENTICATED_PER_SLOT && !slot.evicted.contains(&evicted.hash)
             {
@@ -978,6 +1026,22 @@ impl Engine {
 
     /// IN-1, then ST and AT for a vertex that stages.
     pub fn on_vertex(&mut self, raw_len: usize, v: Vertex, net: &dyn ConsensusNet) {
+        self.judge_vertex(raw_len, v, false, net);
+    }
+
+    /// B68, B442: `v`, kept PENDING, has every parent it waited on
+    /// certified here now: judged once more, on behalf of no sender (B68:
+    /// whoever sent the last certificate did not deliver `v`), and without
+    /// Layer S, which passed it when it was kept (`v4_verdict_judged`). S1
+    /// bounded it when it arrived: it is not serialized again for a length.
+    fn wake(&mut self, v: Vertex, net: &dyn ConsensusNet) {
+        #[cfg(test)]
+        WAKES.with(|n| n.set(n.get() + 1));
+        crate::work::uncounted(|| self.judge_vertex(0, v, true, net));
+    }
+
+    /// `on_vertex`; `woken`: `v` is a body this node kept PENDING (`wake`).
+    fn judge_vertex(&mut self, raw_len: usize, v: Vertex, woken: bool, net: &dyn ConsensusNet) {
         // A copy of a body already staged: nothing to verify or stage again,
         // and nothing to harvest (every ref of a staged body had a verified
         // certificate when it staged; a relay-padded copy is not verified, so
@@ -1085,7 +1149,8 @@ impl Engine {
             let epoch = self.epoch;
             // E4's cache: a ref whose certificate is already in the index was
             // verified when it got there (CE-3 ingests only verified ones).
-            ingress_v4::v4_verdict_checked(
+            ingress_v4::v4_verdict_judged(
+                woken,
                 raw_len,
                 &v,
                 &ctx,
@@ -1175,7 +1240,8 @@ impl Engine {
                 for r in &mut v.parent_refs {
                     r.cert = None;
                 }
-                self.keep_pending(v);
+                // B442: woken once, by the last of these certificates.
+                self.keep_pending(v, &missing);
             }
             Verdict::PendingEpoch => {
                 // B119: its embedded certificates are not checked before the
@@ -1186,7 +1252,7 @@ impl Engine {
                 for r in &mut v.parent_refs {
                     r.cert = None;
                 }
-                self.keep_pending(v);
+                self.keep_pending(v, &[]);
             }
             Verdict::Ahead => {
                 // The network activated E+1 and this node has not closed E:
@@ -1546,24 +1612,15 @@ impl Engine {
             );
         }
         self.try_orderable(digest.clone());
-        // Vertices waiting on this slot's certificate are re-evaluated; the
-        // others keep waiting.
-        if !self.pending.is_empty() {
-            let (round, author) = key;
-            let (wake, wait): (Vec<Vertex>, Vec<Vertex>) =
-                self.pending.take_all().into_iter().partition(|p| {
-                    p.parent_refs
-                        .iter()
-                        .any(|r| r.round == round && r.author == author && r.digest == digest)
-                });
-            for v in wait {
-                self.pending.push(v);
-            }
-            // B68: woken by this certificate, not delivered by its sender.
-            for v in wake {
-                let len = ingress_v4::canonical_body(&v).map_or(usize::MAX, |b| b.len());
-                crate::work::uncounted(|| self.on_vertex(len, v, net));
-            }
+        // B442: the vertices that waited on this slot's certificate last are
+        // judged again, each once (`wake`); the others keep waiting. Every
+        // certificate took the whole buffer out and scanned each held
+        // vertex's refs, and each one naming the slot ran Layer S again over
+        // up to 768 KiB, uncounted: f members cost every honest node
+        // f·(n−f) runs a round, with bodies citing parents not certified yet.
+        let (round, author) = key;
+        for v in self.pending.certified(round, &author, &digest) {
+            self.wake(v, net);
         }
     }
 
@@ -1699,10 +1756,10 @@ impl Engine {
         top.map_or(self.first_round, |r| (r + 1).max(self.first_round))
     }
 
-    /// One tick: rebroadcast this node's uncertified proposals (T_RETRY is one
-    /// tick), then return the round PR-2 and PR-3 allow this node to propose
-    /// now, if any. The caller gathers a payload only then, and calls
-    /// `propose`.
+    /// One tick: send this node's uncertified proposals of the last two
+    /// rounds again (T_RETRY is one tick), then return the round PR-2 and
+    /// PR-3 allow this node to propose now, if any. The caller gathers a
+    /// payload only then, and calls `propose`.
     pub fn tick(&mut self, net: &dyn ConsensusNet) -> Option<Slot> {
         self.tick += 1;
         self.dropped.clear();
@@ -1712,9 +1769,20 @@ impl Engine {
         if self.halted.is_some() {
             return None;
         }
-        for round in self.collectors.keys() {
+        // PR-4 and RC-1 step 6 (B359): an uncertified proposal of the last
+        // two rounds goes again, to the members whose attestation it lacks.
+        // Each one went whole to every member every tick until GC: a member
+        // nobody attests (f members withholding, an honest one away) pushed
+        // ~100 bodies of up to 768 KiB a tick past its byte budget, and its
+        // new vertices were dropped with them. An older one is past being
+        // cited (the rounds above it formed their quorums without it), and
+        // its transactions return to the mempool.
+        let recent = self.current_round().saturating_sub(1);
+        for (round, collector) in self.collectors.range(recent..) {
             if let Some(v) = self.own.get(round) {
-                net.broadcast(Msg::Vertex(v.clone()));
+                for member in collector.missing() {
+                    net.send(member, Msg::Vertex(v.clone()));
+                }
             }
         }
         self.observe_floor(net);
@@ -1725,9 +1793,14 @@ impl Engine {
         // how far the DAG got and wants the whole gap (B300). B300: whether
         // or not this node may still propose: the boundary block closed the
         // epoch (EP-3) before its QC formed, nothing was sent again, and a
-        // member coming back learned nothing.
+        // member coming back learned nothing. B322: only while this node
+        // proposes nothing (the epoch closed, or finality lags): a proposal
+        // pushes the frontier anyway, and every block waits on its QC for a
+        // while, so the newest vertex (up to 768 KiB) went to every member
+        // every fourth tick in steady state.
         if self.tick.is_multiple_of(FINALITY_REBROADCAST_TICKS)
             && crate::qc_producer::lowest_pending_qc_height(&self.storage).is_some()
+            && (self.closing_round.is_some() || self.finality_lags())
         {
             if let Some(v) = self.own.values().next_back() {
                 net.broadcast(Msg::Vertex(v.clone()));
@@ -1965,6 +2038,41 @@ impl Engine {
 
     pub fn halted(&self) -> Option<&str> {
         self.halted.as_deref()
+    }
+
+    /// B405: whether this node signs now: a staked member whose BLS key is
+    /// the registered one (AT-1), with continuous guards (RC-3). A member
+    /// that abstains forwards its transactions instead of holding them.
+    pub fn signs(&self) -> bool {
+        self.can_sign && self.guards_continuous
+    }
+
+    /// B405: whether this node's guards are not continuous (RC-3): it signs
+    /// nothing until the activation of an epoch whose boundary is above its
+    /// proof of boot.
+    pub fn lacks_guards(&self) -> bool {
+        !self.guards_continuous
+    }
+
+    /// B405, B441: whether this node seeks its proof of boot: it lacks
+    /// continuous guards and its key is registered in C_E or in the live
+    /// set, which C_{E+1} is derived from at H_E. A joiner proves during
+    /// the epoch it joined in, so the boundary that admits it is above its
+    /// proof and E+1's activation re-arms it. Asked of C_E's members alone,
+    /// every joiner (no origin is written at a first key use) abstained its
+    /// whole first member epoch, and a wave of joiners cut the committee's
+    /// fault margin by their stake (G5 CH-1 bounds it near 10%) for that
+    /// epoch.
+    pub fn seeks_boot_proof(&self) -> bool {
+        !self.guards_continuous
+            && (self.can_sign
+                || crate::qc_producer::load_validator_set_v1(&self.storage).is_some_and(|live| {
+                    live.iter().any(|m| {
+                        m.address == self.cfg.address
+                            && m.stake > 0
+                            && m.bls_public_key == self.bls_pk
+                    })
+                }))
     }
 
     /// G5 BT-1: when the members whose latest vertex was refused as ahead of

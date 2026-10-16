@@ -32,18 +32,22 @@ struct Cluster {
     /// B14: accounts given AIN at genesis, with the stdlib installed, so a
     /// transaction can execute. Empty: no stdlib, as before.
     funded: Vec<(String, u128)>,
+    /// B441: validators outside C_0 whose keys genesis puts in the live set,
+    /// as a join during epoch 0 does: C_1 takes them at H_0 (EP-2).
+    joiners: Vec<ValidatorInfo>,
 }
 
 fn validator_info(seed: u8) -> ValidatorInfo {
     let (address, ed25519_public_key, key) = tier2_keypair(seed);
     let bls = BLSEngine::consensus();
     let bls_seed = derive_validator_bls_seed(&key);
+    let owner = hex::decode(&ed25519_public_key).unwrap();
     ValidatorInfo {
         address,
         stake: 1000,
         ed25519_public_key,
         bls_public_key: hex::encode(bls.pubkey_raw(&bls_seed)),
-        bls_pop: hex::encode(bls.prove_possession_raw(&bls_seed)),
+        bls_pop: hex::encode(bls.prove_possession_raw(&bls_seed, &owner)),
     }
 }
 
@@ -90,21 +94,38 @@ impl Cluster {
     ) -> Self {
         let mut cluster = Self::unopened(seeds, epoch_interval);
         cluster.funded = funded;
-        for (i, seed) in seeds.iter().enumerate() {
-            let path = storage::test_dir::process_dir()
-                .join(format!("aincore_v4_node_{}_{tag}_{i}", std::process::id()))
-                .to_string_lossy()
-                .to_string();
-            let _ = std::fs::remove_dir_all(&path);
-            cluster.seed_db(&path, *seed, v4);
-            cluster.nodes.push(Node {
-                c: None,
-                path,
-                seed: *seed,
-            });
-            cluster.open(i);
+        for seed in seeds {
+            cluster.add_node(tag, *seed, v4);
         }
         cluster
+    }
+
+    /// B441: a V4 cluster of the committee `seeds` and the nodes of
+    /// `joiners`, validators outside C_0 in the live set (`joiners`).
+    fn with_joiners(tag: &str, seeds: &[u8], joiners: &[u8], epoch_interval: u64) -> Self {
+        let mut cluster = Self::unopened(seeds, epoch_interval);
+        cluster.joiners = joiners.iter().map(|s| validator_info(*s)).collect();
+        for seed in seeds.iter().chain(joiners) {
+            cluster.add_node(tag, *seed, true);
+        }
+        cluster
+    }
+
+    /// Seed and open the next node, of seed `seed`.
+    fn add_node(&mut self, tag: &str, seed: u8, v4: bool) {
+        let i = self.nodes.len();
+        let path = storage::test_dir::process_dir()
+            .join(format!("aincore_v4_node_{}_{tag}_{i}", std::process::id()))
+            .to_string_lossy()
+            .to_string();
+        let _ = std::fs::remove_dir_all(&path);
+        self.seed_db(&path, seed, v4);
+        self.nodes.push(Node {
+            c: None,
+            path,
+            seed,
+        });
+        self.open(i);
     }
 
     /// The committee of `seeds`, with no node open yet.
@@ -120,6 +141,7 @@ impl Cluster {
             known,
             epoch_interval,
             funded: Vec::new(),
+            joiners: Vec::new(),
         }
     }
 
@@ -158,20 +180,34 @@ impl Cluster {
         if v4 {
             db.put(crate::v4::VERTEX_FORMAT_KEY, "4").unwrap();
             // The live set genesis writes: C_{E+1} derives from it (EP-2).
+            let live: Vec<ValidatorInfo> = self
+                .committee
+                .iter()
+                .chain(&self.joiners)
+                .cloned()
+                .collect();
             db.put(
                 "sys:validator_set:v1",
-                &serde_json::to_string(&self.committee).unwrap(),
+                &serde_json::to_string(&live).unwrap(),
             )
             .unwrap();
-            db.put(
-                "consensus:guard_origin",
-                &crate::v4::guard_origin(
-                    &crate::qc::expected_chain_id(),
-                    GENESIS_IDENTITY,
-                    &[seed; 32],
-                ),
-            )
-            .unwrap();
+            // B441: a joiner holds no guard origin: only a first start in
+            // the launch window writes one.
+            let joiner = self
+                .joiners
+                .iter()
+                .any(|j| j.address == tier2_keypair(seed).0);
+            if !joiner {
+                db.put(
+                    "consensus:guard_origin",
+                    &crate::v4::guard_origin(
+                        &crate::qc::expected_chain_id(),
+                        GENESIS_IDENTITY,
+                        &[seed; 32],
+                    ),
+                )
+                .unwrap();
+            }
         }
         if !self.funded.is_empty() {
             executor::test_support::load_stdlib(&db);
@@ -503,6 +539,142 @@ fn a_transaction_travels_through_a_v4_vertex_into_every_nodes_block() {
     }
 }
 
+/// B405 witness: a member whose guard database was wiped abstains, sends a
+/// proof-of-boot transaction from its own funded account, and notes the
+/// height it holds once a block carries it; it still signs nothing until a
+/// boundary above that height. The test is the forwarder here: it hands
+/// node 0's pending transactions to node 1, as `forward` does over sync for
+/// a member that does not sign.
+#[test]
+fn an_abstaining_member_proves_its_boot_through_a_block() {
+    let seeds = [61u8, 62, 63, 64];
+    let me = crypto::derive_address(
+        crypto::SigningKey::from_bytes(&[seeds[0]; 32])
+            .verifying_key()
+            .as_bytes(),
+    )
+    .unwrap();
+    let mut c = Cluster::with_funded(
+        "b405-proof",
+        &seeds,
+        true,
+        1000,
+        vec![(me, 1_000_000_000_000)],
+    );
+    c.run(4);
+    c.node(0).storage.delete("consensus:guard_origin").unwrap();
+    c.reopen(0);
+    assert!(!c.node(0).v4_signs(), "a wiped member signs");
+    c.run(1);
+    let pending = c.node(0).mempool.lock().unwrap().get_all_pending();
+    assert_eq!(pending.len(), 1, "no proof-of-boot transaction was sent");
+    let proof = pending[0].clone();
+    c.node(1)
+        .mempool
+        .lock()
+        .unwrap()
+        .add_transaction(proof.clone())
+        .expect("the proof-of-boot transaction is admitted");
+    let proven = |c: &Cluster| crate::v4::epoch::level_height(&c.node(0).storage).unwrap();
+    let receipt = format!("tx_receipt:{}", hex::encode(crypto::hash(proof.as_bytes())));
+    c.run_until(40, |c| c.node(0).storage.get(&receipt).unwrap().is_some());
+    assert!(
+        c.node(0).storage.get(&receipt).unwrap().is_some(),
+        "no block carried the proof"
+    );
+    // B421: sync imports move the stored tip, not the cached one (it moves
+    // at reload_chain_tip): the receipt is seen while the cache lags.
+    c.node_mut(0).latest_block_height = 0;
+    c.run(1);
+    let height = proven(&c).expect("the block carrying the proof was never noted");
+    let carrying = (1..=c.node(0).storage.get_chain_height())
+        .find(|h| {
+            c.node(0)
+                .storage
+                .get(&format!("block_{h}"))
+                .unwrap()
+                .and_then(|j| serde_json::from_str::<blockchain::Block>(&j).ok())
+                .is_some_and(|b| b.transactions.contains(&proof))
+        })
+        .expect("the carrying block is held");
+    assert!(
+        height >= carrying,
+        "noted {height}, below block {carrying} that carries the proof"
+    );
+    assert!(
+        !c.node(0).v4_signs(),
+        "re-armed with no boundary above the proof"
+    );
+}
+
+/// B441 witness: a validator that joined in epoch 0 (its key in the live
+/// set C_1 is derived from, not in C_0, and no guard origin: only a first
+/// start in the launch window writes one) sends its proof of boot before it
+/// is a member, so the height it notes is below H_0 and C_1's activation
+/// re-arms it: it signs from its first member epoch on. Only members of C_E
+/// sent one, so every joiner abstained its whole first member epoch, and a
+/// wave of joiners cut the committee's fault margin by their stake. The test
+/// stands in for the forwarder and for the block that carries the proof
+/// (the B405 witness runs both): it writes the proof's receipt at the joiner.
+#[test]
+fn a_joiner_proves_its_boot_before_its_first_member_epoch() {
+    const INTERVAL: u64 = 12;
+    let mut c = Cluster::with_joiners("b441-joiner", &[201, 202, 203, 204], &[205], INTERVAL);
+    let joiner = 4;
+    let address = validator_info(205).address;
+    assert!(
+        !c.node(joiner).v4_signs(),
+        "vacuous: the joiner signs in epoch 0"
+    );
+    c.run(1);
+    let pending = c.node(joiner).mempool.lock().unwrap().get_all_pending();
+    assert_eq!(
+        pending.len(),
+        1,
+        "the joiner sent no proof-of-boot transaction"
+    );
+    c.run_until(40, |c| c.node(joiner).latest_block_height >= 1);
+    let receipt = format!(
+        "tx_receipt:{}",
+        hex::encode(crypto::hash(pending[0].as_bytes()))
+    );
+    {
+        let db = &c.node(joiner).storage;
+        let _seeding = db.seeding();
+        db.put(&receipt, "{}").unwrap();
+    }
+    c.run(1);
+    let proven = crate::v4::epoch::level_height(&c.node(joiner).storage)
+        .unwrap()
+        .expect("the joiner never noted its proof");
+    assert!(
+        (1..INTERVAL).contains(&proven),
+        "noted {proven}, not below H_0 = {INTERVAL}"
+    );
+    c.run_until(400, |c| c.epoch(joiner) >= 1);
+    assert!(
+        c.epoch(joiner) >= 1,
+        "vacuous: the joiner never activated C_1"
+    );
+    assert!(
+        c.node(joiner).v4_signs(),
+        "the joiner abstains in its first member epoch"
+    );
+    let authored = |c: &Cluster| {
+        c.node(0)
+            .dag
+            .lock()
+            .unwrap()
+            .values()
+            .any(|v| v.author == address && v.epoch >= 1)
+    };
+    c.run_until(40, authored);
+    assert!(
+        authored(&c),
+        "no vertex of the joiner's was staged in epoch 1"
+    );
+}
+
 /// B14: a transaction that cannot pay is ordered, executes nowhere, and is
 /// stored nowhere: every node builds the same blocks without it.
 #[test]
@@ -699,6 +871,7 @@ fn pend(c: &Cluster, height: u64, round: u64, hash: &str) {
         finality_digest: "dd".repeat(32),
         next_validator_set_hash: String::new(),
         decision_floor: None,
+        decision_cursor: None,
     };
     c.node(0)
         .storage
@@ -877,6 +1050,12 @@ fn a_vote_from_outside_the_committee_is_charged() {
     }
     let failed = crate::work::failed_in(|| c.node_mut(0).handle_message(&vote(112))).1;
     assert_eq!(failed, 0, "a member's vote was charged");
+    // B443: and one that is not a vote at all (each was logged with its
+    // text, uncharged, so its sender was never muted).
+    for junk in ["QC_VOTE:{", "QC_VOTE:\"aaaa\"", "QC_VOTE:{\"vote\":7}"] {
+        let failed = crate::work::failed_in(|| c.node_mut(0).handle_message(junk)).1;
+        assert_eq!(failed, 1, "a malformed vote {junk:?} was not charged");
+    }
     let signer = validator_info(112).address;
     assert!(
         c.node(0)
@@ -1303,6 +1482,145 @@ fn a_node_that_missed_the_boundary_votes_fetches_the_qc_and_activates() {
     c.assert_same_blocks(8);
 }
 
+/// B317 witness: E+1 activates only once every block of E holds its QC.
+/// Activation drops C_E from the session book, so a member of C_E alone (it
+/// left the committee) could no longer send the vote a block of E without
+/// its QC needed (f members withholding theirs): that block never got one,
+/// and its pending work stopped proposals in E+1 for good.
+#[test]
+fn the_next_epoch_waits_for_every_qc_of_the_last() {
+    let mut c = Cluster::with_interval("epoch-b317", &[45, 46, 47, 48], true, 4);
+    // No vote for height 3 reaches anyone, so QC(3) cannot form; QC(4) can.
+    let no_vote_for_3 = |_: usize, _: usize, wire: &str| {
+        wire.starts_with("QC_VOTE:") && wire.contains("\"block_height\":3,")
+    };
+    for _ in 0..240 {
+        for i in 0..4 {
+            c.node_mut(i).try_create_vertex();
+        }
+        c.deliver_filtered(&no_vote_for_3);
+    }
+    assert!(
+        (0..4).all(|i| c.qc(i, 4).is_some()),
+        "vacuous: QC(H_0) did not form"
+    );
+    assert!(
+        (0..4).all(|i| c.qc(i, 3).is_none()),
+        "vacuous: QC(3) formed"
+    );
+    assert!(
+        (0..4).all(|i| c.epoch(i) == 0),
+        "epoch 1 activated with block 3 uncertified"
+    );
+    // The votes for height 3 go through again: QC(3) forms, and E+1 activates.
+    c.run_until(200, |c| (0..4).all(|i| c.epoch(i) >= 1));
+    assert!((0..4).all(|i| c.epoch(i) >= 1 && c.qc(i, 3).is_some()));
+}
+
+/// B419: a row whose key names no height, standing in for pending QC work
+/// that cannot be read (storage cannot inject a read error). It sorts before
+/// every real row, so it is the lowest.
+const UNREADABLE_PENDING: &str = "consensus:qc_pending:-junk";
+
+/// B419 witness: E+1 does not activate while this node's pending QC work
+/// cannot be read. Read as no pending work, B317's wait was skipped.
+#[test]
+fn the_next_epoch_waits_while_pending_work_is_unreadable() {
+    let mut c = Cluster::with_interval("b419-wait", &[177, 178, 179, 180], true, 4);
+    {
+        let db = &c.node(0).storage;
+        let _seed = db.seeding();
+        db.put(UNREADABLE_PENDING, "{}").unwrap();
+    }
+    c.run_until(240, |c| {
+        (1..4).all(|i| c.epoch(i) >= 1) && c.qc(0, 4).is_some()
+    });
+    c.run(10);
+    assert!(
+        (1..4).all(|i| c.epoch(i) >= 1),
+        "vacuous: the others did not activate"
+    );
+    assert!(c.qc(0, 4).is_some(), "vacuous: node 0 lacks QC(H_0)");
+    assert!(
+        c.node(0).v4.as_ref().unwrap().next_start().is_some(),
+        "vacuous: node 0 did not close"
+    );
+    assert_eq!(
+        c.epoch(0),
+        0,
+        "epoch 1 activated with the pending work unread"
+    );
+    // Control: once the work reads, node 0 activates.
+    {
+        let db = &c.node(0).storage;
+        let _seed = db.seeding();
+        db.delete(UNREADABLE_PENDING).unwrap();
+    }
+    c.run_until(200, |c| c.epoch(0) >= 1);
+    assert!(c.epoch(0) >= 1, "control: node 0 never activated");
+}
+
+/// B358 witness: a block's pending QC work is retried at the node's ticks,
+/// not once per vertex that becomes orderable. Each vertex that grew O_E ran
+/// the commit loop, whose reload of the chain tip retried up to 8 pending
+/// rows (each block read whole and its roots recomputed, a Reed-Solomon
+/// extension included, under the storage writer gate) and sent each partial
+/// vote to every member again: about 8n of each a round on every node while
+/// f members withheld their votes.
+#[test]
+fn pending_qc_work_is_retried_at_ticks_only() {
+    let mut c = Cluster::new("b358", &[161, 162, 163, 164], true);
+    let vote_for_3 =
+        |wire: &str| wire.starts_with("QC_VOTE:") && wire.contains("\"block_height\":3,");
+    // No vote for height 3 reaches anyone, so QC(3) cannot form.
+    for _ in 0..240 {
+        for i in 0..4 {
+            c.node_mut(i).try_create_vertex();
+        }
+        c.deliver_filtered(&|_, _, wire| vote_for_3(wire));
+        if (0..4).all(|i| c.node(i).latest_block_height >= 5) {
+            break;
+        }
+    }
+    assert!(
+        (0..4).all(|i| c.node(i).latest_block_height >= 5 && c.qc(i, 3).is_none()),
+        "vacuous: no blocks past 3, or QC(3) formed"
+    );
+    // Rounds of the others' vertices grow node 0's O_E, and its chain, while
+    // it does not tick: its vote for 3 is not sent again.
+    let sent = std::cell::Cell::new(0);
+    let watch = |from: usize, to: usize, wire: &str| {
+        let vote = vote_for_3(wire);
+        if vote && from == 0 && to == 1 {
+            sent.set(sent.get() + 1);
+        }
+        vote
+    };
+    let height = c.node(0).latest_block_height;
+    for _ in 0..12 {
+        for i in 1..4 {
+            c.node_mut(i).try_create_vertex();
+        }
+        c.deliver_filtered(&watch);
+    }
+    assert!(
+        c.node(0).latest_block_height > height,
+        "vacuous: node 0 placed no block"
+    );
+    assert_eq!(sent.get(), 0, "the vote for 3 went again without a tick");
+    // Its own ticks send it again, once a pass over the pending rows (a
+    // lone row is retried every other tick).
+    for _ in 0..3 {
+        c.node_mut(0).try_create_vertex();
+    }
+    c.deliver_filtered(&watch);
+    assert!(
+        (1..=2).contains(&sent.get()),
+        "{} sends of the vote for 3 in three ticks",
+        sent.get()
+    );
+}
+
 /// EP-4: a QC(H_E) whose next committee differs from the one this node
 /// derived halts ordering with `alarm:committee_mismatch`, durably. (Node 0's
 /// record is rewritten as a divergent derivation would have left it.)
@@ -1355,6 +1673,136 @@ fn a_boundary_qc_binding_another_committee_halts_the_node() {
         c.node(0).ordering_halted().is_some(),
         "the halt was forgotten"
     );
+}
+
+/// B419 witness: a corrupt record of the next epoch halts ordering with a
+/// durable alarm row, which sync stops on (`recorded_conflict`). The halt
+/// was in memory only, so sync kept importing; a read error (which storage
+/// cannot inject) halted the node the same way, until a restart.
+#[test]
+fn a_corrupt_next_epoch_record_halts_the_node_with_an_alarm() {
+    let mut c = Cluster::new("b419-record", &[173, 174, 175, 176], true);
+    c.run(2);
+    assert!(
+        c.node(0).ordering_halted().is_none(),
+        "vacuous: halted already"
+    );
+    {
+        let db = &c.node(0).storage;
+        let _seed = db.seeding();
+        db.put(&crate::v4::epoch::epoch_start_key(1), "not an epoch record")
+            .unwrap();
+    }
+    c.node_mut(0).try_create_vertex();
+    assert!(c.node(0).ordering_halted().is_some(), "node 0 did not halt");
+    assert!(
+        c.node(0)
+            .storage
+            .get(&format!("alarm:committee_mismatch:{:020}", 1))
+            .unwrap()
+            .is_some(),
+        "no alarm row"
+    );
+    assert!(
+        crate::dag::recorded_conflict(&c.node(0).storage).is_some(),
+        "sync does not stop on it"
+    );
+}
+
+/// B456: a row that is not an alarm, sorted just past every
+/// `alarm:decision_conflict:*` row: the conflict-alarm scans read its table
+/// block, and a node's other reads (other prefixes, exact keys) never do.
+const BESIDE_THE_ALARMS: &str = "alarm:decision_conflict;";
+
+/// The table files of the database at `path`.
+fn tables(path: &str) -> std::collections::BTreeSet<std::path::PathBuf> {
+    std::fs::read_dir(path)
+        .unwrap()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|file| file.extension().is_some_and(|ext| ext == "sst"))
+        .collect()
+}
+
+/// Overwrite the first bytes of `table` in place: its first data block.
+fn overwrite_start(table: &std::path::Path, bytes: &[u8]) {
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(table)
+        .and_then(|mut file| file.write_all(bytes))
+        .unwrap();
+}
+
+/// B456 witness: a node whose conflict alarms cannot be read halts
+/// ordering (here from its boot: it places no block while the others place
+/// theirs), reads them again each tick, and resumes at the first clean read
+/// without a restart, placing the blocks the others placed. Read as no
+/// alarm, a read error let it order over a recorded conflict; held until a
+/// restart, it would stop ordering while sync, which reads the alarms again
+/// each pass, went on importing (B419). The read error is real: the table
+/// holding the only row the alarm scan reads has a data block whose
+/// checksum fails (bit rot), and its bytes are then put back in place.
+#[test]
+fn a_node_halts_while_its_conflict_alarms_cannot_be_read() {
+    let mut c = Cluster::new("b456-alarms", &[185, 186, 187, 188], true);
+    let path = c.nodes[0].path.clone();
+    // The row alone in the newest table: the node's own rows are flushed
+    // to theirs first.
+    let table = {
+        let db = &c.node(0).storage;
+        db.flush().unwrap();
+        let before = tables(&path);
+        let _seed = db.seeding();
+        db.put(BESIDE_THE_ALARMS, "not an alarm").unwrap();
+        db.flush().unwrap();
+        let new: Vec<_> = tables(&path).difference(&before).cloned().collect();
+        assert_eq!(new.len(), 1, "the flush wrote one table: {new:?}");
+        new.into_iter().next().unwrap()
+    };
+    c.nodes[0].c = None;
+    let start = std::fs::read(&table).unwrap()[..4].to_vec();
+    let damaged: Vec<u8> = start.iter().map(|byte| byte ^ 0xff).collect();
+    overwrite_start(&table, &damaged);
+    c.open(0);
+    assert!(
+        c.node(0).storage.get(BESIDE_THE_ALARMS).is_err(),
+        "control: the damaged block cannot be read"
+    );
+    let why = c.node(0).ordering_halted();
+    assert!(
+        why.as_deref().is_some_and(|why| why.contains("unreadable")),
+        "a node that cannot read its conflict alarms orders: {why:?}"
+    );
+    c.run(14);
+    assert_eq!(
+        c.node(0).latest_block_height,
+        0,
+        "a node that cannot read its conflict alarms placed blocks"
+    );
+    let ahead = c.node(1).latest_block_height;
+    assert!(ahead > 0, "vacuous: the others stopped too");
+    assert!(
+        c.node(0).ordering_halted().is_some(),
+        "the halt lifted while the alarms could not be read"
+    );
+
+    // The read error passes (the bytes are back): the next tick reads the
+    // alarms clean, finds none, and ordering resumes without a restart.
+    overwrite_start(&table, &start);
+    let row = c.node(0).storage.get(BESIDE_THE_ALARMS).unwrap();
+    assert_eq!(
+        row.as_deref(),
+        Some("not an alarm"),
+        "control: the block reads again"
+    );
+    c.node_mut(0).try_create_vertex();
+    let why = c.node(0).ordering_halted();
+    assert!(
+        why.is_none(),
+        "the halt outlived the read error (only a restart lifted it): {why:?}"
+    );
+    c.run_until(60, |c| c.node(0).latest_block_height >= ahead);
+    c.assert_same_blocks(ahead);
 }
 
 /// EP-3 in one commit loop: a node cut off across H_0 learns several
@@ -2114,6 +2562,25 @@ fn the_recovery_tool_pins_the_canonical_certificate_on_every_node() {
     let refused = pin(&c, 3, &real).unwrap_err();
     assert!(refused.contains("ordered"), "{refused}");
     assert!(c.node(3).storage.get(&alarm).unwrap().is_some());
+    // B456: nor is one whose row holding the other digest cannot be read:
+    // one byte of it rotted (read lossily, it named another digest), or it
+    // does not parse. Skipped, the pin went through and cleared the halt.
+    let mut rotted = serde_json::to_string(&vec![fake.clone()])
+        .unwrap()
+        .into_bytes();
+    let at = rotted.len() - 3;
+    rotted[at] = 0xff;
+    for row in [rotted, b"[\"not closed".to_vec()] {
+        let mut batch = storage::rocksdb::WriteBatch::default();
+        batch.put(cseq.as_bytes(), &row);
+        c.node(3).storage.write_batch(batch).unwrap();
+        let refused = pin(&c, 3, &real).unwrap_err();
+        assert!(refused.contains("consensus:cseq:"), "{refused}");
+        assert!(
+            c.node(3).storage.get(&alarm).unwrap().is_some(),
+            "a refused pin cleared the alarm"
+        );
+    }
     c.node(3).storage.delete(cseq).unwrap();
 
     for i in 0..4 {
@@ -2350,12 +2817,15 @@ fn v4_local_acceptance_child() {
             assert_eq!(node.storage.get("block_1").unwrap(), block);
             assert_eq!(node.latest_block_height, 1);
             assert_eq!(node.last_adopted_height, 1);
-            verified_qc_1(&node);
             let round: blockchain::Block = serde_json::from_str(block.as_deref().unwrap()).unwrap();
             assert_eq!(
                 node.ordering_engine.lock().unwrap().finalized_round,
                 round.header.round
             );
+            // B358: the work left pending runs at the next tick (reloading
+            // the tip retried it once per vertex that grew O_E).
+            node.try_create_vertex();
+            verified_qc_1(&node);
         }
         other => panic!("unknown mode {other}"),
     }
@@ -2736,6 +3206,118 @@ fn the_checkpoint_keeps_its_block_and_decisions_are_pruned_in_every_epoch() {
     assert_eq!(decided(&s), 0, "decisions up to round {round} survived");
 }
 
+/// B369 witness: pruning keeps every block at or above the lowest whose QC
+/// this node still waits on. A retention shorter than the wait pruned it: a
+/// QC for a block not held is ignored, the pending work never cleared, and
+/// 50 blocks later the member proposed nothing again.
+#[test]
+fn pruning_keeps_the_blocks_awaiting_their_qcs() {
+    let mut c = Cluster::new("b369", &[165, 166, 167, 168], true);
+    let vote_for_3 =
+        |wire: &str| wire.starts_with("QC_VOTE:") && wire.contains("\"block_height\":3,");
+    // No vote for height 3 reaches anyone, so QC(3) cannot form.
+    for _ in 0..400 {
+        for i in 0..4 {
+            c.node_mut(i).try_create_vertex();
+        }
+        c.deliver_filtered(&|_, _, wire| vote_for_3(wire));
+        if (0..4).all(|i| c.node(i).latest_block_height >= 12) {
+            break;
+        }
+    }
+    let s = Arc::clone(&c.node(0).storage);
+    let tip = c.node(0).latest_block_height;
+    assert!(
+        tip >= 12 && c.qc(0, 3).is_none(),
+        "vacuous: tip {tip}, or QC(3) formed"
+    );
+    assert_eq!(crate::qc_producer::lowest_pending_qc_height(&s), Some(3));
+    let keep = tip - 5;
+    let pins = state_commit::pin_schedule(tip, keep, state_commit::epoch_interval(&s));
+    assert!(!pins.contains(&3), "vacuous: 3 is pinned");
+    crate::dag::prune_history(&s, tip, Some((keep, 1_000)));
+    assert!(
+        s.get("block_3").unwrap().is_some(),
+        "a block awaiting its QC was pruned"
+    );
+    // Positive control: below it, the blocks no pin keeps went.
+    let below = state_commit::pin_schedule(3 + keep, keep, state_commit::epoch_interval(&s));
+    for h in (1..3).filter(|h| !below.contains(h)) {
+        assert!(
+            s.get(&format!("block_{h}")).unwrap().is_none(),
+            "block {h} stayed"
+        );
+    }
+}
+
+/// B371 witness: pruning keeps every block this node has not adopted. Sync
+/// imports, and prunes, a whole pass before adoption runs, and adoption
+/// stops at a missing block for good: with a small retention, a validator
+/// back after a short absence never decided or voted again.
+#[test]
+fn pruning_keeps_the_blocks_not_yet_adopted() {
+    let mut c = Cluster::new("b371", &[169, 170, 171, 172], true);
+    c.run_until(400, |c| c.node(0).latest_block_height >= 12);
+    let s = Arc::clone(&c.node(0).storage);
+    let tip = c.node(0).latest_block_height;
+    assert!(tip >= 12, "vacuous: tip {tip}");
+    let keep = tip - 5;
+    let pins = state_commit::pin_schedule(tip, keep, state_commit::epoch_interval(&s));
+    assert!(!pins.contains(&4), "vacuous: 4 is pinned");
+    {
+        // Adopted up to 3: 4 and above were imported and await adoption.
+        let _seed = s.seeding();
+        s.put("consensus:last_adopted_height", "3").unwrap();
+    }
+    crate::dag::prune_history(&s, tip, Some((keep, 1_000)));
+    assert!(
+        s.get("block_4").unwrap().is_some(),
+        "a block awaiting adoption was pruned"
+    );
+    let below = state_commit::pin_schedule(4 + keep, keep, state_commit::epoch_interval(&s));
+    for h in (1..4).filter(|h| !below.contains(h)) {
+        assert!(
+            s.get(&format!("block_{h}")).unwrap().is_none(),
+            "block {h} stayed"
+        );
+    }
+}
+
+/// B419 witness: pruning skips its run while the pending QC work cannot be
+/// read. Read as no pending work, B369's clamp was dropped and a block
+/// awaiting its QC could be pruned.
+#[test]
+fn pruning_skips_while_pending_work_is_unreadable() {
+    let mut c = Cluster::new("b419-prune", &[181, 182, 183, 184], true);
+    c.run_until(400, |c| c.node(0).latest_block_height >= 12);
+    let s = Arc::clone(&c.node(0).storage);
+    let tip = c.node(0).latest_block_height;
+    assert!(tip >= 12, "vacuous: tip {tip}");
+    let keep = tip - 5;
+    let pins = state_commit::pin_schedule(tip, keep, state_commit::epoch_interval(&s));
+    let unpinned: Vec<u64> = (1..5).filter(|h| !pins.contains(h)).collect();
+    assert!(!unpinned.is_empty(), "vacuous: every low block is pinned");
+    let held = |s: &StateDB| {
+        unpinned
+            .iter()
+            .filter(|h| s.get(&format!("block_{h}")).unwrap().is_some())
+            .count()
+    };
+    {
+        let _seed = s.seeding();
+        s.put(UNREADABLE_PENDING, "{}").unwrap();
+    }
+    crate::dag::prune_history(&s, tip, Some((keep, 1_000)));
+    assert_eq!(held(&s), unpinned.len(), "a block was pruned");
+    // Control: once the work reads, the same run prunes them.
+    {
+        let _seed = s.seeding();
+        s.delete(UNREADABLE_PENDING).unwrap();
+    }
+    crate::dag::prune_history(&s, tip, Some((keep, 1_000)));
+    assert_eq!(held(&s), 0, "control: the blocks stayed");
+}
+
 #[test]
 fn pruning_a_block_takes_its_finality_rows() {
     let mut c = Cluster::new("b6-prune", &[111, 112, 113, 114], true);
@@ -2905,11 +3487,21 @@ fn a_blocks_pending_work_keeps_the_floor_its_decision_walked_to() {
     let db = &c.node(1).storage;
     let low =
         crate::qc_producer::lowest_pending_qc_height(db).expect("vacuous: no pending QC work");
-    let ctx = crate::qc_producer::pending_context(db, low).unwrap();
+    let ctx = crate::qc_producer::pending_context(db, low)
+        .unwrap()
+        .expect("vacuous: the lowest pending work has no row");
     let previous_anchor = c.block(1, low - 1).map(|(round, _)| round).unwrap();
     let floor = ctx
         .decision_floor
         .expect("the decision's floor is recorded");
+    // B318: and the cursor it started from, the round after the previous
+    // anchor (a member's proposals stay within LEAD of it while the QC is
+    // missing).
+    assert_eq!(
+        ctx.decision_cursor,
+        Some(previous_anchor + 1),
+        "the decision's cursor is not recorded"
+    );
     assert_eq!(
         floor,
         previous_anchor.saturating_sub(crate::ordering::GC_DEPTH)
@@ -2924,4 +3516,107 @@ fn a_blocks_pending_work_keeps_the_floor_its_decision_walked_to() {
         floor,
         "the kept floor is not the decision's"
     );
+}
+
+/// B425 witness: right after this node places H_0, the next epoch's record
+/// is not observed (moved aside: storage cannot inject the read error that
+/// B419 turned into no decision). Ordering closes E only when the record is
+/// read, so the commit loop went on and decided an epoch-0 anchor above r*
+/// for height 5, which no peer builds. Placement stalls first, as in
+/// `a_commit_loop_stops_at_the_boundary_even_when_later_anchors_are_ready`,
+/// so epoch-0 anchors above r* are ready when H_0 is placed.
+#[test]
+fn nothing_is_decided_above_the_boundary_while_the_close_is_unknown() {
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    static BLOCKED: AtomicBool = AtomicBool::new(false);
+    static HIDING: AtomicBool = AtomicBool::new(false);
+    static HIDDEN: Mutex<Option<String>> = Mutex::new(None);
+    fn gate(_: u8, _: &StateDB) -> Result<(), String> {
+        if BLOCKED.load(SeqCst) {
+            return Err("placement stalled (test)".into());
+        }
+        Ok(())
+    }
+    // After a block is committed (1) or adopted (3): once E+1's record is
+    // there, move it aside, once.
+    fn hide(stage: u8, db: &StateDB) -> Result<(), String> {
+        if (stage != 1 && stage != 3) || !HIDING.load(SeqCst) {
+            return Ok(());
+        }
+        let key = crate::v4::epoch::epoch_start_key(1);
+        let _seed = db.seeding();
+        if let Some(raw) = db.get(&key).map_err(|e| e.to_string())? {
+            db.delete(&key).map_err(|e| e.to_string())?;
+            *HIDDEN.lock().unwrap() = Some(raw);
+            HIDING.store(false, SeqCst);
+        }
+        Ok(())
+    }
+    let mut c = Cluster::with_interval("b425-close", &[221, 222, 223, 224], true, 4);
+    for i in 0..4 {
+        c.node_mut(i).pre_execution_hook = Some(gate);
+    }
+    c.node_mut(0).local_acceptance_hook = Some(hide);
+    HIDING.store(true, SeqCst);
+    c.run_until(80, |c| (0..4).all(|i| c.node(i).latest_block_height >= 3));
+    BLOCKED.store(true, SeqCst);
+    let stalled_at = c.node(0).latest_block_height;
+    c.run(14);
+    assert_eq!(
+        c.node(0).latest_block_height,
+        stalled_at,
+        "placement was not stalled"
+    );
+    BLOCKED.store(false, SeqCst);
+    c.run_until(300, |c| {
+        (1..4).all(|i| c.epoch(i) >= 1 && c.node(i).latest_block_height >= 7)
+    });
+    c.run(4);
+    assert!(
+        HIDDEN.lock().unwrap().is_some(),
+        "vacuous: the record was never moved aside"
+    );
+    assert!(
+        (1..4).all(|i| c.epoch(i) >= 1 && c.node(i).latest_block_height >= 7),
+        "vacuous: the others did not go past the boundary"
+    );
+    assert!(
+        c.node(0).v4.as_ref().unwrap().next_start().is_none(),
+        "vacuous: node 0 knows the close"
+    );
+    assert_eq!(
+        c.node(0).latest_block_height,
+        4,
+        "node 0 decided above H_0 while the close was unknown"
+    );
+    assert!(c.block(0, 5).is_none(), "node 0 placed a block above H_0");
+    // Control: once the record reads, node 0 closes, activates and places
+    // the network's blocks after H_0, each anchoring an epoch-1 vertex.
+    {
+        let raw = HIDDEN.lock().unwrap().take().unwrap();
+        let db = &c.node(0).storage;
+        let _seed = db.seeding();
+        db.put(&crate::v4::epoch::epoch_start_key(1), &raw).unwrap();
+    }
+    c.run_until(300, |c| {
+        c.epoch(0) >= 1 && c.node(0).latest_block_height >= 6
+    });
+    assert!(c.epoch(0) >= 1, "control: node 0 never activated");
+    let placed = c.assert_same_blocks(6);
+    let db = &c.node(0).storage;
+    for h in 5..=placed {
+        let block: blockchain::Block =
+            serde_json::from_str(&db.get(&format!("block_{h}")).unwrap().unwrap()).unwrap();
+        let anchor: blockchain::Vertex = serde_json::from_str(
+            &db.get(&format!("vertex:{}", block.anchor_hash))
+                .unwrap()
+                .expect("the anchor body is held"),
+        )
+        .unwrap();
+        assert!(
+            anchor.epoch >= 1,
+            "control: block {h} anchors an epoch-{} vertex",
+            anchor.epoch
+        );
+    }
 }

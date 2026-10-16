@@ -42,7 +42,8 @@ use crate::qc::{self, build_qc, verify_qc, FinalityVote, QuorumCertificate, Vali
 
 mod recovery;
 pub(crate) use recovery::{
-    lowest_pending_qc_height, pending_context, retry_pending_qcs, stage_pending_qc,
+    lowest_pending_qc_height, pending_context, retry_pending_qc_at, retry_pending_qcs,
+    stage_pending_qc, try_lowest_pending_qc_height,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -206,6 +207,21 @@ pub fn verify_block_qc(
     verify_header_qc(storage, &block.header, qc)
 }
 
+/// B353: `verify_block_qc` but the pairing, for a QC this node stored (every
+/// path that stores one verified it first). A synced block's QC was paired
+/// four times: at sync's check, when stored with the block, at adoption and
+/// at its pending row's retry.
+pub fn block_qc_binds(
+    storage: &StateDB,
+    block: &blockchain::Block,
+    qc: &QuorumCertificate,
+) -> Result<(), String> {
+    if qc.anchor_hash != block.anchor_hash {
+        return Err("the QC does not bind this block's anchor hash".into());
+    }
+    header_binds(storage, &block.header, qc).map(|_| ())
+}
+
 /// B275: `verify_block_qc` for a block known by its header alone (all it
 /// binds but the anchor hash, a body field): checked before a client asks
 /// for the parts of a block too large for a sync answer. The cheap field
@@ -215,6 +231,20 @@ pub fn verify_header_qc(
     header: &blockchain::BlockHeader,
     qc: &QuorumCertificate,
 ) -> Result<(), String> {
+    let epoch = header_binds(storage, header, qc)?;
+    let validators =
+        load_validator_set_for_epoch(storage, epoch).ok_or("no committee for this epoch")?;
+    crate::qc::verify_qc(qc, &validators, &crate::qc::expected_chain_id())
+        .map_err(|e| format!("the QC does not verify: {e}"))
+}
+
+/// B335: that `qc` binds `header` (all `verify_header_qc` checks but the
+/// signature); the epoch of its height.
+fn header_binds(
+    storage: &StateDB,
+    header: &blockchain::BlockHeader,
+    qc: &QuorumCertificate,
+) -> Result<u64, String> {
     let h = header.height;
     let epoch = epoch_for_block_height(storage, h).ok_or("no epoch for this height")?;
     let checks = [
@@ -228,10 +258,7 @@ pub fn verify_header_qc(
     if let Some((_, field)) = checks.iter().find(|(ok, _)| !ok) {
         return Err(format!("the QC does not bind this block's {field}"));
     }
-    let validators =
-        load_validator_set_for_epoch(storage, epoch).ok_or("no committee for this epoch")?;
-    crate::qc::verify_qc(qc, &validators, &crate::qc::expected_chain_id())
-        .map_err(|e| format!("the QC does not verify: {e}"))
+    Ok(epoch)
 }
 
 /// The stored QC of height `h`, if any.
@@ -267,6 +294,10 @@ pub struct CommitContext {
     /// (`CommitInfo::decision_floor`), what is kept while this QC is missing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision_floor: Option<u64>,
+    /// B318: `CommitInfo::decision_cursor`: while this QC is missing, a
+    /// member proposes nothing more than `LEAD` rounds above it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_cursor: Option<u64>,
 }
 
 /// Outcome of contributing THIS node's signature to a committed block.
@@ -773,6 +804,8 @@ fn check_held_block(storage: &StateDB, cert: &QuorumCertificate) -> Result<(), S
     if !crate::v4::is_v4_chain(storage) {
         return Ok(());
     }
+    #[cfg(test)]
+    HELD_BLOCK_READS.with(|n| n.set(n.get() + 1));
     let Some(raw) = storage
         .get(&format!("block_{}", cert.block_height))
         .map_err(|e| e.to_string())?
@@ -780,7 +813,12 @@ fn check_held_block(storage: &StateDB, cert: &QuorumCertificate) -> Result<(), S
         return Ok(());
     };
     let held: blockchain::Block = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
-    if held.header.hash != cert.block_hash {
+    held_block_binds(cert, &held.header.hash)
+}
+
+/// IM-3 on the hash of the block held at the QC's height (a verified QC).
+fn held_block_binds(cert: &QuorumCertificate, held_hash: &str) -> Result<(), String> {
+    if held_hash != cert.block_hash {
         return Err(crate::alarm::raise(
             crate::alarm::Alarm::DecisionConflict,
             format!(
@@ -788,7 +826,7 @@ fn check_held_block(storage: &StateDB, cert: &QuorumCertificate) -> Result<(), S
                 crate::ordering::DECISION_CONFLICT,
                 cert.block_height,
                 cert.block_hash,
-                held.header.hash
+                held_hash
             ),
         ));
     }
@@ -808,6 +846,12 @@ pub fn record_decision_conflict(storage: &StateDB, height: u64, err: &str) {
 // replay of an older height must not regress the latest pointer.
 fn store_certificate(storage: &StateDB, cert: &QuorumCertificate) -> Result<(), String> {
     check_held_block(storage, cert)?;
+    put_certificate(storage, cert)
+}
+
+/// `store_certificate` for a QC whose held block the caller bound already
+/// (B443: `stage_certificate` read it once; this read it again).
+fn put_certificate(storage: &StateDB, cert: &QuorumCertificate) -> Result<(), String> {
     check_certified_root(storage, cert)?;
     let height_key = format!("consensus:qc:{}", cert.block_height);
     let round_key = format!("consensus:qc_by_round:{}", cert.anchor_round);
@@ -931,8 +975,10 @@ fn stage_imported_finality(storage: &StateDB, cert: &QuorumCertificate) -> Resul
 /// The V4 import of a verified QC for a held block, inside the caller's
 /// transaction (sync stores it with the block it certifies, so a crash cannot
 /// leave the block without its QC; final review HIGH).
+/// B353: a QC sync verified (`verify_block_qc`) just before, staged with
+/// its block: every check but the pairing.
 pub fn stage_block_qc(view: &StateDB, cert: &QuorumCertificate) -> Result<bool, String> {
-    stage_imported_certificate(view, cert)
+    stage_certificate(view, cert, true)
 }
 
 #[cfg(test)]
@@ -940,26 +986,71 @@ thread_local! {
     /// B101 witness support: the QC verifications an import ran on this
     /// thread.
     static QC_PAIRINGS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// B443 witness support: the held blocks read on this thread to stage
+    /// or store a QC.
+    static HELD_BLOCK_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 fn stage_imported_certificate(storage: &StateDB, cert: &QuorumCertificate) -> Result<bool, String> {
+    stage_certificate(storage, cert, false)
+}
+
+/// B443: `verify_qc` under the committee, any failure charged once (B229's
+/// `charged_once`): a failed pairing charges itself, but the checks before
+/// it (no signer, a signer past the committee, a stake the committee does
+/// not give, below the quorum) did not, and no honest node sends a QC that
+/// fails one.
+fn verify_qc_charged(cert: &QuorumCertificate, committee: &[ValidatorInfo]) -> Result<(), String> {
+    let (verdict, failed) =
+        crate::work::failed_in(|| verify_qc(cert, committee, &qc::expected_chain_id()));
+    if verdict.is_err() && failed == 0 {
+        crate::work::note_failed_check();
+    }
+    verdict.map_err(|e| format!("finality QC verification failed: {e:?}"))
+}
+
+/// A QC staged for a held block; `verified`: its pairing ran already
+/// (`stage_block_qc`).
+fn stage_certificate(
+    storage: &StateDB,
+    cert: &QuorumCertificate,
+    verified: bool,
+) -> Result<bool, String> {
     let Some(epoch) = epoch_for_block_height(storage, cert.block_height) else {
         return Ok(false);
     };
     if cert.epoch != epoch {
+        // B443: charged: no honest node sends one (E(h) is arithmetic on a
+        // V4 chain), and it went uncharged for any height, with a log line.
+        crate::work::note_failed_check();
         return Err("finality QC epoch is not its height's epoch".into());
     }
     // B101: before any pairing, a QC with nothing to bind or add: its block
     // is not held (no conflict is possible either), or it is stored already.
     // A replay of a valid QC cost a pairing and a synced commit each time.
     // B190: and before the committee record is parsed.
-    if stored_qc(storage, cert.block_height).as_ref() == Some(cert) {
+    // B335: nor any QC of a vote stored already, whatever its signers or
+    // encoding (an honest peer's QC over another subset cost two pairings
+    // and a synced rewrite).
+    if stored_qc(storage, cert.block_height)
+        .is_some_and(|held| held.finality_vote() == cert.finality_vote())
+    {
         return Ok(false);
     }
     // B225: a height this node cannot hold (pruned, or not reached), from
     // small rows, before the committee: B205 put the committee first, so
     // a member's QC naming such a height parsed the record, uncharged.
     if !storage.may_hold_block(cert.block_height) {
+        return Ok(false);
+    }
+    // B443: nor on a V4 node before its first block: it holds none (genesis
+    // writes no block, and every block is written with the tip), but with
+    // no tip `may_hold_block` holds for any height, and the pairing now
+    // comes before the block is read: each replayed QC cost such a node one
+    // (B101's cost). A tip that cannot be read takes nothing either (the QC
+    // is asked again).
+    let no_tip = !matches!(storage.try_get("latest_height"), Ok(Some(_)));
+    if no_tip && crate::v4::is_v4_chain(storage) {
         return Ok(false);
     }
     // B205: the committee before the held block (up to a whole block read),
@@ -975,21 +1066,47 @@ fn stage_imported_certificate(storage: &StateDB, cert: &QuorumCertificate) -> Re
             cert.validator_set_hash, committee.hash
         ));
     }
+    // B355: its chain and encoding before the block is read, charged: a
+    // member's QC with another version or a padded bitmap read a whole held
+    // block under the consensus lock and was refused uncharged (B51 never
+    // muted it), with a log line each.
+    if let Err(e) = qc::canonical(cert, committee.set.len(), &qc::expected_chain_id()) {
+        crate::work::note_failed_check();
+        return Err(format!("finality QC refused: {e:?}"));
+    }
+    // B443: the stake checks and the pairing before the block is read, any
+    // failure charged: a member's QC with no signer or a wrong stake, or a
+    // session's forged signature over a public QC's fields, read the whole
+    // held block under the writer gate first, and the stake refusals went
+    // uncharged (B51 never muted the member). A height above the tip or
+    // pruned costs no pairing (`may_hold_block`, B101), nor any height on a
+    // V4 node with no tip (above).
+    if !verified {
+        #[cfg(test)]
+        QC_PAIRINGS.with(|p| p.set(p.get() + 1));
+        verify_qc_charged(cert, &committee.set)?;
+    }
+    #[cfg(test)]
+    HELD_BLOCK_READS.with(|n| n.set(n.get() + 1));
     let Some(raw) = storage
         .get(&format!("block_{}", cert.block_height))
         .map_err(|e| e.to_string())?
     else {
         return Ok(false);
     };
-    #[cfg(test)]
-    QC_PAIRINGS.with(|p| p.set(p.get() + 1));
-    verify_qc(cert, &committee.set, &qc::expected_chain_id())
-        .map_err(|e| format!("finality QC verification failed: {e:?}"))?;
-    // Verified: a QC for another block at a held height is now a conflict.
-    check_held_block(storage, cert)?;
+    // B443: the block read once, parsed once (it was read and parsed three
+    // times, under the writer gate).
     let block: blockchain::Block = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
-    verify_block_qc(storage, &block, cert)?;
-    store_certificate(storage, cert)?;
+    // Verified: a QC for another block at a held height is now a conflict.
+    if crate::v4::is_v4_chain(storage) {
+        held_block_binds(cert, &block.header.hash)?;
+    }
+    // B335: verified once, above (`verify_block_qc` paired it again).
+    if cert.anchor_hash != block.anchor_hash {
+        return Err("the QC does not bind this block's anchor hash".into());
+    }
+    header_binds(storage, &block.header, cert)?;
+    put_certificate(storage, cert)?;
     Ok(true)
 }
 
@@ -1477,7 +1594,7 @@ mod tests {
             stake,
             ed25519_public_key: "00".repeat(32),
             bls_public_key: hex::encode(bls.pubkey_raw(&seed)),
-            bls_pop: hex::encode(bls.prove_possession_raw(&seed)),
+            bls_pop: hex::encode(bls.prove_possession_raw(&seed, &[0u8; 32])),
         }
     }
 
@@ -1495,6 +1612,7 @@ mod tests {
             finality_digest: "34".repeat(32),
             next_validator_set_hash: String::new(),
             decision_floor: None,
+            decision_cursor: None,
         }
     }
 

@@ -34,7 +34,23 @@ fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// What a build without tests compiles of `text`: up to its first top-level
+/// test module. A test's mock RPC server (the CLI's, the indexer's, the
+/// bridge's, bench-tps's) is no peer channel.
+fn outside_tests(text: &str) -> &str {
+    [
+        "\n#[cfg(test)]\nmod ",
+        "\n#[cfg(test)]\npub mod ",
+        "\n#[cfg(test)]\npub(crate) mod ",
+    ]
+    .iter()
+    .filter_map(|marker| text.find(marker))
+    .min()
+    .map_or(text, |at| &text[..at])
+}
+
 fn offences(text: &str) -> Vec<&'static str> {
+    let text = outside_tests(text);
     FORBIDDEN
         .into_iter()
         .filter(|name| text.contains(name))
@@ -72,4 +88,10 @@ fn the_scan_sees_a_raw_socket() {
     let line = format!("use tokio::net::{}{};", "Tcp", "Stream");
     assert_eq!(offences(&line), ["TcpStream"]);
     assert!(offences("use libp2p::tcp;").is_empty());
+    // A test module's mock server is not one; code before it still is.
+    let listener = format!("std::net::{}{}", "Tcp", "Listener");
+    let in_tests = format!("fn main() {{}}\n#[cfg(test)]\nmod tests {{ {listener} }}");
+    assert!(offences(&in_tests).is_empty());
+    let before = format!("{line}\n#[cfg(test)]\nmod tests {{}}");
+    assert_eq!(offences(&before), ["TcpStream"]);
 }
