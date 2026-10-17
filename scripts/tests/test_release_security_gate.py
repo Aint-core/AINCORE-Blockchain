@@ -27,6 +27,8 @@ class GateTests(unittest.TestCase):
 
     def fake(self, command):
         self.calls.append(command)
+        if command[1] == "build":
+            return result(command, "")
         package = command[command.index("-p") + 1]
         policy = self.manifest["packages"][package]
         if "--list" in command:
@@ -46,9 +48,28 @@ class GateTests(unittest.TestCase):
         for command in self.calls:
             self.assertIn("--locked", command)
             self.assertIn("--offline", command)
-            if "--list" not in command:
+            if command[1] == "build":
+                self.assertEqual(command, ["cargo", "build", "--locked", "--offline",
+                                          "-p", "executor", "--lib", "--no-default-features"])
+            elif "--list" not in command:
                 for flag in ("--exact", "--include-ignored", "--test-threads=1"):
                     self.assertIn(flag, command)
+
+    def test_normal_build_failure_is_not_masked_by_green_tests(self):
+        for code, timed_out in ((101, False), (-9, True)):
+            def fail_build(command):
+                record = self.fake(command)
+                if command[1] == "build":
+                    record.update(returncode=code, timeout=timed_out)
+                return record
+
+            with self.subTest(code=code, timeout=timed_out):
+                report = gate.evaluate(self.manifest, fail_build)
+                self.assertFalse(report["passed"])
+                self.assertEqual(report["errors"],
+                                 ["executor: normal library build failed or timed out"])
+                self.assertEqual(len(report["witnesses"]), self.required_count())
+                self.assertTrue(all(w["passed"] for w in report["witnesses"]))
 
     def test_missing_name_and_new_ignored_fail_closed(self):
         policy = copy.deepcopy(self.manifest)
@@ -108,7 +129,7 @@ class GateTests(unittest.TestCase):
     def test_failed_witness_does_not_hide_later_results(self):
         def fail_tests(command):
             record = self.fake(command)
-            if "--list" not in command:
+            if command[1] == "test" and "--list" not in command:
                 record["returncode"] = 101
             return record
         report = gate.evaluate(self.manifest, fail_tests)

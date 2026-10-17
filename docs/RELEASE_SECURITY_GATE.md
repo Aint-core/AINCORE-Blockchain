@@ -82,6 +82,24 @@ and feature-matrix testing, independent review, physical crash testing, and
 multi-operator operational evidence remain required before release. Only local
 verification processes were terminated; no live service was changed.
 
+## 2026-10-17 NAS follow-up
+
+The NAS run of `ed2fa1b` completed with 120 passing witnesses, but the gate
+failed: `chain_sync` could not build its normal executor dependency, so its
+eight witnesses did not run. The estimator called `coin_store_key`, which
+was incorrectly restricted to `cfg(test)` or `test-support`. This is a build
+integration failure, not a passing 128-witness result.
+
+The pure resource-key helper is now available in normal builds; no seeding
+helper or `test-support` feature was enabled for production. The gate first
+builds executor alone with `--no-default-features` and fails if that build fails
+or times out, even when all unit witnesses pass. A new gate control tests both
+failure modes. A fresh NAS report is required to verify this repair. This
+normal development-profile build is not a substitute for release-profile CI.
+All 11 Python gate controls passed on the NAS after this change. The Rust
+normal-build and witness rerun are still pending; do not infer their success
+from those control tests.
+
 ## Run locally
 
 From the repository root, with Rust 1.90.0 and Python 3 available:
@@ -101,6 +119,9 @@ tools, timeout, inventory errors, missing tests or a red witness.
 
 ## Contract
 
+- Build executor as a normal library in a separate Cargo invocation, without
+  default features or test-support. A failure or timeout fails the gate even
+  if all subsequently collected witnesses pass.
 - Enumerate library tests and ignored library tests separately in `blockchain`,
   `chain_sync`, `consensus`, `executor`, `node`, `state_commit`, `storage` and
   `vm_move`. Inventory counts and names must agree.

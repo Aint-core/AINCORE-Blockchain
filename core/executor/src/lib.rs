@@ -158,7 +158,6 @@ fn aincore_coin_type() -> move_core_types::language_storage::TypeTag {
     ))
 }
 
-#[cfg(any(test, feature = "test-support"))]
 fn coin_store_key(addr: move_core_types::account_address::AccountAddress) -> String {
     let tag = move_core_types::language_storage::StructTag {
         address: system_address(),

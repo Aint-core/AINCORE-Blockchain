@@ -98,6 +98,13 @@ def evaluate(manifest, execute=run, offline=False):
         report["commands"].append(result)
         return result
 
+    # Unit tests and workspace feature unification can hide cfg(test) helpers
+    # accidentally called by production code. Build this library in isolation.
+    normal_build = ["cargo", "build", "--locked"] + (["--offline"] if offline else [])
+    normal_build += ["-p", "executor", "--lib", "--no-default-features"]
+    if not successful(capture(normal_build)):
+        report["errors"].append("executor: normal library build failed or timed out")
+
     for package, policy in manifest["packages"].items():
         base = ["cargo", "test", "--locked"] + (["--offline"] if offline else [])
         base += ["-p", package, "--lib"]
