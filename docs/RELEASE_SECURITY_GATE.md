@@ -102,6 +102,22 @@ from those control tests.
 
 ## Run locally
 
+NAS verification of clean commit `67cb23f0b4491b824d4aceb06d7f8b4627309b5d`
+finished on 2026-10-17 at 11:30:07 UTC using Rust/Cargo 1.95.0: the normal
+executor build and all 128 required witnesses passed, with no gate errors.
+The NAS report is `target/nas-release-security-gate-67cb23f.json`. This does
+not establish the full regression, strict lint or release build results, nor
+the separately pinned Rust 1.90.0 hosted workflow.
+
+For the next isolated stage, `bash scripts/hardening_regression.sh` runs gate
+controls, the eight-package tests including integration tests, strict clippy,
+and release builds of node/indexer/CLI/genesis-tool, stopping at the first
+failure. Each stage has its own log under a unique
+`target/hardening-regression-*` directory. Only `stage=complete` with
+`exit_code=0` in `result.txt` establishes that all stages completed. A missing
+result after a power cut or forced termination is incomplete, not success.
+Run it with external CPU/RAM/time limits; it does not launch or deploy nodes.
+
 From the repository root, with Rust 1.90.0 and Python 3 available:
 
 ```sh
