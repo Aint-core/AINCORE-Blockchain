@@ -2781,7 +2781,8 @@ mod tests {
 
         let payload = transfer_payload(&sender, &recipient, 250);
         let executor = Executor::new(db.clone());
-        let tx_json = signed_tx(&sender_key, &sender, &payload, 0, 100_000, 1);
+        // Include retained-history write gas in this successful-transfer fixture.
+        let tx_json = signed_tx(&sender_key, &sender, &payload, 0, 500_000, 1);
         let gas_limit = serde_json::from_str::<Transaction>(&tx_json)
             .unwrap()
             .gas_limit as u128;

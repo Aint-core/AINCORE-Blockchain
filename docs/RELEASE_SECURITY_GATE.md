@@ -151,6 +151,30 @@ only reverted unrelated formatter changes and updated documentation/the runner.
 Full regression, clippy, and release results for this repair are pending. The
 earlier 128-witness pass applies to `67cb23f`, not automatically to this revision.
 
+## 2026-10-18 genesis fixture follow-up
+
+The full runner on `930d5e5` exited 101 at the node library suite. Completed
+library suites: blockchain 82 passed, chain_sync 256 passed/1 ignored,
+consensus 416 passed/7 ignored, executor 218 passed/2 ignored. The consensus
+and executor installed-chain-ID integration tests each passed. Node reported
+129 passed and one failure; later stages did not run.
+
+`test_fresh_genesis_then_executor_accepts_bcs_transfer_path` still supplied a
+100,000 execution budget despite retained-history writes costing 212,695 plus
+5,138 execution gas. Execution correctly aborted the transfer for insufficient
+gas. The successful-transfer fixture now supplies 500,000 execution gas; sender
+funding, exact fee deduction, and the 250-unit recipient assertion are retained.
+Production gas accounting and genesis configuration are unchanged.
+
+All 56 genesis tests passed on NAS (zero failed/ignored, 74 filtered out,
+44.43 seconds) in `target/genesis-gas-20261018.log`; the user service
+`aincore-genesis-gas-20261018` finished with exit 0. The continuation must run
+the full node/storage/vm_move/state_commit tests, all required witnesses, block
+identity vectors, the original eight-package strict lint, and release builds.
+Earlier package results remain evidence for `930d5e5`, not a claim of a single
+all-green full run on this later test-fixture-only revision. Continuation results
+are pending. No release binary has been published from these partial results.
+
 ## Run locally
 
 From the repository root, with Rust 1.90.0 and Python 3 available:
