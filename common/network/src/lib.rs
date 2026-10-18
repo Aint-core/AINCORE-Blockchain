@@ -96,16 +96,21 @@ impl SessionClient {
         timeout: std::time::Duration,
     ) -> Result<String, String> {
         let (reply, answer) = tokio::sync::oneshot::channel();
-        self.dials
-            .send(SyncDial {
-                addr: addr.to_string(),
-                reply,
-            })
-            .await
-            .map_err(|_| "the network task is gone".to_string())?;
-        match tokio::time::timeout(timeout, answer).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err("the network task dropped the dial".to_string()),
+        let operation = async {
+            self.dials
+                .send(SyncDial {
+                    addr: addr.to_string(),
+                    reply,
+                })
+                .await
+                .map_err(|_| "the network task is gone".to_string())?;
+            answer
+                .await
+                .map_err(|_| "the network task dropped the dial".to_string())?
+        };
+        // Queue admission and the reply share the caller's deadline.
+        match tokio::time::timeout(timeout, operation).await {
+            Ok(result) => result,
             Err(_) => Err(format!("no session to {addr} within {timeout:?}")),
         }
     }
@@ -134,19 +139,22 @@ impl SessionClient {
         timeout: std::time::Duration,
     ) -> Result<String, AskError> {
         let (reply, answer) = tokio::sync::oneshot::channel();
-        self.asks
-            .send(SyncAsk {
-                peer: peer.to_string(),
-                wire: wire.to_string(),
-                reply,
-            })
-            .await
-            .map_err(|_| AskError::Failed("the network task is gone".to_string()))?;
-        match tokio::time::timeout(timeout, answer).await {
-            Ok(Ok(result)) => result.map_err(AskError::Failed),
-            Ok(Err(_)) => Err(AskError::Failed(
-                "the network task dropped the request".to_string(),
-            )),
+        let operation = async {
+            self.asks
+                .send(SyncAsk {
+                    peer: peer.to_string(),
+                    wire: wire.to_string(),
+                    reply,
+                })
+                .await
+                .map_err(|_| AskError::Failed("the network task is gone".to_string()))?;
+            answer
+                .await
+                .map_err(|_| AskError::Failed("the network task dropped the request".to_string()))?
+                .map_err(AskError::Failed)
+        };
+        match tokio::time::timeout(timeout, operation).await {
+            Ok(result) => result,
             Err(_) => Err(AskError::Timeout),
         }
     }
@@ -165,6 +173,103 @@ pub enum AskError {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[tokio::test(start_paused = true)]
+    async fn full_queues_timeout_without_enqueuing_expired_work() {
+        let (client, mut asks, mut dials) = client();
+        for _ in 0..4 {
+            let (reply, _) = tokio::sync::oneshot::channel();
+            client
+                .asks
+                .try_send(SyncAsk {
+                    peer: "old".into(),
+                    wire: "x".into(),
+                    reply,
+                })
+                .unwrap();
+            let (reply, _) = tokio::sync::oneshot::channel();
+            client
+                .dials
+                .try_send(SyncDial {
+                    addr: "old".into(),
+                    reply,
+                })
+                .unwrap();
+        }
+        let limit = Duration::from_millis(10);
+        let result =
+            tokio::time::timeout(Duration::from_secs(1), client.ask_timed("new", "x", limit))
+                .await
+                .expect("queue admission exceeded deadline");
+        assert_eq!(result, Err(AskError::Timeout));
+        let result = tokio::time::timeout(Duration::from_secs(1), client.connect("new", limit))
+            .await
+            .expect("dial queue admission exceeded deadline");
+        assert_eq!(
+            result.unwrap_err(),
+            format!("no session to new within {limit:?}")
+        );
+        for _ in 0..4 {
+            assert_eq!(asks.try_recv().unwrap().peer, "old");
+            assert_eq!(dials.try_recv().unwrap().addr, "old");
+        }
+        assert!(matches!(
+            asks.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            dials.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queue_admission_does_not_restart_reply_deadline() {
+        let (client, mut asks, mut dials) = client();
+        let ask_permits = client.asks.reserve_many(4).await.unwrap();
+        let dial_permits = client.dials.reserve_many(4).await.unwrap();
+        let worker = async {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            drop(ask_permits);
+            drop(dial_permits);
+            let ask = asks.recv().await.unwrap();
+            let dial = dials.recv().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            assert!(ask.reply.send(Ok("late".into())).is_err());
+            assert!(dial.reply.send(Ok("late".into())).is_err());
+        };
+        let (ask, dial, ()) = tokio::join!(
+            client.ask_timed("p", "x", Duration::from_millis(100)),
+            client.connect("p", Duration::from_millis(100)),
+            worker
+        );
+        assert_eq!(ask, Err(AskError::Timeout));
+        assert_eq!(dial.unwrap_err(), "no session to p within 100ms");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_requests_succeed_within_shared_deadline() {
+        let (client, mut asks, mut dials) = client();
+        let ask_permits = client.asks.reserve_many(4).await.unwrap();
+        let dial_permits = client.dials.reserve_many(4).await.unwrap();
+        let worker = async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            drop(ask_permits);
+            drop(dial_permits);
+            let ask = asks.recv().await.unwrap();
+            let dial = dials.recv().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            ask.reply.send(Ok("answer".into())).unwrap();
+            dial.reply.send(Ok("peer".into())).unwrap();
+        };
+        let (ask, dial, ()) = tokio::join!(
+            client.ask_timed("p", "x", Duration::from_millis(100)),
+            client.connect("p", Duration::from_millis(100)),
+            worker
+        );
+        assert_eq!(ask.as_deref(), Ok("answer"));
+        assert_eq!(dial.as_deref(), Ok("peer"));
+    }
 
     fn client() -> (
         SessionClient,

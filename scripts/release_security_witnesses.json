@@ -1,6 +1,14 @@
 {
   "version": 1,
   "packages": {
+    "network": {
+      "required": [
+        "tests::full_queues_timeout_without_enqueuing_expired_work",
+        "tests::queue_admission_does_not_restart_reply_deadline",
+        "tests::queued_requests_succeed_within_shared_deadline"
+      ],
+      "excluded_ignored": {}
+    },
     "blockchain": {
       "required": [
         "bft_time_tests::bft_timestamp_stays_in_the_honest_range_at_n_4",

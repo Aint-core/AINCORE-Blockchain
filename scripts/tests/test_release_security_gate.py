@@ -71,6 +71,23 @@ class GateTests(unittest.TestCase):
                 self.assertEqual(len(report["witnesses"]), self.required_count())
                 self.assertTrue(all(w["passed"] for w in report["witnesses"]))
 
+    def test_network_deadlines_are_required_and_fail_closed(self):
+        required = self.manifest["packages"]["network"]["required"]
+        self.assertIn("tests::full_queues_timeout_without_enqueuing_expired_work", required)
+        self.assertIn("tests::queue_admission_does_not_restart_reply_deadline", required)
+        self.assertIn("tests::queued_requests_succeed_within_shared_deadline", required)
+        for name in required:
+            def failed_network(command):
+                record = self.fake(command)
+                if "network" in command and name in command:
+                    record.update(returncode=101, stdout="test result: FAILED. 0 passed; 1 failed;")
+                return record
+
+            with self.subTest(witness=name):
+                report = gate.evaluate(self.manifest, failed_network)
+                self.assertFalse(report["passed"])
+                self.assertEqual(sum(not w["passed"] for w in report["witnesses"]), 1)
+
     def test_missing_name_and_new_ignored_fail_closed(self):
         policy = copy.deepcopy(self.manifest)
         policy["packages"]["executor"]["required"][0] = "tests::renamed_or_missing"

@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "scripts/release_security_witnesses.json"
 PACKAGES = {
     "blockchain", "chain_sync", "consensus", "executor", "node", "state_commit", "storage",
-    "vm_move",
+    "vm_move", "network",
 }
 NAME = re.compile(r"[A-Za-z_][A-Za-z_0-9]*(?:::[A-Za-z_][A-Za-z_0-9]*)+")
 
