@@ -3608,8 +3608,159 @@ fn polling() -> Patience {
 /// A value part answered "busy" is asked for again from where the value
 /// stands: no part is fetched twice, the wait does not grow from one part to
 /// the next, and the request timeout runs from the last part, not the first.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn value_parts_wait_out_busy_answers_without_starting_over() {
+    let part = vec![b'w'; VALUE_PART_BYTES];
+    let len = 8 * VALUE_PART_BYTES as u64;
+    let delivered = format!(
+        "{VALUE_RESP}{}",
+        serde_json::to_string(&ValueResponse {
+            len,
+            data: hex::encode(&part),
+            ..Default::default()
+        })
+        .unwrap()
+    );
+    let busy = format!(
+        "{VALUE_RESP}{}",
+        serde_json::to_string(&ValueResponse {
+            error: Some(BUSY.into()),
+            ..Default::default()
+        })
+        .unwrap()
+    );
+    let patience = Patience {
+        backoff_start: Duration::from_millis(300),
+        request_timeout: Duration::from_secs(3),
+        ..polling()
+    };
+    let mut requests = Vec::new();
+    let mut waits = Vec::new();
+    let mut said_busy = tokio::time::Instant::now();
+    let started = said_busy;
+    let mut ask = |peer, msg: String| {
+        assert_eq!(peer, 0);
+        let request: ValueRequest =
+            serde_json::from_str(msg.strip_prefix(VALUE_REQ).unwrap()).unwrap();
+        assert_eq!(request.version, 7);
+        assert_eq!(request.key, "value-key");
+        requests.push(request.offset);
+        let response = if !requests.len().is_multiple_of(2) {
+            said_busy = tokio::time::Instant::now();
+            busy.clone()
+        } else {
+            waits.push(said_busy.elapsed());
+            delivered.clone()
+        };
+        std::future::ready(Ok(response))
+    };
+    let value = ask_parts(
+        &mut ask,
+        0,
+        7,
+        "value-key",
+        len,
+        &patience,
+        &mut Pace::new(),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("busy peer delivering timely parts must complete"));
+    let expected: Vec<u64> = (0..8)
+        .flat_map(|i| [i * VALUE_PART_BYTES as u64; 2])
+        .collect();
+    assert_eq!(
+        requests, expected,
+        "busy retries the same part exactly once"
+    );
+    assert_eq!(value, part.repeat(8));
+    assert!(started.elapsed() > patience.request_timeout);
+    assert_eq!(waits.len(), 8);
+    // Tokio timers can round by a millisecond. A missing busy reset would
+    // hit the 1 s cap on the second part, outside this narrow interval.
+    assert!(
+        waits.iter().all(|wait| {
+            *wait >= Duration::from_millis(600) && *wait <= Duration::from_millis(610)
+        }),
+        "{waits:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn value_parts_busy_cannot_extend_progress_deadline() {
+    let patience = Patience {
+        backoff_start: Duration::from_millis(300),
+        request_timeout: Duration::from_secs(3),
+        ..polling()
+    };
+    let started = tokio::time::Instant::now();
+    let mut requests = 0;
+    let mut ask = |_, msg: String| {
+        let request: ValueRequest =
+            serde_json::from_str(msg.strip_prefix(VALUE_REQ).unwrap()).unwrap();
+        assert_eq!(request.offset, 0);
+        requests += 1;
+        std::future::ready(Ok(format!(
+            "{VALUE_RESP}{}",
+            serde_json::to_string(&ValueResponse {
+                error: Some(BUSY.into()),
+                ..Default::default()
+            })
+            .unwrap()
+        )))
+    };
+    // Pay for ample total turn time, leaving the per-part deadline as the
+    // only reason to reject a peer which never progresses.
+    let mut pace = Pace::new();
+    pace.received = 100;
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        ask_parts(&mut ask, 0, 7, "value-key", 1, &patience, &mut pace),
+    )
+    .await
+    .expect("busy responses must not postpone the progress deadline");
+    assert!(matches!(result, Err(Reply::Unanswered(_))));
+    assert_eq!(requests, 4);
+    assert!(started.elapsed() > patience.request_timeout);
+    assert!(started.elapsed() < Duration::from_secs(4));
+}
+
+#[tokio::test(start_paused = true)]
+async fn value_parts_progress_cannot_extend_unpaid_turn_deadline() {
+    let patience = Patience {
+        request_timeout: Duration::from_secs(3),
+        min_bytes_per_sec: u64::MAX,
+        ..polling()
+    };
+    let len = 8 * VALUE_PART_BYTES as u64;
+    let response = format!(
+        "{VALUE_RESP}{}",
+        serde_json::to_string(&ValueResponse {
+            len,
+            data: hex::encode(vec![b'w'; VALUE_PART_BYTES]),
+            ..Default::default()
+        })
+        .unwrap()
+    );
+    let mut requests = 0;
+    let mut ask = |_, _: String| {
+        requests += 1;
+        let response = response.clone();
+        async move {
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            Ok(response)
+        }
+    };
+    let mut pace = Pace::new();
+    let result = ask_parts(&mut ask, 0, 7, "value-key", len, &patience, &mut pace).await;
+    assert!(matches!(result, Err(Reply::Unanswered(_))));
+    assert_eq!(requests, 5);
+    assert_eq!(pace.received, 5 * VALUE_PART_BYTES as u64);
+}
+
+/// Retain the real database/server path separately from timer assertions:
+/// CPU throttling may make a server turn time out and be retried.
+#[tokio::test]
+async fn busy_value_parts_restore_authenticated_state() {
     let g = genesis();
     let a = chain_with(
         "partbusy_a",
@@ -3620,9 +3771,6 @@ async fn value_parts_wait_out_busy_answers_without_starting_over() {
     );
     let client = temp_db("partbusy_client");
     let mut server = peer(&a, Behaviour::Honest);
-    // Eight parts, each after a 600 ms wait (4.8 s): longer than the 3 s
-    // timeout in all, which each single part has room to meet on a loaded
-    // Pi (B17: at 1 s, a 1 MiB part outlived it there once).
     let polled = RestorePlan {
         patience: Patience {
             backoff_start: Duration::from_millis(300),
@@ -3631,14 +3779,12 @@ async fn value_parts_wait_out_busy_answers_without_starting_over() {
         },
         ..plan(&a.cp, &g, false)
     };
-    let (mut asked, mut served, mut waits) = (Vec::new(), Vec::new(), Vec::new());
-    let mut said_busy = Instant::now();
+    let (mut asked, mut served) = (Vec::new(), Vec::new());
     run_with(&client, &polled, 1, |_, msg| {
         if let Some(json) = msg.strip_prefix(VALUE_REQ) {
             let offset = serde_json::from_str::<ValueRequest>(json).unwrap().offset;
             if !asked.contains(&offset) {
                 asked.push(offset);
-                said_busy = Instant::now();
                 let busy = ValueResponse {
                     error: Some("busy".into()),
                     ..Default::default()
@@ -3649,7 +3795,6 @@ async fn value_parts_wait_out_busy_answers_without_starting_over() {
                 ));
             }
             served.push(offset);
-            waits.push(said_busy.elapsed());
         }
         serve(&mut server, msg)
     })
@@ -3657,11 +3802,6 @@ async fn value_parts_wait_out_busy_answers_without_starting_over() {
     .unwrap();
     let parts: Vec<u64> = (0..8).map(|i| i * VALUE_PART_BYTES as u64).collect();
     assert_eq!(served, parts, "each part once, in order");
-    // One step each (600 ms). Growing, the third would wait 2.4 s.
-    assert!(
-        waits.iter().all(|w| *w < Duration::from_millis(1800)),
-        "{waits:?}"
-    );
     assert_restored(&client, &a);
 }
 

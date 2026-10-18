@@ -100,7 +100,7 @@ All 11 Python gate controls passed on the NAS after this change. The Rust
 normal-build and witness rerun are still pending; do not infer their success
 from those control tests.
 
-## Run locally
+## NAS witness result and regression runner
 
 NAS verification of clean commit `67cb23f0b4491b824d4aceb06d7f8b4627309b5d`
 finished on 2026-10-17 at 11:30:07 UTC using Rust/Cargo 1.95.0: the normal
@@ -110,13 +110,48 @@ not establish the full regression, strict lint or release build results, nor
 the separately pinned Rust 1.90.0 hosted workflow.
 
 For the next isolated stage, `bash scripts/hardening_regression.sh` runs gate
-controls, the eight-package tests including integration tests, strict clippy,
-and release builds of node/indexer/CLI/genesis-tool, stopping at the first
+controls, the eight-package tests including integration tests, required security
+witnesses, independent block identity vectors, strict clippy, and release builds
+of node/indexer/CLI/genesis-tool, stopping at the first
 failure. Each stage has its own log under a unique
 `target/hardening-regression-*` directory. Only `stage=complete` with
 `exit_code=0` in `result.txt` establishes that all stages completed. A missing
 result after a power cut or forced termination is incomplete, not success.
 Run it with external CPU/RAM/time limits; it does not launch or deploy nodes.
+
+## 2026-10-18 sync timing regression
+
+The eight-package regression on `a8f93b7` stopped in `chain_sync`: 252 passed,
+one failed, one ignored. The exact failed test also failed alone under the
+same NAS CPU quota. `value_parts_wait_out_busy_answers_without_starting_over`
+measured approximately 4.03 seconds for the first busy response, after a turn
+timeout/retry, and approximately 600 ms for each remaining part. Its assertion
+required every interval below 1.8 seconds. These intervals include local server
+work and outer restore retries; they are not network-latency measurements.
+The subsequent clippy and release stages did not run.
+
+The timing witness now calls the real part-fetch loop with Tokio's paused
+clock, checking exact requested offsets, reconstructed bytes, a 600-610 ms
+backoff on every part, and successful progress across more than one request
+timeout overall. The previous 1.8-second upper bound could not detect a missing
+backoff reset because production caps each busy wait at one second. New negative
+controls require a perpetually busy peer to hit the progress deadline and a
+progressing but too-slow peer to hit the total turn deadline. The real database,
+server, and authenticated restore scenario remains a separate integration test.
+Only the part-fetch deadline clocks now use Tokio's monotonic clock, matching
+the existing async sleeps; timeout values and peer policy are unchanged.
+
+The NAS targeted command `cargo test --locked --offline -p chain_sync --lib
+value_parts -- --test-threads=1 --nocapture` passed all six selected tests (zero
+failed or ignored), in 54.52 seconds under the same one-CPU/2-GiB cap. This
+includes the retained database/server restore and two existing malicious/slow
+part controls. Evidence: `target/sync-clock-v2-20261018.log`, user service
+`aincore-sync-clock-v2-20261018`, inactive with exit 0. Subsequent local edits
+only reverted unrelated formatter changes and updated documentation/the runner.
+Full regression, clippy, and release results for this repair are pending. The
+earlier 128-witness pass applies to `67cb23f`, not automatically to this revision.
+
+## Run locally
 
 From the repository root, with Rust 1.90.0 and Python 3 available:
 

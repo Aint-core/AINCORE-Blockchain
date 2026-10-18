@@ -20,6 +20,7 @@ rand = "0.8"
 hex = "0.4"
 
 [dev-dependencies]
+tokio = { version = "1.0", features = ["test-util"] }
 # G3 WG-1: test fixtures seed their own genesis state (StateDB::seeding).
 storage = { path = "../common/storage", features = ["test-seeding"] }
 # G1 S10: the system suite runs real consensus nodes with their sync.

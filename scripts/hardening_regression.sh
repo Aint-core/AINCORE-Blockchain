@@ -34,6 +34,8 @@ run_stage() {
 run_stage gate-controls python3 -m unittest discover -s scripts/tests -p test_release_security_gate.py -v
 packages=(-p blockchain -p chain_sync -p consensus -p executor -p node -p storage -p vm_move -p state_commit)
 run_stage regression cargo test --locked --offline "${packages[@]}" -- --test-threads=1
+run_stage witnesses python3 scripts/release_security_gate.py --offline --report "$out/security-gate.json"
+run_stage identity-vectors node scripts/tests/block_identity_v2_vectors.mjs
 run_stage clippy cargo clippy --locked --offline "${packages[@]}" --all-targets -- -D warnings
 run_stage release cargo build --locked --offline --release -p node -p indexer -p aincore-cli -p genesis-tool --bins
 stage=complete

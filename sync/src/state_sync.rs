@@ -1900,14 +1900,15 @@ enum Reply {
 /// junk part every request timeout, and a chunk of 2,047 values claimed one
 /// part long held it about 33 hours.
 struct Pace {
-    started: Instant,
+    // Use the same clock as async backoff so deadline tests can advance time.
+    started: tokio::time::Instant,
     received: u64,
 }
 
 impl Pace {
     fn new() -> Self {
         Self {
-            started: Instant::now(),
+            started: tokio::time::Instant::now(),
             received: 0,
         }
     }
@@ -1939,7 +1940,7 @@ where
     // A busy server is waited for, with no part lost, as long as parts keep
     // coming: one per request timeout at least, at the minimum rate overall
     // (B463: of the bytes received, never of the length claimed).
-    let mut progress = Instant::now();
+    let mut progress = tokio::time::Instant::now();
     while (value.len() as u64) < len {
         if pace.spent(patience) || progress.elapsed() > patience.request_timeout {
             return Err(Reply::Unanswered("value parts too slow".into()));
@@ -1970,7 +1971,7 @@ where
             None => {}
         }
         busy = 0;
-        progress = Instant::now();
+        progress = tokio::time::Instant::now();
         let expected = (len - value.len() as u64).min(VALUE_PART_BYTES as u64);
         match hex::decode(&part.data) {
             Ok(data) if part.len == len && data.len() as u64 == expected => {
