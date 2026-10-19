@@ -19,6 +19,8 @@ jobs:
         uses: dtolnay/rust-toolchain@1.90.0
       - name: Test gate itself
         run: python3 -m unittest discover -s scripts/tests -p 'test_release_security_gate.py' -v
+      - name: Test interrupted runner reporting
+        run: python3 -m unittest discover -s scripts/tests -p 'test_hardening_runner.py' -v
       - name: Require security witnesses, including ignored blockers
         run: python3 scripts/release_security_gate.py
       - name: Regression suite
