@@ -2,10 +2,7 @@
 
 **Sovereign Layer-1 | DAG-BFT Consensus | Move VM | No-VC Fairlaunch**
 
-[![Build Status](https://img.shields.io/badge/build-passing-brightgreen)]()
-[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange)]()
-[![License](https://img.shields.io/badge/license-MIT-blue)]()
-[![Security](https://img.shields.io/badge/audit-pending-yellow)]()
+This branch contains a mainnet release candidate for testing. See the [release criteria](docs/MAINNET_LAUNCH_PLAN.md) and [contributor guide](CONTRIBUTING.md).
 
 ---
 
@@ -115,15 +112,15 @@ A testnet's genesis lists what its operator chose. AINCORE-TESTNET-V4 predates b
 
 ### Prerequisites
 
-- **Rust** 1.75+ (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
+- **Rust** — use the version pinned by the [node Dockerfile](Dockerfile).
 - **RocksDB** dependencies (macOS: `brew install rocksdb`, Ubuntu: `apt install librocksdb-dev`)
 
 ### Build
 
 ```bash
-git clone https://github.com/Aint-core/AINCORE-Blockchain.git
+git clone --branch mainnet-rc-20261123 https://github.com/Aint-core/AINCORE-Blockchain.git
 cd AINCORE-Blockchain
-cargo build --release
+cargo build --release --locked
 ```
 
 ### Run a Local Dev Node
@@ -149,6 +146,8 @@ refuses a higher node price; `--assume-yes` skips the question.
 ---
 
 ## Public Observer Testnet
+
+These instructions document an earlier observer deployment. The candidate validator testnet requires its own announced network parameters. See the [validator join guide](scripts/validator-join/README.md).
 
 This is the public-connectivity path for outside users who want to run an
 observer peer. It is meant to prove that outside nodes can reach AINCORE P2P and
@@ -297,7 +296,7 @@ Use this path for a non-validator peer that syncs from an existing AINCORE node 
 
 Runtime networking uses **Tailscale**. GitHub is only used to distribute source code.
 
-### Current Hardening Branch
+### Source branch for the earlier observer deployment
 
 The latest security-hardening branch for the current testnet/fresh observer flow is:
 

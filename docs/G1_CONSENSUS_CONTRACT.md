@@ -1490,7 +1490,7 @@ Release rule: a witness passes only with exactly 1 passed, 0 failed, 0 ignored (
 - `corpus_honest_liveness_does_not_regress` (`ordering.rs:2776-2811`, floor 0.42) stays green at every stage.
 - The seven controls stay green unless a stage names their re-expression.
 - Until S11, V4 code runs only under a V4 genesis format, which no production genesis can set. The V3 path that every live node runs changes only through S4's decision edits, which are extensionally identical on V3-reachable input.
-- CLAUDE.md rules 8 and 9 apply: unit tests for crypto use, and `cargo test -p executor` after executor edits.
+- Run unit tests for crypto changes and `cargo test --locked -p executor` after executor edits. See [Contributing](../CONTRIBUTING.md).
 
 | Stage | Scope (landable alone) | Observable gate | Mutations that must go red |
 |---|---|---|---|

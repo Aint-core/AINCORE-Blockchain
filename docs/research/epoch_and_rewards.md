@@ -367,7 +367,7 @@ The price of freezing is G1 Open question 8: misbehaviour is removed from consen
 
 ## (e) Exact places that must change (not edited)
 
-Everything below lands in the one fresh genesis that G1 S11 and G3 S8 already require. `genesis.json` edits require the founder's explicit confirmation (CLAUDE.md rule 1).
+Everything below lands in the one fresh genesis that G1 S11 and G3 S8 already require. `genesis.json` edits require the founder's explicit confirmation under the [genesis change policy](../../CONTRIBUTING.md#genesis-and-node-data).
 
 **Genesis, pins and boot**
 

@@ -64,3 +64,12 @@ testnet_data/
 
 # gstack local artifacts (security reports stay local)
 .gstack/
+
+# Local assistant settings and development transcripts
+.claude/
+/CLAUDE.md
+/CLAUDE.local.md
+/CREW.md
+/aincore-js/test_output_*.txt
+/aincore-js/test_*_output.txt
+__pycache__/

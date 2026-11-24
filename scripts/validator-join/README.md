@@ -27,13 +27,9 @@ chain pribadi menjadi jaringan.
 
 ---
 
-## Parameter jaringan (testnet saat ini)
+## Parameter jaringan
 
-```
-AINCORE_CHAIN_ID              AINCORE-LOCALTEST-3V
-AINCORE_EXPECTED_GENESIS_HASH <minta ke operator — lihat catatan di bawah>
-AINCORE_BOOTNODES             /ip4/192.168.18.202/tcp/9201,/ip4/192.168.18.202/tcp/9205,/ip4/192.168.18.66/tcp/9203
-```
+Sebelum memulai, minta chain ID, berkas genesis, hash genesis, alamat peer (bootnodes) yang bisa dijangkau dari mesinmu, dan URL RPC referensi untuk testnet yang ingin kamu ikuti. Cocokkan dengan pengumuman jaringan itu. [Cara memverifikasi paket node](../../docs/RELEASE_PACKAGE.md)
 
 > **Nilai genesis hash TIDAK dicantumkan di sini dengan sengaja.** Hash itu
 > berubah setiap kali genesis diubah (versi stdlib, parameter konsensus, set
@@ -62,12 +58,13 @@ Minta `genesis.json` ke operator dan simpan sebagai `genesis.json`.
 ## Langkah
 
 ```bash
-export AINCORE_CHAIN_ID=AINCORE-LOCALTEST-3V
-export AINCORE_EXPECTED_GENESIS_HASH=<nilai dari operator>   # WAJIB, lihat catatan di atas
+read -rp 'Chain ID testnet: ' AINCORE_CHAIN_ID
+read -rp 'Hash genesis terverifikasi: ' AINCORE_EXPECTED_GENESIS_HASH
+read -rp 'Alamat bootnodes, dipisahkan koma: ' AINCORE_BOOTNODES
+read -rp 'URL RPC referensi: ' AINCORE_REFERENCE_RPC
+export AINCORE_CHAIN_ID AINCORE_EXPECTED_GENESIS_HASH AINCORE_BOOTNODES AINCORE_REFERENCE_RPC
 export AINCORE_GENESIS_PATH=./genesis.json
-export AINCORE_BOOTNODES=/ip4/192.168.18.202/tcp/9201,/ip4/192.168.18.202/tcp/9205,/ip4/192.168.18.66/tcp/9203
 export AINCORE_P2P_PORT=9301          # pilih port yang bebas di mesinmu
-export AINCORE_REFERENCE_RPC=<URL RPC dari operator>   # disarankan, lihat langkah 3
 
 ./scripts/validator-join/join-validator.sh prepare   # build + bikin kunci, cetak alamatmu
 # → kirim alamatmu ke operator, minta 1010 AIN (1000 stake + gas)
@@ -150,8 +147,10 @@ satu epoch sesudahnya, dan buktinya punya satu epoch penuh untuk masuk.
 
 ```bash
 # dijalankan DI mesin validator (kunci tidak pernah keluar dari mesin)
-AINCORE_CHAIN_ID=AINCORE-LOCALTEST-3V \
-  ./scripts/validator-join/fund-validator.sh <alamat-64-hex> 1010
+read -rp 'Chain ID testnet yang akan didanai: ' AINCORE_CHAIN_ID
+read -rp 'Alamat publik validator (64 hex): ' validator_address
+export AINCORE_CHAIN_ID
+./scripts/validator-join/fund-validator.sh "$validator_address" 1010
 ```
 
 ---
@@ -214,12 +213,12 @@ diatestasi.
 
 ---
 
-## Kondisi jujur jaringan ini
+## Catatan dari pengujian lab terdahulu
 
-Supaya kamu ikut dengan mata terbuka:
+Angka berikut berasal dari konfigurasi lab saat panduan ini pertama kali ditulis.
 
 - **Testnet.** AIN di sini tidak punya nilai ekonomi.
-- **4 validator, 2 mesin, 1 operator.** Kamu akan jadi yang pertama dari luar.
+- **4 validator, 2 mesin, 1 operator** pada konfigurasi lab tersebut.
 - **Belum ada audit eksternal.** Audit internal menemukan dan menutup puluhan
   bug, termasuk beberapa yang fatal, tapi belum ada mata dari luar.
 - **wBTC bukan BTC.** Node sendiri melabelinya `synthetic_test_asset_not_btc_backed`.

@@ -83,7 +83,7 @@ const FALSE_CLAIMS: &[(&str, &str)] = &[
 #[test]
 fn the_public_documents_make_no_claim_the_code_contradicts() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    for doc in ["README.md", "WHITEPAPER.md", "CLAUDE.md"] {
+    for doc in ["README.md", "WHITEPAPER.md", "CONTRIBUTING.md"] {
         let text = std::fs::read_to_string(root.join(doc))
             .unwrap()
             .to_lowercase();

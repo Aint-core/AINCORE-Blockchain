@@ -45,3 +45,9 @@ coverage
 *.tmp
 *.bak
 *.swp
+
+# Keep local assistant settings outside the build context.
+**/.claude
+CLAUDE.md
+CREW.md
+**/CLAUDE.local.md
