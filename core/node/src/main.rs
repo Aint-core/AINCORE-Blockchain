@@ -196,47 +196,32 @@ async fn restore_from_checkpoint(
     local_signer: &str,
 ) -> Result<Option<chain_sync::state_sync::Restored>, String> {
     let cp = &settings.checkpoint;
-    let read = |key: &str| storage.get(key).map_err(|e| e.to_string());
+    let read = |key: &str| storage.try_get(key).map_err(|e| e.to_string());
     if read(storage::RESTORE_MARKER)?.is_none() {
-        if read(chain_sync::state_sync::RESTORED_CHECKPOINT)? == Some(cp.to_string()) {
-            println!("ℹ️ [STATE_SYNC] restored from this checkpoint already; not restoring");
-            return Ok(None);
-        }
-        let height = read("latest_height")?.and_then(|h| h.parse::<u64>().ok());
-        if let Some(height) = height.filter(|h| *h >= cp.height) {
-            // The block at the checkpoint height, or its QC, which is never
-            // pruned.
-            let ours = read(&format!("block_{}", cp.height))?
-                .and_then(|json| serde_json::from_str::<blockchain::Block>(&json).ok())
-                .map(|block| block.header.hash)
-                .or(read(&format!("consensus:qc:{}", cp.height))?
-                    .and_then(|json| {
-                        serde_json::from_str::<consensus::qc::QuorumCertificate>(&json).ok()
-                    })
-                    .map(|qc| qc.block_hash));
-            match ours {
-                Some(hash) if hash.eq_ignore_ascii_case(&cp.block_hash) => {
+        let height = read("latest_height")?
+            .map(|raw| raw.parse::<u64>())
+            .transpose()
+            .map_err(|e| format!("invalid local height: {e}"))?;
+        let restored_here =
+            read(chain_sync::state_sync::RESTORED_CHECKPOINT)? == Some(cp.to_string());
+        if restored_here || height.is_some_and(|h| h >= cp.height) {
+            match cp.matches_retained(storage)? {
+                Some(true) => {
                     println!(
-                        "ℹ️ [STATE_SYNC] at height {height}, past the checkpoint on its chain; \
-                         not restoring"
+                        "ℹ️ [STATE_SYNC] local history matches checkpoint {cp}; not restoring"
                     );
                     return Ok(None);
                 }
-                Some(hash) if !settings.replace_existing => {
+                Some(false) if !settings.replace_existing => {
                     return Err(format!(
-                        "this datadir's block {} is {hash}, not the checkpoint's {}: it is on \
-                         another chain. Set AINCORE_STATE_SYNC_REPLACE=1 to replace it",
-                        cp.height, cp.block_hash
-                    ))
+                        "local block or QC disagrees with checkpoint {cp}: another chain or a different state root. Set AINCORE_STATE_SYNC_REPLACE=1 to replace it"
+                    ));
                 }
                 None if !settings.replace_existing => {
                     return Err(format!(
-                        "at height {height}, past the checkpoint, this datadir holds neither \
-                         the block nor the QC at {}, so whether it is on the checkpoint's chain \
-                         cannot be told. Set AINCORE_STATE_SYNC_REPLACE=1 to replace it, or \
-                         unset the checkpoint",
+                        "this datadir holds neither the block nor the QC at {}, so whether it is on the checkpoint's chain cannot be told. Set AINCORE_STATE_SYNC_REPLACE=1 to replace it, or unset the checkpoint",
                         cp.height
-                    ))
+                    ));
                 }
                 _ => {}
             }
@@ -273,12 +258,12 @@ async fn restore_from_checkpoint(
 /// become a validator later: it had to be none when the restore ran.
 fn check_restored_signer(storage: &StateDB, my_address: &str) -> Result<(), String> {
     let Some(restored_by) = storage
-        .get(chain_sync::state_sync::RESTORED_BY)
+        .try_get(chain_sync::state_sync::RESTORED_BY)
         .map_err(|e| e.to_string())?
     else {
         return Ok(());
     };
-    if restored_by != my_address && chain_sync::state_sync::recorded_validator(storage, my_address)
+    if restored_by != my_address && chain_sync::state_sync::recorded_validator(storage, my_address)?
     {
         return Err(format!(
             "this datadir was restored with key {restored_by}, and this node's key \
@@ -371,46 +356,6 @@ fn check_bootnodes(bootnodes: &[String], public_seed: Option<String>) -> Result<
     }
 }
 
-/// B87: write a secret (node.key: it derives the Ed25519 identity, the
-/// validator's BLS seed and the DA at-rest key) owner-only from the first
-/// byte: a temporary file created 0600 and exclusively, written, synced,
-/// then renamed into place. `fs::write` created it with the umask (0644)
-/// and the narrowing after it ignored its error.
-fn write_secret_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let tmp = path.with_extension("tmp");
-    let _ = std::fs::remove_file(&tmp);
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&tmp)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-    std::fs::rename(&tmp, path)?;
-    // B112: the rename is durable once the directory is synced.
-    #[cfg(unix)]
-    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        std::fs::File::open(dir)?.sync_all()?;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(path)?.permissions().mode() & 0o777;
-        if mode != 0o600 {
-            return Err(std::io::Error::other(format!(
-                "{} is mode {mode:o}, not 600",
-                path.display()
-            )));
-        }
-    }
-    Ok(())
-}
-
 /// B112: `path` (a secret) readable and writable by its owner only.
 fn owner_only(path: &std::path::Path) -> std::io::Result<()> {
     #[cfg(unix)]
@@ -426,8 +371,27 @@ fn owner_only(path: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
+fn load_or_create_node_key(path: &std::path::Path) -> std::io::Result<ed25519_dalek::SigningKey> {
+    let read_key = || {
+        owner_only(path)?;
+        crypto::key_file::read_ed25519(path)
+    };
+    match read_key() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let candidate = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+            match crypto::key_file::publish_new(path, &candidate.to_bytes()) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e),
+            }
+            read_key()
+        }
+        result => result,
+    }
+}
+
 #[tokio::main]
-async fn main() {
+async fn main() -> std::process::ExitCode {
     // B77: a panic ends the process (systemd restarts it) instead of
     // poisoning a lock every loop then skips.
     node::abort_on_panic();
@@ -457,90 +421,19 @@ async fn main() {
     let enable_nat = config.enable_nat;
 
     // === INISIALISASI NODE IDENTITY ===
-    use ed25519_dalek::SigningKey;
-
-    // Load or Generate Keypair
-    let _ = std::fs::create_dir_all(&datadir);
     let datadir_path = std::path::PathBuf::from(&datadir);
-    // Load or generate node key with error handling
-    let key_path_buf = datadir_path.join("node.key");
-    let key_path = match key_path_buf.to_str() {
-        Some(p) => p,
-        None => {
-            eprintln!("❌ FATAL: Invalid key path (non-UTF8)");
+    let key_path = datadir_path.join("node.key");
+    let signing_key = match std::fs::create_dir_all(&datadir_path)
+        .and_then(|_| load_or_create_node_key(&key_path))
+    {
+        Ok(key) => key,
+        Err(e) => {
+            eprintln!(
+                "❌ FATAL: cannot load or initialize {}: {e}",
+                key_path.display()
+            );
             std::process::exit(1);
         }
-    };
-
-    let signing_key = if std::path::Path::new(key_path).exists() {
-        // B112: a key an older build wrote with the umask (0644) is narrowed
-        // to owner-only before it is read, or the node does not start.
-        if let Err(e) = owner_only(std::path::Path::new(key_path)) {
-            eprintln!("❌ FATAL: {key_path} cannot be made owner-only: {e}");
-            std::process::exit(1);
-        }
-        match std::fs::read(key_path) {
-            Ok(bytes) => {
-                let key_bytes = if bytes.len() == 32 {
-                    bytes
-                } else if let Ok(text) = std::str::from_utf8(&bytes) {
-                    let trimmed = text.trim();
-                    if trimmed.len() == 64 {
-                        match hex::decode(trimmed) {
-                            Ok(decoded) => decoded,
-                            Err(e) => {
-                                eprintln!("❌ FATAL: Invalid hex node key in {}", key_path);
-                                eprintln!("   Error: {}", e);
-                                std::process::exit(1);
-                            }
-                        }
-                    } else {
-                        bytes
-                    }
-                } else {
-                    bytes
-                };
-
-                match key_bytes.as_slice().try_into() {
-                    Ok(key_bytes) => SigningKey::from_bytes(key_bytes),
-                    Err(_) => {
-                        eprintln!("❌ FATAL: Invalid key length in {}", key_path);
-                        eprintln!(
-                            "   Expected raw 32 bytes or 64 hex chars, got {} bytes",
-                            key_bytes.len()
-                        );
-                        eprintln!("   Try deleting the key file to regenerate.");
-                        std::process::exit(1);
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("❌ FATAL: Failed to read node key from {}: {}", key_path, e);
-                std::process::exit(1);
-            }
-        }
-    } else {
-        // Auto-generate key for testnet (key persists via Docker volume)
-        println!(
-            "⚠️  node.key not found in {} — generating new keypair...",
-            datadir
-        );
-        let mut csprng = rand::rngs::OsRng;
-        let new_key = SigningKey::generate(&mut csprng);
-        match write_secret_file(std::path::Path::new(key_path), &new_key.to_bytes()) {
-            Ok(_) => {
-                println!("✅ Generated new node key: {}", key_path);
-                println!(
-                    "🔑 Public Key: {}",
-                    hex::encode(new_key.verifying_key().to_bytes())
-                );
-            }
-            Err(e) => {
-                eprintln!("❌ FATAL: Failed to save generated key: {}", e);
-                std::process::exit(1);
-            }
-        }
-        new_key
     };
 
     let verifying_key = signing_key.verifying_key();
@@ -672,13 +565,29 @@ async fn main() {
     }
 
     // === INISIALISASI P2P NETWORK (Start early to bind port) ===
-    // G4 S1: the committee members the consensus protocol admits; filled
-    // once consensus boots and refreshed by the ticker at every epoch change.
+    let state_sync_settings = match StateSyncSettings::from_env() {
+        Ok(settings) => settings,
+        Err(e) => {
+            eprintln!("[STATE_SYNC] invalid boot settings: {e}; refusing to boot");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    // The empty book permits sync bootstrap, not consensus. Normal boots
+    // publish the validated engine's committee before sessions may open.
     let session_book = Arc::new(RwLock::new(node::sessions::PeerBook::default()));
     // Sync asks over the sessions through `session_client`; the requests
     // sessions send arrive on `sync_serves`.
-    let (session_wiring, session_client, mut sync_serves) =
+    let (mut session_wiring, session_client, mut sync_serves) =
         node::sessions::SessionWiring::new(Arc::clone(&session_book));
+    let network_ready = if state_sync_settings.is_none() {
+        let (ready, wait) = tokio::sync::oneshot::channel();
+        session_wiring.startup_ready = Some(wait);
+        Some(ready)
+    } else {
+        // Restoring a checkpoint needs sync sessions before the local state
+        // and its committee exist. Member-only admission remains closed.
+        None
+    };
     let (_p2p_tx, mut p2p_rx) = match start_p2p(
         port,
         libp2p_bootnodes,
@@ -696,7 +605,7 @@ async fn main() {
         }
         Err(e) => {
             eprintln!("❌ Failed to start P2P: {:?}", e);
-            return;
+            return std::process::ExitCode::FAILURE;
         }
     };
 
@@ -719,12 +628,12 @@ async fn main() {
         "core/vm_move/stdlib/bytecode" // Default, will error with clear message if missing
     };
     // G3 S6: restore from a checkpoint first, when one is configured.
-    match StateSyncSettings::from_env() {
-        Ok(None) => {
+    match state_sync_settings {
+        None => {
             // B35: no checkpoint, no pinned height.
             let _ = storage.delete(storage::CHECKPOINT_PIN);
         }
-        Ok(Some(settings)) => {
+        Some(settings) => {
             // B35: pruning keeps the checkpoint's block and QC, which the
             // check below reads at every boot.
             if let Err(e) = storage.put(
@@ -761,10 +670,6 @@ async fn main() {
                 eprintln!("❌ FATAL: state restore failed: {e}; refusing to boot");
                 std::process::exit(1);
             }
-        }
-        Err(e) => {
-            eprintln!("❌ FATAL: {e}; refusing to boot");
-            std::process::exit(1);
         }
     }
     // G3 FX-7: genesis depends on genesis.json and the stdlib only, never on
@@ -843,14 +748,37 @@ async fn main() {
     // CRITICAL: Use RwLock for DAG Consensus
     let p2p_tx_clone = Some(_p2p_tx.clone()); // Pass the libp2p transmitter
 
-    let consensus = Arc::new(RwLock::new(DagConsensus::new(
+    let consensus = DagConsensus::new(
         node_id.clone(),
         Arc::clone(&mempool),
         Arc::clone(&executor),
         Arc::clone(&storage),
         p2p_tx_clone,           // Add Libp2p gossip channel
         signing_key.to_bytes(), // H4 FIX: Pass the persistent Ed25519 key for BLS derivation
-    )));
+    );
+    if let Some((epoch, current, next)) = consensus.session_committees() {
+        let mut committees = vec![current.as_slice()];
+        if let Some(next) = &next {
+            committees.push(next.as_slice());
+        }
+        match session_book.write() {
+            Ok(mut book) => {
+                *book = node::sessions::PeerBook::new(epoch, &committees);
+                println!("[P2P] boot committee ready for epoch {epoch}: {} members", book.len());
+            }
+            Err(e) => {
+                eprintln!("[P2P] cannot publish boot committee: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        }
+    }
+    if let Some(ready) = network_ready {
+        if ready.send(()).is_err() {
+            eprintln!("[P2P] network task ended before boot completed");
+            return std::process::ExitCode::FAILURE;
+        }
+    }
+    let consensus = Arc::new(RwLock::new(consensus));
 
     let chain_sync = Arc::new(
         ChainSync::new(Arc::clone(&storage))
@@ -1090,11 +1018,12 @@ async fn main() {
     }
 
     // === START REST API SERVER ===
-    {
+    let api_thread = {
         let api_consensus = Arc::clone(&consensus);
         let api_sessions = Arc::clone(&session_table);
         let api_mempool = Arc::clone(&mempool);
         let api_storage = Arc::clone(&storage);
+        let api_shutdown = Arc::clone(&shutdown);
 
         std::thread::spawn(move || {
             println!(
@@ -1115,6 +1044,7 @@ async fn main() {
                             api_sessions,
                             api_mempool,
                             api_storage,
+                            Arc::clone(&api_shutdown),
                         )
                         .await
                         {
@@ -1122,16 +1052,22 @@ async fn main() {
                             // taken) stops: it ran on with no RPC, and every
                             // tool reading it saw nothing or another node.
                             eprintln!("❌ FATAL: the API server on port {api_port} failed: {e}");
-                            std::process::exit(1);
+                            api_shutdown.store(true, Ordering::SeqCst);
+                            return Err(e);
                         } else {
-                            println!("🌍 API Server exited normally (Unexpected).");
+                            api_shutdown.store(true, Ordering::SeqCst);
                         }
-                    });
+                        Ok(())
+                    })
                 }
-                Err(e) => eprintln!("❌ Failed to build endpoint runtime: {}", e),
+                Err(e) => {
+                    api_shutdown.store(true, Ordering::SeqCst);
+                    Err(e)
+                }
             }
-        });
-    }
+        })
+    };
+    let mut api_thread = Some(api_thread);
 
     // === MAIN LOOP (EXECUTION & DA ONLY) ===
     // Consensus is now running in background!
@@ -1232,6 +1168,10 @@ async fn main() {
         // and flush the DB before exiting, so a rolling deploy never relies on
         // crash recovery.
         if shutdown.load(Ordering::SeqCst) {
+            // The API owns DB references on a separate OS thread. Join it
+            // before process teardown can destroy RocksDB's global scheduler.
+            api_thread.take().expect("API thread exists").join()
+                .expect("API thread panicked").expect("API server failed");
             println!("🧹 Graceful shutdown: draining in-flight consensus work...");
             // Acquiring the consensus write lock blocks until the current
             // try_create_vertex/commit (if any) has finished — the ticker has
@@ -1241,9 +1181,13 @@ async fn main() {
             }
             match storage.flush() {
                 Ok(()) => println!("💾 Graceful shutdown: storage flushed to disk."),
-                Err(e) => eprintln!("⚠️ Graceful shutdown: storage flush failed: {e}"),
+                Err(e) => {
+                    eprintln!("⚠️ Graceful shutdown: storage flush failed: {e}");
+                    // Return through runtime teardown; do not report a clean stop.
+                    return std::process::ExitCode::FAILURE;
+                }
             }
-            println!("👋 Node exited cleanly.");
+            println!("👋 Shutdown drain completed; runtime teardown follows.");
             break;
         }
 
@@ -1263,6 +1207,7 @@ async fn main() {
 
         thread::sleep(Duration::from_millis(250)); // Poll shutdown ~4x/sec; metrics tick
     }
+    std::process::ExitCode::SUCCESS
 }
 
 #[cfg(test)]
@@ -1456,6 +1401,7 @@ mod boot_identity_tests {
             String::new(),
         );
         block.header.hash = hash.to_string();
+        block.header.state_root = "cd".repeat(32);
         serde_json::to_string(&block).unwrap()
     }
 
@@ -1502,6 +1448,9 @@ mod boot_identity_tests {
             );
         }
         let restored = skip_db("restored");
+        restored
+            .put("block_7", &block_at_7(&"ab".repeat(32)))
+            .unwrap();
         restored
             .put(
                 chain_sync::state_sync::RESTORED_CHECKPOINT,
@@ -1585,6 +1534,7 @@ mod boot_identity_tests {
                 }))
                 .unwrap();
             qc.block_hash = hash.to_string();
+            qc.state_root = "cd".repeat(32);
             serde_json::to_string(&qc).unwrap()
         };
         let pruned_on_chain = skip_db("pruned_on_chain");
@@ -1619,6 +1569,33 @@ mod boot_identity_tests {
         .await
         .unwrap_err();
         assert!(err.contains("another chain"), "{err}");
+        let mut wrong_root = settings(false);
+        wrong_root.checkpoint.state_root = "ee".repeat(32);
+        let block_only = skip_db("pinned_root");
+        block_only.put("latest_height", "100").unwrap();
+        block_only
+            .put("block_7", &block_at_7(&"ab".repeat(32)))
+            .unwrap();
+        for db in [&pruned_on_chain, &block_only] {
+            assert!(
+                restore_from_checkpoint(db, &wrong_root, untouched, &closed_sessions(), &me)
+                    .await
+                    .is_err()
+            );
+        }
+        // A retained block and QC must describe a consistent history.
+        pruned_on_chain
+            .put("block_7", &block_at_7(&"99".repeat(32)))
+            .unwrap();
+        assert!(restore_from_checkpoint(
+            &pruned_on_chain,
+            &settings(false),
+            untouched,
+            &closed_sessions(),
+            &me
+        )
+        .await
+        .is_err());
         // Neither block nor QC: cannot tell, so refused unless replacing.
         let unknown = skip_db("unknown");
         unknown.put("latest_height", "100").unwrap();
@@ -1761,17 +1738,40 @@ mod boot_identity_tests {
 
 #[cfg(test)]
 mod secret_file_tests {
-    use super::{owner_only, write_secret_file};
+    use super::{load_or_create_node_key, owner_only};
+    use crypto::key_file::publish_new;
+
+    #[test]
+    fn concurrent_node_initializers_read_the_same_key() {
+        let dir = storage::test_dir::process_dir()
+            .join(format!("init-key-{:032x}", rand::random::<u128>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("node.key");
+        let barrier = std::sync::Barrier::new(2);
+        let initialize = || {
+            barrier.wait();
+            load_or_create_node_key(&path).unwrap().verifying_key()
+        };
+        let (a, b) = std::thread::scope(|s| {
+            let first = s.spawn(initialize);
+            let second = initialize();
+            (first.join().unwrap(), second)
+        });
+        assert_eq!(a, b);
+        assert_eq!(a, load_or_create_node_key(&path).unwrap().verifying_key());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     /// B87: node.key is owner-only from the first byte, under any umask,
-    /// and a second write replaces it whole.
+    /// and later initializers cannot replace it.
     #[test]
     fn a_secret_file_is_created_owner_only() {
         let dir = storage::test_dir::process_dir().join(format!("secret_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("node.key");
-        write_secret_file(&path, &[7u8; 32]).unwrap();
+        publish_new(&path, &[7u8; 32]).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), vec![7u8; 32]);
         #[cfg(unix)]
         {
@@ -1779,9 +1779,10 @@ mod secret_file_tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "node.key must be owner-only, is {mode:o}");
         }
-        write_secret_file(&path, &[9u8; 32]).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), vec![9u8; 32]);
-        assert!(!path.with_extension("tmp").exists());
+        let second = publish_new(&path, &[9u8; 32]).unwrap_err();
+        assert_eq!(second.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).unwrap(), vec![7u8; 32]);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         // B112: a key an older build left world-readable is narrowed.
         #[cfg(unix)]
         {

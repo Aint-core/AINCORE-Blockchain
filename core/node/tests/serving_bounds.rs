@@ -14,7 +14,6 @@
 //!
 //! B34: free identities on one host share one sync budget.
 
-use async_trait::async_trait;
 use libp2p::futures::{AsyncRead, AsyncWrite, StreamExt};
 use libp2p::{
     core::upgrade, noise, request_response, swarm::SwarmEvent, tcp, yamux, Multiaddr,
@@ -30,7 +29,6 @@ use std::time::Duration;
 #[derive(Debug, Clone, Copy, Default)]
 struct NeverReads;
 
-#[async_trait]
 impl request_response::Codec for NeverReads {
     type Protocol = StreamProtocol;
     type Request = String;

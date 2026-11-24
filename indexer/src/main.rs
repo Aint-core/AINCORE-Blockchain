@@ -1,6 +1,8 @@
+mod ingestion;
+
 use actix_cors::Cors;
 use actix_web::{App, HttpRequest, HttpResponse, HttpServer, Responder, web};
-use rusqlite::{Connection, Result, params};
+use rusqlite::{Connection, OptionalExtension, Result, params};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -9,7 +11,7 @@ use std::time::Instant;
 use tokio::sync::Semaphore;
 use tokio::time::{Duration, sleep};
 
-use log::{error, info};
+use log::info;
 use move_core_types::account_address::AccountAddress;
 use std::env;
 
@@ -526,12 +528,6 @@ fn day_points(
 }
 
 // --- Database Setup ---
-fn init_db() -> Result<Connection, Box<dyn std::error::Error>> {
-    let conn = Connection::open(DB_PATH)?;
-    prepare_db(&conn)?;
-    Ok(conn)
-}
-
 /// The schema, its indexes and its journal (B265).
 fn prepare_db(conn: &Connection) -> rusqlite::Result<()> {
     // B265: WAL, so the API's readers and the indexing writer never wait
@@ -689,29 +685,31 @@ fn migrate_transactions_v2(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-fn get_last_indexed_height(conn: &Connection) -> u64 {
-    let stmt = conn
-        .prepare("SELECT value FROM state WHERE key = 'last_height'")
-        .ok();
-    if let Some(mut s) = stmt {
-        let mut rows = s.query([]).ok();
-        if let Some(rows) = rows.as_mut()
-            && let Ok(Some(row)) = rows.next()
-        {
-            let s: String = row.get(0).unwrap_or("0".to_string());
-            return s.parse::<u64>().unwrap_or(0);
-        }
-    }
-    0
+fn get_last_indexed_height(conn: &Connection) -> rusqlite::Result<u64> {
+    conn.query_row(
+        "SELECT value FROM state WHERE key = 'last_height'",
+        [],
+        |row| {
+            let value: String = row.get(0)?;
+            value.parse::<u64>().map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })
+        },
+    )
+    .optional()
+    .map(|height| height.unwrap_or(0))
 }
 
-fn set_last_indexed_height(conn: &Connection, height: u64) {
-    if let Err(e) = conn.execute(
+fn set_last_indexed_height(conn: &Connection, height: u64) -> rusqlite::Result<()> {
+    conn.execute(
         "INSERT OR REPLACE INTO state (key, value) VALUES ('last_height', ?1)",
-        params![height.to_string()],
-    ) {
-        error!("Failed to update last indexed height: {}", e);
-    }
+        [height.to_string()],
+    )?;
+    Ok(())
 }
 
 // --- RPC Client ---
@@ -731,29 +729,15 @@ struct RpcResponse<T> {
     error: Option<serde_json::Value>,
 }
 
-/// B270: `Err` when the node did not answer (no connection, the call's time
-/// out, an answer that is not JSON-RPC); `Ok(None)` when it answered an
-/// error.
-async fn fetch_blocks(
-    start: u64,
-    limit: u64,
-) -> std::result::Result<Option<Vec<serde_json::Value>>, ()> {
-    let client = http_client();
-    let req = RpcRequest {
-        jsonrpc: "2.0".to_string(),
-        method: "aincore_getBlocks".to_string(),
-        params: vec![serde_json::json!(limit), serde_json::json!(start)],
-        id: 1,
-    };
-
-    let res = client
-        .post(get_rpc_url())
-        .json(&req)
-        .send()
-        .await
-        .map_err(|_| ())?;
-    let json: RpcResponse<Vec<serde_json::Value>> = res.json().await.map_err(|_| ())?;
-    Ok(json.result)
+async fn fetch_blocks(start: u64, limit: u64) -> Result<Vec<serde_json::Value>, String> {
+    ingestion::rpc(
+        "aincore_getBlocks",
+        vec![limit.into(), start.into()],
+        ingestion::BLOCK_RESPONSE_BYTES,
+    )
+    .await?
+    .result
+    .ok_or_else(|| "missing blocks result".into())
 }
 
 /// B270: the blocks the next read asks for: half as many after a read the
@@ -849,20 +833,12 @@ fn http_client() -> &'static reqwest::Client {
 /// could not be read (a refused or busy call, the network). An error was
 /// read as "no receipt", so the batch's DEX trades were skipped for good.
 async fn fetch_transaction_receipt(tx_hash: &str) -> Result<Option<serde_json::Value>, String> {
-    let client = http_client();
-    let req = RpcRequest {
-        jsonrpc: "2.0".to_string(),
-        method: "aincore_getTransactionReceipt".to_string(),
-        params: vec![serde_json::json!(tx_hash)],
-        id: 1,
-    };
-    let res = client
-        .post(get_rpc_url())
-        .json(&req)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    let json: RpcResponse<serde_json::Value> = res.json().await.map_err(|e| e.to_string())?;
+    let json = ingestion::rpc(
+        "aincore_getTransactionReceipt",
+        vec![tx_hash.into()],
+        ingestion::BLOCK_RESPONSE_BYTES,
+    )
+    .await?;
     receipt_of(json)
 }
 
@@ -894,25 +870,6 @@ async fn fetch_receipt_retried(tx_hash: &str) -> Result<Option<serde_json::Value
         }
     }
     Err(last)
-}
-
-async fn fetch_latest_height() -> Option<u64> {
-    let client = http_client();
-    let req = RpcRequest {
-        jsonrpc: "2.0".to_string(),
-        method: "aincore_getStatus".to_string(),
-        params: vec![],
-        id: 1,
-    };
-
-    let res = client.post(get_rpc_url()).json(&req).send().await.ok()?;
-    let json: RpcResponse<serde_json::Value> = res.json().await.ok()?;
-    let status = json.result?;
-    value_to_u64(
-        status
-            .get("latest_height")
-            .unwrap_or(&serde_json::Value::Null),
-    )
 }
 
 /// B361: a transaction's row: a transfer's receiver, amount and coin, and
@@ -1024,179 +981,9 @@ fn write_batch(
         }
     }
     if indexed_to > last_height {
-        conn.execute(
-            "INSERT OR REPLACE INTO state (key, value) VALUES ('last_height', ?1)",
-            params![indexed_to.to_string()],
-        )?;
+        set_last_indexed_height(conn, indexed_to)?;
     }
     Ok(())
-}
-
-// --- Indexing Logic ---
-async fn indexer_loop(db: Arc<Mutex<Connection>>) {
-    println!("🕵️ Indexer started...");
-    let batch_size = indexer_batch_size();
-    let bootstrap_backfill =
-        indexer_bootstrap_backfill().unwrap_or(DEFAULT_INDEXER_BOOTSTRAP_BACKFILL);
-    if bootstrap_backfill > 0
-        && let Some(latest_height) = fetch_latest_height().await
-    {
-        let last_height = db
-            .lock()
-            .map(|conn| get_last_indexed_height(&conn))
-            .unwrap_or(0);
-        if last_height == 0 && latest_height > bootstrap_backfill {
-            let bootstrap_height = latest_height.saturating_sub(bootstrap_backfill);
-            if let Ok(conn) = db.lock() {
-                set_last_indexed_height(&conn, bootstrap_height);
-                // B379: loud, the history it skips named (a quiet line on
-                // stdout was all an operator saw).
-                eprintln!(
-                    "⚠️ Indexer bootstrap tail mode: latest={} backfill={}: indexing starts at height {}; blocks 1..={} are NOT indexed (AINCORE_INDEXER_BOOTSTRAP_BACKFILL=0 indexes from height 1, on a node that still holds them)",
-                    latest_height,
-                    bootstrap_backfill,
-                    bootstrap_height.saturating_add(1),
-                    bootstrap_height
-                );
-            }
-        }
-    }
-
-    // B270: the blocks a read asks for (`next_batch`).
-    let mut batch = batch_size;
-    // B377: the height last reported missing, and when.
-    let mut missing_reported: Option<(u64, Instant)> = None;
-    loop {
-        let last_height = {
-            match db.lock() {
-                Ok(conn) => get_last_indexed_height(&conn),
-                Err(_) => {
-                    eprintln!("❌ DB Lock Poisoned");
-                    0
-                }
-            }
-        };
-
-        let start_height = last_height.saturating_add(1);
-        let mut indexed_any = false;
-
-        // Pull lag metric for observability (B377: and whether the node
-        // holds the start height).
-        let node_latest = fetch_latest_height().await;
-
-        let fetched = fetch_blocks(start_height, batch).await;
-        batch = next_batch(batch, fetched.is_ok(), batch_size);
-        if let Ok(Some(blocks)) = fetched {
-            // B377: only the leading run of blocks at start_height,
-            // start_height + 1, ... by their own headers. The node's answer
-            // skips heights it cannot read (pruned, a read error, bad JSON),
-            // and the cursor went to the batch's highest block, past heights
-            // never indexed; a range pruned whole was answered empty, and
-            // the loop asked again for good without a word.
-            let run = leading_run(&blocks, start_height);
-            if let Some(missing) = missing_height(run, blocks.len(), start_height, node_latest) {
-                let due = missing_reported.is_none_or(|(height, at)| {
-                    height != missing || at.elapsed() >= MISSING_REPORT_EVERY
-                });
-                if due {
-                    eprintln!(
-                        "❌ Indexer: the node no longer holds block {missing} (pruned, or unreadable): indexing cannot go past it and waits there. An archive node is needed, or a reset of the indexer (its database removed, AINCORE_INDEXER_BOOTSTRAP_BACKFILL within what the node keeps)"
-                    );
-                    missing_reported = Some((missing, Instant::now()));
-                }
-            }
-
-            // Phase 1 — collect ALL (height, timestamp, hash, tx_str) tuples across the batch.
-            //          This lets us fan-out receipt fetches in parallel below.
-            let mut pending: Vec<PendingTx> = Vec::new();
-            let mut max_height_in_batch = last_height;
-
-            for block in &blocks[..run] {
-                // `leading_run`: start_height and up, in order.
-                let height = block["header"]["height"].as_u64().unwrap_or(0);
-                indexed_any = true;
-                max_height_in_batch = height;
-                let timestamp = value_to_u64(&block["header"]["timestamp"]).unwrap_or(0);
-                if let Some(txs) = block["transactions"].as_array() {
-                    for tx in txs {
-                        if let Some(tx_str) = tx.as_str() {
-                            pending.push(PendingTx {
-                                height,
-                                timestamp,
-                                hash: tx_hash_hex(tx_str),
-                                tx_str: tx_str.to_string(),
-                            });
-                        }
-                    }
-                }
-            }
-
-            if let Some(latest) = node_latest {
-                let lag = latest.saturating_sub(last_height);
-                if lag > 100 || pending.len() > 50 {
-                    println!(
-                        "📥 Indexing batch: start={} end={} txs={} lag={}",
-                        start_height,
-                        max_height_in_batch,
-                        pending.len(),
-                        lag
-                    );
-                }
-            }
-
-            // Phase 2 — the receipts, one at a time, in block order (B233:
-            // the node serves one heavy call per client). B242: the first
-            // that cannot be read ends the batch there: the blocks before
-            // its block are written and the height advances to the last of
-            // them; its block is read again next loop (all-or-nothing, a
-            // 500-block batch failed whole on one busy answer, and kept
-            // failing under steady load).
-            let mut receipts: Vec<(PendingTx, Option<serde_json::Value>)> = Vec::new();
-            let mut unread_at: Option<u64> = None;
-            for tx in pending {
-                match fetch_receipt_retried(&tx.hash).await {
-                    Ok(receipt) => receipts.push((tx, receipt)),
-                    Err(e) => {
-                        eprintln!(
-                            "⚠️ Indexer: the receipt of {} (block {}) could not be read: {e}; indexing resumes at its block",
-                            tx.hash, tx.height
-                        );
-                        unread_at = Some(tx.height);
-                        break;
-                    }
-                }
-            }
-            let indexed_to = complete_blocks(&mut receipts, unread_at, max_height_in_batch);
-
-            // Phase 3 — single DB lock per batch, drain all writes serially,
-            // in one transaction with the height (B265).
-            let mut failed = false;
-            if let Ok(mut conn) = db.lock()
-                && let Ok(conn) = conn.transaction()
-            {
-                match write_batch(&conn, &receipts, indexed_to, last_height) {
-                    Ok(()) => {
-                        if let Err(e) = conn.commit() {
-                            error!("Failed to commit the indexed batch: {}", e);
-                        }
-                    }
-                    // B361: dropped uncommitted, its height with it: the
-                    // batch is read again.
-                    Err(e) => {
-                        error!("Failed to index the batch from height {start_height}: {e}");
-                        failed = true;
-                    }
-                }
-            }
-            if unread_at.is_some() || failed {
-                sleep(Duration::from_secs(2)).await;
-            }
-        }
-
-        if !indexed_any {
-            sleep(Duration::from_secs(2)).await;
-        }
-    }
 }
 
 // --- API Handlers ---
@@ -1617,6 +1404,7 @@ fn markets(conn: &Connection, limit: u64, now_ts: u64) -> rusqlite::Result<Vec<D
 }
 
 struct AppState {
+    progress: ingestion::Progress,
     reads: Arc<Reads>,
     client_ip: ClientIp,
 }
@@ -1866,33 +1654,26 @@ async fn main() -> std::io::Result<()> {
     env_logger::init();
     info!("Starting AINCORE Indexer...");
 
-    let db = match init_db() {
-        Ok(c) => Arc::new(Mutex::new(c)),
-        Err(e) => {
-            error!("Failed to initialize database: {}", e);
-            return Ok(());
-        }
-    };
-    // B265: the API reads on its own connections; `db` is the writer's.
-    let reads = match Reads::open(DB_PATH, READERS) {
-        Ok(reads) => Arc::new(reads),
-        Err(e) => {
-            error!("Failed to open the database for reading: {}", e);
-            return Ok(());
-        }
-    };
-
-    // Spawn Indexer
-    let db_clone = db.clone();
+    let db_path = env::var("AINCORE_INDEXER_DB_PATH").unwrap_or_else(|_| DB_PATH.to_owned());
+    let mut db = Connection::open(&db_path).map_err(std::io::Error::other)?;
+    let legacy = ingestion::legacy_checkpoint(&db).map_err(std::io::Error::other)?;
+    prepare_db(&db).map_err(std::io::Error::other)?;
+    let reads = Arc::new(Reads::open(&db_path, READERS).map_err(std::io::Error::other)?);
+    let progress = ingestion::Progress::default();
+    let writer_progress = progress.clone();
     tokio::spawn(async move {
-        indexer_loop(db_clone).await;
+        ingestion::indexer_loop(&mut db, writer_progress, legacy).await;
     });
 
     println!("🚀 Indexer API running on port 3001");
 
     let client_ip = ClientIp::from_env();
     let proxy_port = client_ip.proxy_port;
-    let app_state = web::Data::new(AppState { reads, client_ip });
+    let app_state = web::Data::new(AppState {
+        reads,
+        client_ip,
+        progress,
+    });
 
     HttpServer::new(move || {
         let cors = if permissive_cors_enabled() {
@@ -1910,12 +1691,15 @@ async fn main() -> std::io::Result<()> {
             .wrap(cors)
             .app_data(app_state.clone())
             .route("/health", web::get().to(health))
+            .route("/ready", web::get().to(ingestion::readiness))
             .route("/history/{address}", web::get().to(get_history))
             .route("/api/v1/trades", web::get().to(get_dex_trades))
             .route("/api/v1/ohlc", web::get().to(get_ohlc))
             .route("/api/v1/pair_summary", web::get().to(get_pair_summary))
             .route("/api/v1/markets", web::get().to(get_markets))
     })
+    // Both plaintext listeners serve HTTP/1.1, including the proxy port.
+    .auto_h2c(false)
     .bind(("0.0.0.0", 3001))
     .and_then(|server| match proxy_port {
         // B294: the listener only the header-setting proxy uses.
@@ -2440,7 +2224,7 @@ mod tests {
         assert_eq!(listed[0].amount.as_deref(), Some("100000000000000000000"));
         assert_eq!(listed[0].status.as_deref(), Some("aborted"));
         assert_eq!(listed[0].coin.as_deref(), Some("0x1::staking::AincoreCoin"));
-        assert_eq!(super::get_last_indexed_height(&conn), 7);
+        assert_eq!(super::get_last_indexed_height(&conn).unwrap(), 7);
 
         // A row that cannot be written fails its batch, height and all.
         conn.execute_batch("DROP TABLE dex_trades").unwrap();
@@ -2459,7 +2243,7 @@ mod tests {
         assert!(write_batch(&batch, &[(next, Some(swap))], 8, 7).is_err());
         drop(batch);
         assert_eq!(
-            super::get_last_indexed_height(&conn),
+            super::get_last_indexed_height(&conn).unwrap(),
             7,
             "the height advanced"
         );
@@ -2506,7 +2290,7 @@ mod tests {
         // B378: the row without a status is gone, the cursor back to 0.
         assert!(history(&conn, "a").unwrap().is_empty(), "a row kept");
         assert_eq!(
-            super::get_last_indexed_height(&conn),
+            super::get_last_indexed_height(&conn).unwrap(),
             0,
             "the cursor stayed"
         );
@@ -2520,9 +2304,9 @@ mod tests {
             .unwrap();
         assert_eq!(trader, "a");
         // A second open migrates nothing: the cursor is left alone.
-        super::set_last_indexed_height(&conn, 7);
+        super::set_last_indexed_height(&conn, 7).unwrap();
         prepare_db(&conn).unwrap();
-        assert_eq!(super::get_last_indexed_height(&conn), 7);
+        assert_eq!(super::get_last_indexed_height(&conn).unwrap(), 7);
         // B378: a row indexed again replaces the one there (OR IGNORE kept
         // the first, its status unknown). The rows this test writes by hand
         // carry a payload, as every indexed row does: `history` skips a row
@@ -2549,7 +2333,7 @@ mod tests {
             Some("aborted"),
             "the first row kept"
         );
-        assert_eq!(super::get_last_indexed_height(&conn), 7);
+        assert_eq!(super::get_last_indexed_height(&conn).unwrap(), 7);
         // B361: the rebuilt column keeps a whole u128 as text (an INTEGER
         // column made it a REAL, which no reader takes for a string).
         let big = "340282366920938463463374607431768211455";
@@ -2835,6 +2619,7 @@ mod tests {
         other_pool.pool_addr = "pool2".into();
         index_dex_trade_row(&conn, &other_pool).unwrap();
         let state = actix_web::web::Data::new(super::AppState {
+            progress: Default::default(),
             reads: Arc::new(Reads::open(&db.path, READERS).unwrap()),
             client_ip: super::ClientIp::default(),
         });

@@ -55,6 +55,7 @@ PORT=9001
 DATA="$WORK/data"
 DB="$DATA/validator_${PORT}.db"
 mkdir -p "$DB/sub"
+touch "$DB/LOCK"
 
 # Fabricate deterministic-ish DB contents + identity.
 printf 'CURRENT-marker\n' > "$DB/CURRENT"

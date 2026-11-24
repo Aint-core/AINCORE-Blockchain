@@ -1,0 +1,14 @@
+✅ backup refuses (exit 3) without --not-a-validator: a validator backs up node.key only (B467)
+✅ backup --not-a-validator produced archive + sha256 sidecar
+✅ the archive holds no node.key; MANIFEST includes_node_key=no, not_a_validator=yes (B467)
+✅ sha256 sidecar verifies
+✅ restore refuses (exit 3) without --not-a-validator (B467)
+✅ --restore-validator-key is refused (exit 2) and installs nothing (B467)
+✅ DB + genesis round-trip byte-for-byte; no node.key; RESTORED_FROM_BACKUP written
+✅ restore refuses to clobber existing non-empty DB
+✅ a pre-B467 archive with a node.key restores its DB only, with a warning (B467)
+✅ restore rejects tampered archive (sha256 mismatch caught)
+✅ restore refuses (exit 3) a datadir with a node.key, key untouched (B373)
+✅ the DR runbook, the operator guide and both scripts agree with G1 SA-4 and B459 (B467)
+
+✅ DR ROUND-TRIP TEST PASSED (12 checks)

@@ -1,0 +1,21 @@
+{
+  "scope": "fresh directory with node-only artifact layout; no stdlib",
+  "binary_sha256": "6882bbd71cc21c8db20c8fdb3825d6e81d335025bf5e46e4495d80778bf890b4",
+  "genesis_sha256": "fb8479b39650654f608b6b159821764e9de31d9da7a1340afddfd26282cde61d",
+  "case": {
+    "scenario": "clean_shutdown",
+    "passed": false,
+    "log": "/home/pi/aincore-backup-safety-20261022/package-before/clean_shutdown.log",
+    "command": [
+      "/home/pi/aincore-exit-probe-20261022/node",
+      "--port",
+      "37439",
+      "--rpc-port",
+      "60739",
+      "--datadir",
+      "/home/pi/aincore-backup-safety-20261022/package-before/clean_shutdown"
+    ],
+    "error": "process exited before readiness: 1",
+    "elapsed_seconds": 0.293
+  }
+}

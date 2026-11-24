@@ -1,0 +1,146 @@
+{
+  "passed": true,
+  "stage": "complete",
+  "started_at": 1792673963.1954153,
+  "scope": "real disposable lab observer sync/backup/restore, historical receipt/balance/nonce and RPC-verified QC checks; not validator recovery or independent cryptographic verification",
+  "binary_sha256": "6882bbd71cc21c8db20c8fdb3825d6e81d335025bf5e46e4495d80778bf890b4",
+  "genesis_sha256": "fb8479b39650654f608b6b159821764e9de31d9da7a1340afddfd26282cde61d",
+  "script_sha256": {
+    "backup_node.sh": "7a6048cf5afd091a1ed3bc75b20edb949321682bae4b73ebe9fbcb1b297f9614",
+    "restore_node.sh": "6f28c46378ea49f998d95d4b4ee50dd98ca17293ae9f3b4aa96903144aa38f59",
+    "observer_backup_probe.py": "409947ada18b1ce8d9c6b482ae21290615a48497ff31c43a76407c54261b3360",
+    "node_exit_probe.py": "d036cff7f9f1e1e6c6f7c71d3b81a47c8182c018d172f013647d1a6252ef82f6"
+  },
+  "steps": [
+    {
+      "step": "live_lock_refused",
+      "exit_code": 3
+    },
+    {
+      "step": "original_shutdown",
+      "exit_code": 0
+    },
+    {
+      "step": "stopped_backup_restore",
+      "database_files": 8,
+      "archive_sha256": "a02390fa6652a0a16b61c1d0e37c436610b54d23d296db3ab5ebde34595f6e5a",
+      "key_not_restored": true
+    },
+    {
+      "step": "restored_shutdown",
+      "exit_code": 0
+    }
+  ],
+  "reference": {
+    "1263": [
+      1263,
+      [
+        "c47fbde410d91b99d84054c717813767fb620f0cba89b01c49a4c0e1b1077877",
+        "02f14fe2e94d2a421f875b34b9ba903c7e5625811c2d59478399fc6339885748",
+        "08d4c986de4a78b1864cd93b374cd8f0eed2a95da8cb7135b4ac66c7452130b5",
+        "b7d6c37768367acba72e6e93764ba451c0f129afadf970b4e4091a9612d99601"
+      ]
+    ],
+    "2157": [
+      2157,
+      [
+        "21648eb69a41648c7c1942605ad266d7bd57f720ccefc309c3a01c4045cea1a4",
+        "19e2cd566b2be6c1411cc635f5470657d9cdde37e07f60a89f3e5b1aaf4e5753",
+        "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc",
+        "6551e545aed420e67ea776e136f0b4ad26eaeb488045f9b90f8e064f3346489a"
+      ]
+    ]
+  },
+  "reference_height": 2157,
+  "before": {
+    "node_id": "3587a4ef70bd3c7cbd47de3f6fd8142fcfa5ad7d35a530246b95b4c2823e5321",
+    "chain_id": "AINCORE-LAB-646F5C8B4FEBB6A2",
+    "identity_source": "local child startup log; RPC consensus_busy=true",
+    "certified_tip": 2166,
+    "history": {
+      "1263": [
+        1263,
+        [
+          "c47fbde410d91b99d84054c717813767fb620f0cba89b01c49a4c0e1b1077877",
+          "02f14fe2e94d2a421f875b34b9ba903c7e5625811c2d59478399fc6339885748",
+          "08d4c986de4a78b1864cd93b374cd8f0eed2a95da8cb7135b4ac66c7452130b5",
+          "b7d6c37768367acba72e6e93764ba451c0f129afadf970b4e4091a9612d99601"
+        ]
+      ],
+      "2157": [
+        2157,
+        [
+          "21648eb69a41648c7c1942605ad266d7bd57f720ccefc309c3a01c4045cea1a4",
+          "19e2cd566b2be6c1411cc635f5470657d9cdde37e07f60a89f3e5b1aaf4e5753",
+          "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc",
+          "6551e545aed420e67ea776e136f0b4ad26eaeb488045f9b90f8e064f3346489a"
+        ]
+      ]
+    },
+    "receipt": {
+      "block_height": 1263,
+      "block_hash": "c47fbde410d91b99d84054c717813767fb620f0cba89b01c49a4c0e1b1077877",
+      "execution_receipt": {
+        "error": null,
+        "gas_charged": "1312515357875148",
+        "metadata": null,
+        "status": "success"
+      }
+    },
+    "nonce": {
+      "nonce": 4,
+      "sequence_number": 4
+    },
+    "balance": {
+      "balance_source": "move_coin_store",
+      "id": "37d9a6e9265914f530e5381d36af5d0183927d7c6b9c10f8dc0630f861540ae7",
+      "move_balance": "1000000000000000000"
+    }
+  },
+  "after": {
+    "node_id": "9fd07f8f4e245499c8ed1baee50131f4489dd1fb5fcaaa5034df016f079318bd",
+    "chain_id": "AINCORE-LAB-646F5C8B4FEBB6A2",
+    "identity_source": "RPC",
+    "certified_tip": 2166,
+    "history": {
+      "1263": [
+        1263,
+        [
+          "c47fbde410d91b99d84054c717813767fb620f0cba89b01c49a4c0e1b1077877",
+          "02f14fe2e94d2a421f875b34b9ba903c7e5625811c2d59478399fc6339885748",
+          "08d4c986de4a78b1864cd93b374cd8f0eed2a95da8cb7135b4ac66c7452130b5",
+          "b7d6c37768367acba72e6e93764ba451c0f129afadf970b4e4091a9612d99601"
+        ]
+      ],
+      "2157": [
+        2157,
+        [
+          "21648eb69a41648c7c1942605ad266d7bd57f720ccefc309c3a01c4045cea1a4",
+          "19e2cd566b2be6c1411cc635f5470657d9cdde37e07f60a89f3e5b1aaf4e5753",
+          "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc",
+          "6551e545aed420e67ea776e136f0b4ad26eaeb488045f9b90f8e064f3346489a"
+        ]
+      ]
+    },
+    "receipt": {
+      "block_height": 1263,
+      "block_hash": "c47fbde410d91b99d84054c717813767fb620f0cba89b01c49a4c0e1b1077877",
+      "execution_receipt": {
+        "error": null,
+        "gas_charged": "1312515357875148",
+        "metadata": null,
+        "status": "success"
+      }
+    },
+    "nonce": {
+      "nonce": 4,
+      "sequence_number": 4
+    },
+    "balance": {
+      "balance_source": "move_coin_store",
+      "id": "37d9a6e9265914f530e5381d36af5d0183927d7c6b9c10f8dc0630f861540ae7",
+      "move_balance": "1000000000000000000"
+    }
+  },
+  "finished_at": 1792674054.43068
+}

@@ -1,0 +1,59 @@
+{
+  "passed": true,
+  "stage": "complete",
+  "chain_id": "AINCORE-LAB-646F5C8B4FEBB6A2",
+  "binary_sha256": "8ac0c2112432f819d3c3dd1735184edc47ebf5e90edd3a3a62e9cc6704f5e893",
+  "genesis_sha256": "fb8479b39650654f608b6b159821764e9de31d9da7a1340afddfd26282cde61d",
+  "scope": "fresh isolated observer process exits; not validator recovery",
+  "cases": [
+    {
+      "scenario": "p2p_busy",
+      "passed": true,
+      "log": "/home/alpha/aincore-exit-fix-20261022/target/exit-followup/process-exits/p2p_busy.log",
+      "command": [
+        "/home/alpha/aincore-exit-fix-20261022/target/exit-followup/node-x86_64",
+        "--port",
+        "33917",
+        "--rpc-port",
+        "37357",
+        "--datadir",
+        "/home/alpha/aincore-exit-fix-20261022/target/exit-followup/process-exits/p2p_busy"
+      ],
+      "exit_code": 1,
+      "elapsed_seconds": 0.515
+    },
+    {
+      "scenario": "clean_shutdown",
+      "passed": true,
+      "log": "/home/alpha/aincore-exit-fix-20261022/target/exit-followup/process-exits/clean_shutdown.log",
+      "command": [
+        "/home/alpha/aincore-exit-fix-20261022/target/exit-followup/node-x86_64",
+        "--port",
+        "39721",
+        "--rpc-port",
+        "45911",
+        "--datadir",
+        "/home/alpha/aincore-exit-fix-20261022/target/exit-followup/process-exits/clean_shutdown"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 3.825
+    },
+    {
+      "scenario": "flush_denied",
+      "passed": true,
+      "log": "/home/alpha/aincore-exit-fix-20261022/target/exit-followup/process-exits/flush_denied.log",
+      "command": [
+        "/home/alpha/aincore-exit-fix-20261022/target/exit-followup/node-x86_64",
+        "--port",
+        "55267",
+        "--rpc-port",
+        "53417",
+        "--datadir",
+        "/home/alpha/aincore-exit-fix-20261022/target/exit-followup/process-exits/flush_denied"
+      ],
+      "injected_fault": "own fresh database directory mode 0500",
+      "exit_code": 1,
+      "elapsed_seconds": 3.601
+    }
+  ]
+}

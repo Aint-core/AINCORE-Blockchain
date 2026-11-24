@@ -40,7 +40,15 @@ const crypto = __importStar(require("crypto"));
 const address_1 = require("./address");
 class Keypair {
     constructor(keypair) {
-        this._keypair = keypair;
+        if (keypair.secretKey.length !== nacl.sign.secretKeyLength) {
+            throw new Error('Expected a 64-byte Ed25519 secret key');
+        }
+        const derived = nacl.sign.keyPair.fromSeed(keypair.secretKey.subarray(0, nacl.sign.seedLength));
+        if (!nacl.verify(derived.publicKey, keypair.secretKey.subarray(nacl.sign.seedLength)) ||
+            !nacl.verify(derived.publicKey, keypair.publicKey)) {
+            throw new Error('Inconsistent Ed25519 keypair');
+        }
+        this._keypair = derived;
     }
     /**
      * Generate a new random Keypair

@@ -15,11 +15,10 @@
 //! or `libp2p-pubsub:`, consensus signs 64-character hex hashes and
 //! domain-tagged pull requests.
 
-use async_trait::async_trait;
 use blockchain::committee::ValidatorInfo;
 use libp2p::futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{identity, request_response, PeerId, StreamProtocol};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
@@ -258,7 +257,6 @@ pub async fn write_frame<T: AsyncWrite + Unpin + Send>(
     io.close().await
 }
 
-#[async_trait]
 impl<Q> request_response::Codec for FramedCodec<Q>
 where
     Q: From<String> + AsRef<str> + Send + Sync + 'static,
@@ -314,8 +312,24 @@ pub fn consensus_behaviour() -> request_response::Behaviour<ConsensusCodec> {
             .with_request_timeout(std::time::Duration::from_secs(10))
             // B30: a connection's unanswered consensus streams hold at most
             // 16 frames (a member keeps a few pushes in flight to a peer).
-            .with_max_concurrent_streams(16),
+            .with_max_concurrent_streams(CONSENSUS_STREAMS),
     )
+}
+
+const CONSENSUS_STREAMS: usize = 16;
+// request-response 0.27 shares its worker limit between both directions.
+// Reserve half for honest peers' pushes without raising the inbound cap.
+const PUSH_IN_FLIGHT_PER_PEER: usize = CONSENSUS_STREAMS / 2;
+const PUSH_COUNT_PER_PEER: usize = 64;
+const PUSH_COUNT_TOTAL: usize = 256;
+const PUSH_BYTES_PER_PEER: usize = 2 << 20;
+const PUSH_BYTES_TOTAL: usize = 8 << 20;
+const PUSH_QUEUE_TTL: std::time::Duration = std::time::Duration::from_secs(10);
+
+struct QueuedPush {
+    peer: PeerId,
+    wire: Arc<str>,
+    queued: std::time::Instant,
 }
 
 /// B30: `/aincore/consensus/1` exists only on connections whose peer a
@@ -331,6 +345,11 @@ pub fn consensus_behaviour() -> request_response::Behaviour<ConsensusCodec> {
 pub struct MembersOnly {
     inner: request_response::Behaviour<ConsensusCodec>,
     book: Arc<RwLock<PeerBook>>,
+    local_peer: PeerId,
+    queued_pushes: VecDeque<QueuedPush>,
+    active_pushes: HashMap<request_response::OutboundRequestId, (PeerId, usize)>,
+    push_bytes: usize,
+    dropped_pushes: u64,
     /// Handlers chosen, until the connection is established or fails.
     chosen: HashMap<libp2p::swarm::ConnectionId, bool>,
     /// Connections with the request-response handler, by peer.
@@ -340,14 +359,119 @@ pub struct MembersOnly {
 }
 
 impl MembersOnly {
-    pub fn new(book: Arc<RwLock<PeerBook>>) -> Self {
+    pub fn new(book: Arc<RwLock<PeerBook>>, local_peer: PeerId) -> Self {
         Self {
             inner: consensus_behaviour(),
             book,
+            local_peer,
+            queued_pushes: VecDeque::new(),
+            active_pushes: HashMap::new(),
+            push_bytes: 0,
+            dropped_pushes: 0,
             chosen: HashMap::new(),
             served: HashMap::new(),
             refused: HashMap::new(),
         }
+    }
+
+    /// Queue only current members' pushes to connected members. Overflow
+    /// is dropped, as on the inbound inbox, leaving repair to V4 pulls/rebroadcast.
+    /// QC_WANT over the separate sync behaviour is unaffected for observers.
+    pub fn push(&mut self, peer: &PeerId, wire: Arc<str>) -> bool {
+        if !self.can_push(peer) || wire.len() > CONSENSUS_REQUEST_CAP {
+            return false;
+        }
+        let mut peer_count = 0;
+        let mut peer_bytes = 0;
+        for (p, bytes) in self.active_pushes.values() {
+            if p == peer {
+                peer_count += 1;
+                peer_bytes += bytes;
+            }
+        }
+        for queued in &self.queued_pushes {
+            if &queued.peer == peer {
+                peer_count += 1;
+                peer_bytes += queued.wire.len();
+            }
+        }
+        if peer_count >= PUSH_COUNT_PER_PEER
+            || self.active_pushes.len() + self.queued_pushes.len() >= PUSH_COUNT_TOTAL
+            || peer_bytes + wire.len() > PUSH_BYTES_PER_PEER
+            || self.push_bytes + wire.len() > PUSH_BYTES_TOTAL
+        {
+            self.note_dropped_push();
+            return false;
+        }
+        self.push_bytes += wire.len();
+        self.queued_pushes.push_back(QueuedPush {
+            peer: *peer,
+            wire,
+            queued: std::time::Instant::now(),
+        });
+        true
+    }
+
+    fn can_push(&self, peer: &PeerId) -> bool {
+        *peer != self.local_peer
+            && self.served.contains_key(peer)
+            && self.book.read().is_ok_and(|book| {
+                book.member_of(&self.local_peer).is_some() && book.member_of(peer).is_some()
+            })
+    }
+
+    fn note_dropped_push(&mut self) {
+        self.dropped_pushes = self.dropped_pushes.saturating_add(1);
+        if self.dropped_pushes.is_power_of_two() {
+            eprintln!(
+                "[P2P] consensus outbound queue full/expired: {} dropped pushes",
+                self.dropped_pushes
+            );
+        }
+    }
+
+    fn pump_pushes(&mut self, now: std::time::Instant) {
+        // Examine each entry once. A stalled peer must not hold up others.
+        for _ in 0..self.queued_pushes.len() {
+            let Some(push) = self.queued_pushes.pop_front() else {
+                break;
+            };
+            if !self.can_push(&push.peer) {
+                self.push_bytes -= push.wire.len();
+                continue;
+            }
+            if now.saturating_duration_since(push.queued) >= PUSH_QUEUE_TTL {
+                self.push_bytes -= push.wire.len();
+                self.note_dropped_push();
+                continue;
+            }
+            let active = self
+                .active_pushes
+                .values()
+                .filter(|(peer, _)| *peer == push.peer)
+                .count();
+            if active >= PUSH_IN_FLIGHT_PER_PEER {
+                self.queued_pushes.push_back(push);
+                continue;
+            }
+            let len = push.wire.len();
+            let id = self.inner.send_request(&push.peer, push.wire);
+            self.active_pushes.insert(id, (push.peer, len));
+        }
+    }
+
+    fn finish_push(&mut self, id: &request_response::OutboundRequestId) {
+        if let Some((_, bytes)) = self.active_pushes.remove(id) {
+            self.push_bytes -= bytes;
+        }
+    }
+
+    pub fn send_response(
+        &mut self,
+        channel: request_response::ResponseChannel<String>,
+        response: String,
+    ) -> Result<(), String> {
+        self.inner.send_response(channel, response)
     }
 
     fn is_member(&self, peer: &PeerId) -> bool {
@@ -401,12 +525,6 @@ impl std::ops::Deref for MembersOnly {
     type Target = request_response::Behaviour<ConsensusCodec>;
     fn deref(&self) -> &Self::Target {
         &self.inner
-    }
-}
-
-impl std::ops::DerefMut for MembersOnly {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
     }
 }
 
@@ -573,9 +691,25 @@ impl libp2p::swarm::NetworkBehaviour for MembersOnly {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<libp2p::swarm::ToSwarm<Self::ToSwarm, libp2p::swarm::THandlerInEvent<Self>>>
     {
-        self.inner
-            .poll(cx)
-            .map(|action| action.map_in(libp2p::swarm::derive_prelude::Either::Left))
+        use libp2p::swarm::ToSwarm;
+        use std::task::Poll;
+        self.pump_pushes(std::time::Instant::now());
+        let action = self.inner.poll(cx);
+        if let Poll::Ready(ToSwarm::GenerateEvent(event)) = &action {
+            let id = match event {
+                request_response::Event::Message {
+                    message: request_response::Message::Response { request_id, .. },
+                    ..
+                } => Some(request_id),
+                request_response::Event::OutboundFailure { request_id, .. } => Some(request_id),
+                _ => None,
+            };
+            if let Some(id) = id {
+                self.finish_push(id);
+                cx.waker().wake_by_ref();
+            }
+        }
+        action.map(|action| action.map_in(libp2p::swarm::derive_prelude::Either::Left))
     }
 }
 
@@ -584,6 +718,9 @@ impl libp2p::swarm::NetworkBehaviour for MembersOnly {
 /// sessions ask it to serve.
 pub struct SessionWiring {
     pub book: Arc<RwLock<PeerBook>>,
+    /// Bind the port early, but wait for validated boot state before sessions.
+    /// None permits sync-only bootstrap before a checkpoint has been restored.
+    pub startup_ready: Option<tokio::sync::oneshot::Receiver<()>>,
     pub table: network::SessionTable,
     pub asks: mpsc::Receiver<network::SyncAsk>,
     pub dials: mpsc::Receiver<network::SyncDial>,
@@ -609,6 +746,7 @@ impl SessionWiring {
         (
             Self {
                 book,
+                startup_ready: None,
                 table: Arc::clone(&table),
                 asks,
                 dials,
@@ -3274,6 +3412,340 @@ mod tests {
         )
     }
 
+    fn member_swarm(key: identity::Keypair, book: Arc<RwLock<PeerBook>>) -> Swarm<MembersOnly> {
+        let local = key.public().to_peer_id();
+        let transport = MemoryTransport::default()
+            .upgrade(upgrade::Version::V1)
+            .authenticate(noise::Config::new(&key).unwrap())
+            .multiplex(yamux::Config::default())
+            .boxed();
+        Swarm::new(
+            transport,
+            MembersOnly::new(book, local),
+            local,
+            libp2p::swarm::Config::with_tokio_executor()
+                .with_idle_connection_timeout(Duration::from_secs(30)),
+        )
+    }
+
+    async fn connect_members(a: &mut Swarm<MembersOnly>, b: &mut Swarm<MembersOnly>) {
+        let addr: Multiaddr = format!("/memory/{}", rand::random::<u64>() | 1).parse().unwrap();
+        b.listen_on(addr.clone()).unwrap();
+        a.add_peer_address(*b.local_peer_id(), addr);
+        a.dial(*b.local_peer_id()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !(a.is_connected(b.local_peer_id()) && b.is_connected(a.local_peer_id())) {
+                tokio::select! {
+                    _ = a.select_next_some() => {},
+                    _ = b.select_next_some() => {},
+                }
+            }
+        }).await.expect("Noise connection did not open");
+    }
+
+    #[tokio::test]
+    async fn consensus_push_observer_never_queues_member_protocol() {
+        let (validator, secret) = member(1);
+        let book = Arc::new(RwLock::new(PeerBook::new(0, &[&[validator]])));
+        let mut observer = member_swarm(local_keypair(&[9; 32]), Arc::clone(&book));
+        let mut validator = member_swarm(local_keypair(&secret), book);
+        connect_members(&mut observer, &mut validator).await;
+        assert!(!observer.behaviour_mut().push(validator.local_peer_id(), "DAG_V4:test".into()),
+            "observer queued a request on the member-only protocol");
+    }
+
+    #[tokio::test]
+    async fn consensus_push_observer_can_fetch_qc_over_sync_but_cannot_push() {
+        #[derive(libp2p::swarm::NetworkBehaviour)]
+        struct Protocols {
+            consensus: MembersOnly,
+            sync: request_response::Behaviour<FramedCodec>,
+        }
+        let (validator, secret) = member(1);
+        let book = Arc::new(RwLock::new(PeerBook::new(0, &[&[validator]])));
+        let make = |key: identity::Keypair| {
+            let local = key.public().to_peer_id();
+            let transport = MemoryTransport::default()
+                .upgrade(upgrade::Version::V1)
+                .authenticate(noise::Config::new(&key).unwrap())
+                .multiplex(yamux::Config::default())
+                .boxed();
+            Swarm::new(transport, Protocols {
+                consensus: MembersOnly::new(Arc::clone(&book), local),
+                sync: sync_behaviour(),
+            }, local, libp2p::swarm::Config::with_tokio_executor()
+                .with_idle_connection_timeout(Duration::from_secs(30)))
+        };
+        let mut observer = make(local_keypair(&[9; 32]));
+        let mut validator = make(local_keypair(&secret));
+        let peer = *validator.local_peer_id();
+        let addr: Multiaddr = format!("/memory/{}", rand::random::<u64>() | 1).parse().unwrap();
+        validator.listen_on(addr.clone()).unwrap();
+        observer.add_peer_address(peer, addr);
+        observer.dial(peer).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !(observer.is_connected(&peer) && validator.is_connected(observer.local_peer_id())) {
+                tokio::select! {
+                    _ = observer.select_next_some() => {},
+                    _ = validator.select_next_some() => {},
+                }
+            }
+        }).await.unwrap();
+        assert!(!observer.behaviour_mut().consensus.push(&peer, "DAG_V4:test".into()));
+        // Bypass our sender policy to emulate a malicious peer. Inbound
+        // protocol negotiation must still reject it before reading a frame.
+        observer.behaviour_mut().consensus.inner.send_request(&peer, "DAG_V4:forged".into());
+        let wire = format!("{}100", consensus::dag::QC_WANT_PREFIX);
+        observer.behaviour_mut().sync.send_request(&peer, wire.clone());
+        let (mut refused, mut answered) = (false, false);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !(refused && answered) {
+                tokio::select! {
+                    ev = observer.select_next_some() => match ev {
+                        SwarmEvent::Behaviour(ProtocolsEvent::Consensus(request_response::Event::OutboundFailure { error, .. })) => {
+                            assert!(matches!(error, request_response::OutboundFailure::UnsupportedProtocols));
+                            refused = true;
+                        }
+                        SwarmEvent::Behaviour(ProtocolsEvent::Sync(request_response::Event::Message {
+                            message: request_response::Message::Response { response, .. }, ..
+                        })) => {
+                            assert_eq!(response, "test-qc-response");
+                            answered = true;
+                        }
+                        _ => {}
+                    },
+                    ev = validator.select_next_some() => match ev {
+                        SwarmEvent::Behaviour(ProtocolsEvent::Consensus(request_response::Event::Message { .. })) => panic!("non-member reached consensus codec"),
+                        SwarmEvent::Behaviour(ProtocolsEvent::Sync(request_response::Event::Message {
+                            message: request_response::Message::Request { request, channel, .. }, ..
+                        })) => {
+                            assert_eq!(request, wire);
+                            validator.behaviour_mut().sync.send_response(channel, "test-qc-response".into()).unwrap();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }).await.expect("observer sync was blocked by the consensus admission rule");
+    }
+
+    #[tokio::test]
+    async fn consensus_push_bidirectional_burst_drains_without_stream_exhaustion() {
+        let (a, sa) = member(1);
+        let (b, sb) = member(2);
+        let book = Arc::new(RwLock::new(PeerBook::new(0, &[&[a, b]])));
+        let mut a = member_swarm(local_keypair(&sa), Arc::clone(&book));
+        let mut b = member_swarm(local_keypair(&sb), book);
+        connect_members(&mut a, &mut b).await;
+        for n in 0..48 {
+            assert!(a.behaviour_mut().push(b.local_peer_id(), format!("DAG_V4:a{n}").into()));
+            assert!(b.behaviour_mut().push(a.local_peer_id(), format!("DAG_V4:b{n}").into()));
+        }
+        let mut held_a = Vec::new();
+        let mut held_b = Vec::new();
+        let mut seen_a = std::collections::HashSet::new();
+        let mut seen_b = std::collections::HashSet::new();
+        let mut acked = [0; 2];
+        let mut failures = Vec::new();
+        let mut release = tokio::time::interval(Duration::from_millis(150));
+        release.tick().await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while acked.iter().sum::<usize>() + failures.len() < 96 {
+                tokio::select! {
+                    ev = a.select_next_some() => match ev {
+                        SwarmEvent::Behaviour(request_response::Event::Message { message, .. }) => match message {
+                            request_response::Message::Request { request, channel, .. } => {
+                                assert!(seen_a.insert(request.to_string()), "duplicate push");
+                                held_a.push(channel);
+                            }
+                            request_response::Message::Response { response, .. } => {
+                                assert_eq!(response, CONSENSUS_ACK);
+                                acked[0] += 1;
+                            }
+                        },
+                        SwarmEvent::Behaviour(request_response::Event::OutboundFailure { error, .. }) => failures.push(error.to_string()),
+                        _ => {}
+                    },
+                    ev = b.select_next_some() => match ev {
+                        SwarmEvent::Behaviour(request_response::Event::Message { message, .. }) => match message {
+                            request_response::Message::Request { request, channel, .. } => {
+                                assert!(seen_b.insert(request.to_string()), "duplicate push");
+                                held_b.push(channel);
+                            }
+                            request_response::Message::Response { response, .. } => {
+                                assert_eq!(response, CONSENSUS_ACK);
+                                acked[1] += 1;
+                            }
+                        },
+                        SwarmEvent::Behaviour(request_response::Event::OutboundFailure { error, .. }) => failures.push(error.to_string()),
+                        _ => {}
+                    },
+                    _ = release.tick() => {
+                        for channel in held_a.drain(..) {
+                            a.behaviour_mut().send_response(channel, CONSENSUS_ACK.into()).unwrap();
+                        }
+                        for channel in held_b.drain(..) {
+                            b.behaviour_mut().send_response(channel, CONSENSUS_ACK.into()).unwrap();
+                        }
+                    }
+                }
+            }
+        }).await.expect("burst did not drain");
+        assert!(failures.is_empty(), "healthy burst failed: {failures:?}");
+        assert_eq!(acked, [48, 48]);
+        assert_eq!((seen_a.len(), seen_b.len()), (48, 48));
+        for swarm in [&a, &b] {
+            assert!(swarm.behaviour().queued_pushes.is_empty());
+            assert!(swarm.behaviour().active_pushes.is_empty());
+            assert_eq!(swarm.behaviour().push_bytes, 0);
+        }
+    }
+
+    // Accounting tests use synthetic established connections. The tests
+    // above/below exercise the same scheduler over real Noise/Yamux streams.
+    fn push_fixture() -> (MembersOnly, Vec<PeerId>) {
+        let validators: Vec<_> = (1..=6).map(|i| member(i).0).collect();
+        let peers: Vec<_> = validators.iter().map(|v| peer_id_of(&v.ed25519_public_key).unwrap()).collect();
+        let book = Arc::new(RwLock::new(PeerBook::new(0, &[&validators])));
+        let mut behaviour = MembersOnly::new(book, peers[0]);
+        for (i, peer) in peers.iter().enumerate().skip(1) {
+            behaviour.served.insert(*peer, vec![libp2p::swarm::ConnectionId::new_unchecked(i)]);
+        }
+        (behaviour, peers)
+    }
+
+    #[test]
+    fn consensus_push_count_and_byte_limits_include_waiting_requests() {
+        let (mut queue, peers) = push_fixture();
+        for peer in &peers[1..5] {
+            for _ in 0..PUSH_COUNT_PER_PEER {
+                assert!(queue.push(peer, "DAG_V4:x".into()));
+            }
+            assert!(!queue.push(peer, "DAG_V4:overflow".into()));
+        }
+        assert_eq!(queue.queued_pushes.len(), PUSH_COUNT_TOTAL);
+        assert!(!queue.push(&peers[5], "DAG_V4:global-overflow".into()));
+        let (mut queue, peers) = push_fixture();
+        let wire: Arc<str> = "x".repeat(512 << 10).into();
+        for peer in &peers[1..5] {
+            for _ in 0..4 {
+                assert!(queue.push(peer, Arc::clone(&wire)));
+            }
+            assert!(!queue.push(peer, "x".into()), "peer byte cap exceeded");
+        }
+        assert_eq!(queue.push_bytes, PUSH_BYTES_TOTAL);
+        assert!(!queue.push(&peers[5], "x".into()), "global byte cap exceeded");
+        assert!(!queue.push(&peers[5], "x".repeat(CONSENSUS_REQUEST_CAP + 1).into()));
+    }
+
+    #[test]
+    fn consensus_push_stalled_peer_does_not_block_other_peers_or_leak_slots() {
+        let (mut queue, peers) = push_fixture();
+        for _ in 0..PUSH_COUNT_PER_PEER {
+            assert!(queue.push(&peers[1], "slow".into()));
+        }
+        assert!(queue.push(&peers[2], "healthy".into()));
+        queue.pump_pushes(std::time::Instant::now());
+        assert_eq!(queue.active_pushes.values().filter(|(p, _)| *p == peers[1]).count(), 8);
+        assert_eq!(queue.active_pushes.values().filter(|(p, _)| *p == peers[2]).count(), 1);
+        // In-flight requests are charged too, not just the waiting queue.
+        assert!(!queue.push(&peers[1], "overflow".into()));
+        let ids: Vec<_> = queue.active_pushes.keys().copied().collect();
+        for id in ids {
+            queue.finish_push(&id);
+            queue.finish_push(&id); // a duplicate completion cannot underflow
+        }
+        queue.pump_pushes(std::time::Instant::now() + PUSH_QUEUE_TTL);
+        assert!(queue.active_pushes.is_empty());
+        assert!(queue.queued_pushes.is_empty());
+        assert_eq!(queue.push_bytes, 0);
+        assert!(queue.push(&peers[2], "fresh".into()));
+        queue.pump_pushes(std::time::Instant::now());
+        assert_eq!(queue.active_pushes.len(), 1);
+    }
+
+    #[test]
+    fn consensus_push_membership_is_rechecked_before_dispatch() {
+        let (mut queue, peers) = push_fixture();
+        assert!(!queue.push(&peers[0], "self".into()));
+        let stranger = local_keypair(&[99; 32]).public().to_peer_id();
+        assert!(!queue.push(&stranger, "stranger".into()));
+        assert!(queue.push(&peers[1], "queued".into()));
+        let local = member(1).0;
+        let remote = member(2).0;
+        *queue.book.write().unwrap() = PeerBook::new(1, &[std::slice::from_ref(&local)]);
+        queue.pump_pushes(std::time::Instant::now());
+        assert_eq!(queue.push_bytes, 0, "removed remote kept a queued push");
+        assert!(!queue.push(&peers[1], "removed".into()));
+        *queue.book.write().unwrap() = PeerBook::new(1, &[&[local], std::slice::from_ref(&remote)]);
+        assert!(queue.push(&peers[1], "next committee".into()));
+        *queue.book.write().unwrap() = PeerBook::new(2, &[&[remote]]);
+        queue.pump_pushes(std::time::Instant::now());
+        assert_eq!(queue.push_bytes, 0, "departed local kept a queued push");
+        assert!(!queue.push(&peers[1], "local left".into()));
+        assert!(queue.active_pushes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn consensus_push_failures_release_capacity_and_disconnect_discards_queue() {
+        let (a, sa) = member(1);
+        let (b, sb) = member(2);
+        let book = Arc::new(RwLock::new(PeerBook::new(0, &[&[a, b]])));
+        let mut a = member_swarm(local_keypair(&sa), Arc::clone(&book));
+        let mut b = member_swarm(local_keypair(&sb), book);
+        connect_members(&mut a, &mut b).await;
+        for _ in 0..24 {
+            assert!(a.behaviour_mut().push(b.local_peer_id(), "DAG_V4:refused".into()));
+        }
+        let mut failures = 0;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while failures < 24 {
+                tokio::select! {
+                    ev = a.select_next_some() => {
+                        if let SwarmEvent::Behaviour(request_response::Event::OutboundFailure { .. }) = ev {
+                            failures += 1;
+                        }
+                    }
+                    ev = b.select_next_some() => {
+                        if let SwarmEvent::Behaviour(request_response::Event::Message {
+                            message: request_response::Message::Request { channel, .. }, ..
+                        }) = ev { drop(channel); }
+                    }
+                }
+            }
+        }).await.expect("failed requests held capacity forever");
+        assert_eq!(a.behaviour().push_bytes, 0);
+        for _ in 0..48 {
+            assert!(a.behaviour_mut().push(b.local_peer_id(), "DAG_V4:disconnect".into()));
+        }
+        let mut held = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while held.len() < PUSH_IN_FLIGHT_PER_PEER {
+                tokio::select! {
+                    _ = a.select_next_some() => {},
+                    ev = b.select_next_some() => {
+                        if let SwarmEvent::Behaviour(request_response::Event::Message {
+                            message: request_response::Message::Request { channel, .. }, ..
+                        }) = ev { held.push(channel); }
+                    }
+                }
+            }
+        }).await.expect("no in-flight requests before disconnect");
+        assert_eq!(a.behaviour().queued_pushes.len(), 40);
+        b.disconnect_peer_id(*a.local_peer_id()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while a.behaviour().push_bytes != 0 {
+                tokio::select! {
+                    _ = a.select_next_some() => {},
+                    _ = b.select_next_some() => {},
+                }
+            }
+        }).await.expect("disconnect leaked requests/bytes");
+        assert!(a.behaviour().active_pushes.is_empty());
+        assert!(a.behaviour().queued_pushes.is_empty());
+        assert!(!a.behaviour_mut().push(b.local_peer_id(), "disconnected".into()));
+    }
+
     /// What a server does in this test: the node's own rule.
     enum Seen {
         Delivered(String, String),
@@ -3319,6 +3791,7 @@ mod tests {
                     if let SwarmEvent::Behaviour(request_response::Event::Message {
                         peer,
                         message: request_response::Message::Request { request, channel, .. },
+                        ..
                     }) = ev {
                         match admit_consensus_request(&book, &peer) {
                             Some(who) => {

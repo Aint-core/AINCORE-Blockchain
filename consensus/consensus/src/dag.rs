@@ -117,6 +117,7 @@ pub struct DagConsensus {
     qc_retry_cursor: String,
     /// G4 S1: the network task (gossip and committee sessions).
     pub p2p_tx: Option<tokio::sync::mpsc::Sender<network::Outbound>>,
+    v4_egress: egress::Egress,
     pub node_key: [u8; 32], // H4 FIX: Store the persistent Ed25519 key for BLS derivation
     /// Phase 2.8 (M-08): cache of the active validator set.
     ///
@@ -209,8 +210,12 @@ pub type V4Outbox = Arc<Mutex<Vec<String>>>;
 /// every member session, and sends an addressed message (an attestation, a
 /// pull answer) on its member's session only (G4 S1). No connection is
 /// opened per message.
+#[path = "v4_egress.rs"]
+mod egress;
+
 struct V4Net {
     p2p_tx: Option<tokio::sync::mpsc::Sender<network::Outbound>>,
+    egress: egress::Egress,
     #[cfg(any(test, feature = "sim"))]
     outbox: Option<V4Outbox>,
 }
@@ -232,22 +237,31 @@ impl V4Net {
             return;
         }
         if let Some(tx) = &self.p2p_tx {
-            let tx = tx.clone();
-            match tokio::runtime::Handle::try_current() {
-                Ok(handle) => {
-                    handle.spawn(async move {
-                        let _ = tx.send(out).await;
-                    });
-                }
-                Err(_) => {
-                    let _ = tx.try_send(out);
-                }
-            }
+            self.egress.emit(tx, out);
         }
     }
 }
 
 impl crate::v4::ConsensusNet for V4Net {
+    fn relay_conflict(&self, first: crate::vcert::VertexCertificate, second: crate::vcert::VertexCertificate) {
+        #[cfg(any(test, feature = "sim"))]
+        if self.outbox.is_some() {
+            self.broadcast(crate::v4::Msg::Cert(first));
+            self.broadcast(crate::v4::Msg::Cert(second));
+            return;
+        }
+        let (Ok(first), Ok(second)) = (
+            serde_json::to_string(&crate::v4::Msg::Cert(first)),
+            serde_json::to_string(&crate::v4::Msg::Cert(second)),
+        ) else { return; };
+        if let Some(tx) = &self.p2p_tx {
+            self.egress.relay_conflict(tx, [
+                network::Outbound::Broadcast(format!("{}{first}", crate::v4::WIRE_PREFIX)),
+                network::Outbound::Broadcast(format!("{}{second}", crate::v4::WIRE_PREFIX)),
+            ]);
+        }
+    }
+
     fn broadcast(&self, msg: crate::v4::Msg) {
         let Ok(json) = serde_json::to_string(&msg) else {
             return;
@@ -362,6 +376,7 @@ impl DagConsensus {
             clock_alarm_logged: false,
             qc_retry_cursor: String::new(),
             p2p_tx,
+            v4_egress: egress::Egress::default(),
             node_key,
             // Phase 2.8 (M-08): empty cache; first get_validator_set call
             // populates it from storage. Subsequent reads are cache hits
@@ -912,9 +927,15 @@ impl DagConsensus {
         ))
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_admit_v4_outbound(&self, out: network::Outbound) -> bool {
+        self.v4_egress.emit(self.p2p_tx.as_ref().expect("test channel"), out)
+    }
+
     fn v4_net(&self) -> V4Net {
         V4Net {
             p2p_tx: self.p2p_tx.clone(),
+            egress: self.v4_egress.clone(),
             #[cfg(any(test, feature = "sim"))]
             outbox: self.v4_outbox.clone(),
         }
@@ -1034,6 +1055,15 @@ impl DagConsensus {
         };
         let net = self.v4_net();
         if let Some(slot) = engine.tick(&net) {
+            let closed: Vec<_> = engine.take_closed_frontier_payload()
+                .into_iter().filter(|p| !p.starts_with(SLASH_EVIDENCE_PREFIX)).rev().collect();
+            if !closed.is_empty() {
+                if let Ok(mut mp) = mempool::lock_for_consensus(&self.mempool) {
+                    // Same attempt accounting/cap as a stale loan; no blind
+                    // resubmission and no reset of the transaction identity.
+                    mp.return_refused(&closed);
+                }
+            }
             let payload = if slot.carry_payload {
                 let overhead = engine
                     .proposal_overhead(slot.round)

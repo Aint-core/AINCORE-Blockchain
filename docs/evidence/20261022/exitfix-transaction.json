@@ -1,0 +1,26 @@
+{
+  "passed": true,
+  "scope": "NAS admission/execution; lab tokens only",
+  "forged_signature": {
+    "code": -32010,
+    "message": "Transaction rejected by mempool: Invalid signature: Invalid signature: Ed25519 does not verify"
+  },
+  "valid_receipt": {
+    "block_hash": "1238e2124d4472c6986c5270fbd44b05310344923ebf0892a25c88d3cb3f6a6f",
+    "block_height": 2052,
+    "confirmations": 0,
+    "execution_receipt": {
+      "error": null,
+      "gas_charged": "1312515357875148",
+      "metadata": null,
+      "status": "success"
+    },
+    "status": "success",
+    "tx_hash": "5b463b532ebf3c8202c79ff4a7f7e8b4e21550f4dabaceb49e3e7bd560b79e53"
+  },
+  "replay_rejection": {
+    "code": -32010,
+    "message": "Transaction rejected by mempool: Duplicate transaction: 523b749510d92df2bd79ad5131336fe5cf8737080300e218777319b98f80cc2d"
+  },
+  "recipient_delta": "1000000000000000000"
+}

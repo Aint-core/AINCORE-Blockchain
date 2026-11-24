@@ -42,13 +42,22 @@ pub const MAX_WIRE_BYTES: usize = crate::dag::MAX_VERTEX_BYTES + 8 * 1024;
 /// node's two keys. A database whose row differs (or is missing) did not sign
 /// under these keys from genesis on.
 pub fn guard_origin(chain_id: &str, genesis_identity: &str, node_key: &[u8; 32]) -> String {
+    let bls =
+        hex::encode(BLSEngine::consensus().pubkey_raw(&qc::derive_validator_bls_seed(node_key)));
+    guard_origin_with_bls(chain_id, genesis_identity, node_key, &bls)
+}
+
+pub(crate) fn guard_origin_with_bls(
+    chain_id: &str,
+    genesis_identity: &str,
+    node_key: &[u8; 32],
+    bls: &str,
+) -> String {
     let ed25519 = hex::encode(
         crypto::SigningKey::from_bytes(node_key)
             .verifying_key()
             .to_bytes(),
     );
-    let bls =
-        hex::encode(BLSEngine::consensus().pubkey_raw(&qc::derive_validator_bls_seed(node_key)));
     serde_json::json!({
         "cg": vcert::chain_genesis_tag(chain_id, genesis_identity),
         "ed25519": ed25519,
@@ -92,6 +101,10 @@ pub enum Msg {
 pub trait ConsensusNet {
     fn broadcast(&self, msg: Msg);
     fn send(&self, to: &str, msg: Msg);
+    fn relay_conflict(&self, first: VertexCertificate, second: VertexCertificate) {
+        self.broadcast(Msg::Cert(first));
+        self.broadcast(Msg::Cert(second));
+    }
 }
 
 pub struct Config {
@@ -286,6 +299,8 @@ pub struct Engine {
     early: HashMap<String, u64>,
     /// This node's proposals, as broadcast (parent certificates embedded).
     own: BTreeMap<u64, Vertex>,
+    /// Latest payload already returned after its entire child frontier closed.
+    returned_closed_payload: Option<String>,
     /// CE-1 for this node's proposals not yet certified.
     collectors: BTreeMap<u64, CertCollector>,
     ordering: Arc<Mutex<OrderingEngine>>,
@@ -445,7 +460,7 @@ impl Engine {
         let can_sign = me.is_some_and(|m| m.bls_public_key == bls_pk);
         let origin = guard_origin(&cfg.chain_id, &cfg.genesis_identity, &cfg.node_key);
         let held = storage
-            .get("consensus:guard_origin")
+            .try_get("consensus:guard_origin")
             .map_err(|e| e.to_string())?;
         let guards_continuous = match held {
             Some(h) => h == origin,
@@ -512,6 +527,7 @@ impl Engine {
             next_checks: HashMap::new(),
             early: HashMap::new(),
             own: BTreeMap::new(),
+            returned_closed_payload: None,
             collectors: BTreeMap::new(),
             decided: Vec::new(),
             halted: None,
@@ -556,15 +572,15 @@ impl Engine {
 
     fn never_signed(storage: &StateDB) -> bool {
         let fresh_tip = storage
-            .get("latest_height")
-            .ok()
-            .flatten()
-            .is_none_or(|h| h == "0");
+            .try_get("latest_height")
+            .is_ok_and(|height| height.is_none_or(|h| h == "0"));
         let no_rows = [
             "consensus:vproposed:",
             "consensus:vproposed_high:",
             "consensus:vattest:",
             "consensus:vslot:",
+            "consensus:qc_signing:",
+            "consensus:qc_vote:",
         ]
         .iter()
         .all(|p| {
@@ -1584,8 +1600,7 @@ impl Engine {
                 // coalition able to make two could halt the chain anyway).
                 // It is carried once operators recover the chain.
                 if first {
-                    net.broadcast(Msg::Cert(held.clone()));
-                    net.broadcast(Msg::Cert(cert.clone()));
+                    net.relay_conflict(held.clone(), cert.clone());
                 }
             }
             return;
@@ -1754,6 +1769,50 @@ impl Engine {
             .find(|(_, s)| qc::stake_quorum_met(**s, total))
             .map(|(r, _)| *r);
         top.map_or(self.first_round, |r| (r + 1).max(self.first_round))
+    }
+
+    /// Reclaim only the latest own payload when every possible immediate
+    /// child is known not to cite it. Other members' certified children are
+    /// immutable; our skipped child slot is closed by our higher proposal
+    /// guard. IN-1 permits only previous-round parents, so no later path can
+    /// recover this vertex. No timeout, quorum or ordering rule changes.
+    pub fn take_closed_frontier_payload(&mut self) -> Vec<String> {
+        if self.halted.is_some() || self.closing_round.is_some() {
+            return Vec::new();
+        }
+        let Some((&round, vertex)) = self.own.iter().rev().find(|(_, v)| !v.payload.is_empty()) else {
+            return Vec::new();
+        };
+        let Some(child_round) = round.checked_add(1) else { return Vec::new(); };
+        if round <= self.gc_floor()
+            || self.returned_closed_payload.as_ref() == Some(&vertex.hash)
+            || self.own.contains_key(&child_round)
+            || self.own.last_key_value().is_none_or(|(r, _)| *r <= child_round)
+            || lock(&self.ordering).is_committed(&vertex.hash)
+            || self.certs.get(&(round, vertex.author.clone()))
+                .is_none_or(|c| c.body.digest != vertex.hash)
+        {
+            return Vec::new();
+        }
+        {
+            let dag = lock(&self.dag);
+            for member in &self.cfg.committee {
+                if member.address == vertex.author { continue; }
+                let Some(cert) = self.certs.get(&(child_round, member.address.clone())) else {
+                    return Vec::new();
+                };
+                let Some(child) = dag.get(&cert.body.digest) else { return Vec::new(); };
+                if child.epoch != vertex.epoch || child.round != child_round || child.author != member.address
+                    || child.parents.contains(&vertex.hash)
+                {
+                    return Vec::new();
+                }
+            }
+        }
+        // Considering only the newest payload prevents an old orphan from
+        // recalling the same transaction's newer, still-viable loan.
+        self.returned_closed_payload = Some(vertex.hash.clone());
+        vertex.payload.clone()
     }
 
     /// One tick: send this node's uncertified proposals of the last two

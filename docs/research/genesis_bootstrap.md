@@ -76,13 +76,19 @@ owned supply, so growth measured against circulating supply is high at first in 
 
 ## Parameters
 
+The modeled amounts below assume both participant pools are fully allocated. For
+the launch calculation, use the sum of the scorer's actual bonded and liquid
+allocations. Whole-AIN rounding and the public funding-cluster cap can reduce
+that sum. Compute initial bootstrap weight from the actual bonded stake and rerun
+the model with the allocations selected for genesis. [Testnet allocation rules](incentivized_testnet.md)
+
 | Parameter | Value | Basis | Kind |
 |---|---|---|---|
 | Emission | 1.90 %/yr of the remaining reserve | G5 EM-1 (unchanged) | decided earlier |
 | P0, earned at genesis | 1.5 M (1 % of cap) | Keeps every month's owned-supply growth below Cagan's 50 % with margin: 0.30 % gives 52 % in month 1, 0.50 % gives 31 %, 1 % gives 15 %. Testnets gave 0.12–0.31 %, but those chains also had sales | math (bound) + choice of margin |
 | S_min | 18.5 M | Owned stake passes 2/3 of the committee (bootstrap weight below 1/3 cannot break safety alone) within 4 years, about one Bitcoin halving period | math given the 4-year target, which is a choice |
 | B at genesis | 17.5 M (= S_min − the 1.0 M bonded) | the public track's 0.5 M is liquid at genesis and counts once staked | math |
-| Founder share of B | ≤ 30 % | decided 2026-10-01 (founder < 1/3) | decided |
+| Founder's bootstrap weight | ≤ 30 % of S_min | 5.55 M at S_min = 18.5 M | decided |
 | Founder pre-mine | 0 | goal | decided |
 
 With these: owned stake passes 1/3 of the committee at 1.7 years and 2/3 at 4.0 years, and

@@ -1,0 +1,148 @@
+test_explicit_stopped_acknowledgement_required (test_backup_safety.BackupSafetyTests.test_explicit_stopped_acknowledgement_required) ... ok
+test_failed_copy_leaves_no_usable_archive (test_backup_safety.BackupSafetyTests.test_failed_copy_leaves_no_usable_archive) ... ok
+test_hot_copy_refused_even_if_stopped_flag_follows (test_backup_safety.BackupSafetyTests.test_hot_copy_refused_even_if_stopped_flag_follows) ... 
+  test_hot_copy_refused_even_if_stopped_flag_follows (test_backup_safety.BackupSafetyTests.test_hot_copy_refused_even_if_stopped_flag_follows) (flags=('--hot',)) ... FAIL
+  test_hot_copy_refused_even_if_stopped_flag_follows (test_backup_safety.BackupSafetyTests.test_hot_copy_refused_even_if_stopped_flag_follows) (flags=('--hot', '--assume-stopped')) ... FAIL
+  test_hot_copy_refused_even_if_stopped_flag_follows (test_backup_safety.BackupSafetyTests.test_hot_copy_refused_even_if_stopped_flag_follows) (flags=('--assume-stopped', '--hot')) ... FAIL
+test_live_posix_lock_refused (test_backup_safety.BackupSafetyTests.test_live_posix_lock_refused) ... FAIL
+test_lock_held_during_entire_copy (test_backup_safety.BackupSafetyTests.test_lock_held_during_entire_copy) ... FAIL
+test_missing_lock_refused_without_creating_it (test_backup_safety.BackupSafetyTests.test_missing_lock_refused_without_creating_it) ... FAIL
+test_stopped_backup_succeeds_and_releases_lock (test_backup_safety.BackupSafetyTests.test_stopped_backup_succeeds_and_releases_lock) ... ok
+test_symlink_lock_refused (test_backup_safety.BackupSafetyTests.test_symlink_lock_refused) ... FAIL
+
+======================================================================
+FAIL: test_hot_copy_refused_even_if_stopped_flag_follows (test_backup_safety.BackupSafetyTests.test_hot_copy_refused_even_if_stopped_flag_follows) (flags=('--hot',))
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/pi/aincore-backup-safety-20261022/scripts/tests/test_backup_safety.py", line 42, in test_hot_copy_refused_even_if_stopped_flag_follows
+    self.assert_refused(self.backup(*flags))
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+  File "/home/pi/aincore-backup-safety-20261022/scripts/tests/test_backup_safety.py", line 34, in assert_refused
+    self.assertNotEqual(result.returncode, 0, result.stdout)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 == 0 : ==> Packing backup -> /tmp/tmpea0u5uov/backups/aincore-backup-port9001-20261022T123234Z.tar.gz (mode=hot)
+
+✅ Backup ready: /tmp/tmpea0u5uov/backups/aincore-backup-port9001-20261022T123234Z.tar.gz (4.0K)
+   sha256: 68ebffda4c6062e9659bb8e720502e13a0d44944ea1a5d22259f45bdc57ddb22
+   sha256 file: /tmp/tmpea0u5uov/backups/aincore-backup-port9001-20261022T123234Z.tar.gz.sha256
+   node.key is not in it (B467): a restored node runs a new key.
+
+   Restore with:   scripts/restore_node.sh --backup '/tmp/tmpea0u5uov/backups/aincore-backup-port9001-20261022T123234Z.tar.gz' --datadir <fresh> --port 9001 --not-a-validator
+
+
+======================================================================
+FAIL: test_hot_copy_refused_even_if_stopped_flag_follows (test_backup_safety.BackupSafetyTests.test_hot_copy_refused_even_if_stopped_flag_follows) (flags=('--hot', '--assume-stopped'))
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/pi/aincore-backup-safety-20261022/scripts/tests/test_backup_safety.py", line 42, in test_hot_copy_refused_even_if_stopped_flag_follows
+    self.assert_refused(self.backup(*flags))
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+  File "/home/pi/aincore-backup-safety-20261022/scripts/tests/test_backup_safety.py", line 34, in assert_refused
+    self.assertNotEqual(result.returncode, 0, result.stdout)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 == 0 : ==> Packing backup -> /tmp/tmpea0u5uov/backups/aincore-backup-port9001-20261022T123234Z.tar.gz (mode=stopped)
+
+✅ Backup ready: /tmp/tmpea0u5uov/backups/aincore-backup-port9001-20261022T123234Z.tar.gz (4.0K)
+   sha256: 7112c834246208a23e4afca17a757577136ce2776065b784005821d44915a87b
+   sha256 file: /tmp/tmpea0u5uov/backups/aincore-backup-port9001-20261022T123234Z.tar.gz.sha256
+   node.key is not in it (B467): a restored node runs a new key.
+
+   Restore with:   scripts/restore_node.sh --backup '/tmp/tmpea0u5uov/backups/aincore-backup-port9001-20261022T123234Z.tar.gz' --datadir <fresh> --port 9001 --not-a-validator
+
+
+======================================================================
+FAIL: test_hot_copy_refused_even_if_stopped_flag_follows (test_backup_safety.BackupSafetyTests.test_hot_copy_refused_even_if_stopped_flag_follows) (flags=('--assume-stopped', '--hot'))
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/pi/aincore-backup-safety-20261022/scripts/tests/test_backup_safety.py", line 42, in test_hot_copy_refused_even_if_stopped_flag_follows
+    self.assert_refused(self.backup(*flags))
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^
+  File "/home/pi/aincore-backup-safety-20261022/scripts/tests/test_backup_safety.py", line 34, in assert_refused
+    self.assertNotEqual(result.returncode, 0, result.stdout)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 == 0 : ==> Packing backup -> /tmp/tmpea0u5uov/backups/aincore-backup-port9001-20261022T123234Z.tar.gz (mode=hot)
+
+✅ Backup ready: /tmp/tmpea0u5uov/backups/aincore-backup-port9001-20261022T123234Z.tar.gz (4.0K)
+   sha256: 68ebffda4c6062e9659bb8e720502e13a0d44944ea1a5d22259f45bdc57ddb22
+   sha256 file: /tmp/tmpea0u5uov/backups/aincore-backup-port9001-20261022T123234Z.tar.gz.sha256
+   node.key is not in it (B467): a restored node runs a new key.
+
+   Restore with:   scripts/restore_node.sh --backup '/tmp/tmpea0u5uov/backups/aincore-backup-port9001-20261022T123234Z.tar.gz' --datadir <fresh> --port 9001 --not-a-validator
+
+
+======================================================================
+FAIL: test_live_posix_lock_refused (test_backup_safety.BackupSafetyTests.test_live_posix_lock_refused)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/pi/aincore-backup-safety-20261022/scripts/tests/test_backup_safety.py", line 50, in test_live_posix_lock_refused
+    self.assert_refused(self.backup("--assume-stopped"))
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/pi/aincore-backup-safety-20261022/scripts/tests/test_backup_safety.py", line 34, in assert_refused
+    self.assertNotEqual(result.returncode, 0, result.stdout)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 == 0 : WARNING: /tmp/tmplsenic_z/data/validator_9001.db/LOCK still held by a running process — node may NOT be stopped.
+         The backup may be inconsistent. Stop the node and retry.
+==> Packing backup -> /tmp/tmplsenic_z/backups/aincore-backup-port9001-20261022T123235Z.tar.gz (mode=stopped)
+
+✅ Backup ready: /tmp/tmplsenic_z/backups/aincore-backup-port9001-20261022T123235Z.tar.gz (4.0K)
+   sha256: 1ed19afcc16eafd9157580ef33a0cfc64a68af151f869d1fd03f25480e0ef939
+   sha256 file: /tmp/tmplsenic_z/backups/aincore-backup-port9001-20261022T123235Z.tar.gz.sha256
+   node.key is not in it (B467): a restored node runs a new key.
+
+   Restore with:   scripts/restore_node.sh --backup '/tmp/tmplsenic_z/backups/aincore-backup-port9001-20261022T123235Z.tar.gz' --datadir <fresh> --port 9001 --not-a-validator
+
+
+======================================================================
+FAIL: test_lock_held_during_entire_copy (test_backup_safety.BackupSafetyTests.test_lock_held_during_entire_copy)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/pi/aincore-backup-safety-20261022/scripts/tests/test_backup_safety.py", line 92, in test_lock_held_during_entire_copy
+    self.assertEqual(result.returncode, 0, result.stdout)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 51 != 0 : ==> Packing backup -> /tmp/tmpv7e_dmlp/backups/aincore-backup-port9001-20261022T123235Z.tar.gz (mode=stopped)
+
+
+======================================================================
+FAIL: test_missing_lock_refused_without_creating_it (test_backup_safety.BackupSafetyTests.test_missing_lock_refused_without_creating_it)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/pi/aincore-backup-safety-20261022/scripts/tests/test_backup_safety.py", line 54, in test_missing_lock_refused_without_creating_it
+    self.assert_refused(self.backup("--assume-stopped"))
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/pi/aincore-backup-safety-20261022/scripts/tests/test_backup_safety.py", line 34, in assert_refused
+    self.assertNotEqual(result.returncode, 0, result.stdout)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 == 0 : ==> Packing backup -> /tmp/tmpu1eo55ak/backups/aincore-backup-port9001-20261022T123235Z.tar.gz (mode=stopped)
+
+✅ Backup ready: /tmp/tmpu1eo55ak/backups/aincore-backup-port9001-20261022T123235Z.tar.gz (4.0K)
+   sha256: 2f6396a0947742ce6e0152b9da001c703745cded1764245fc8546108a7340d7b
+   sha256 file: /tmp/tmpu1eo55ak/backups/aincore-backup-port9001-20261022T123235Z.tar.gz.sha256
+   node.key is not in it (B467): a restored node runs a new key.
+
+   Restore with:   scripts/restore_node.sh --backup '/tmp/tmpu1eo55ak/backups/aincore-backup-port9001-20261022T123235Z.tar.gz' --datadir <fresh> --port 9001 --not-a-validator
+
+
+======================================================================
+FAIL: test_symlink_lock_refused (test_backup_safety.BackupSafetyTests.test_symlink_lock_refused)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/pi/aincore-backup-safety-20261022/scripts/tests/test_backup_safety.py", line 62, in test_symlink_lock_refused
+    self.assert_refused(self.backup("--assume-stopped"))
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/pi/aincore-backup-safety-20261022/scripts/tests/test_backup_safety.py", line 34, in assert_refused
+    self.assertNotEqual(result.returncode, 0, result.stdout)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 == 0 : ==> Packing backup -> /tmp/tmpbbfvtsmq/backups/aincore-backup-port9001-20261022T123235Z.tar.gz (mode=stopped)
+
+✅ Backup ready: /tmp/tmpbbfvtsmq/backups/aincore-backup-port9001-20261022T123235Z.tar.gz (4.0K)
+   sha256: a03c780da80b3e01e9aaf855e1bba976fcc16e99db20ed3d7a2ea775459e8998
+   sha256 file: /tmp/tmpbbfvtsmq/backups/aincore-backup-port9001-20261022T123235Z.tar.gz.sha256
+   node.key is not in it (B467): a restored node runs a new key.
+
+   Restore with:   scripts/restore_node.sh --backup '/tmp/tmpbbfvtsmq/backups/aincore-backup-port9001-20261022T123235Z.tar.gz' --datadir <fresh> --port 9001 --not-a-validator
+
+
+----------------------------------------------------------------------
+Ran 8 tests in 0.569s
+
+FAILED (failures=7)

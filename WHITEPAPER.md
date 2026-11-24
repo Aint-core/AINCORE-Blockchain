@@ -200,19 +200,21 @@ AINCORE menggunakan **Move Language** yang sama dengan Aptos/Sui karena:
 
 ## 8. Cross-Chain Bridge
 
-### BTC Bridge:
+Bridge BTC dan EVM masih eksperimental. Kandidat rilis ini belum menyediakan layanan setoran, mint, atau pencairan lintas jaringan. Diagram berikut menggambarkan alur yang direncanakan.
+
+### Rancangan BTC Bridge
 ```
 BTC (Bitcoin) → Lock → Mint AIN-BTC (Wrapped)
 AIN-BTC → Burn → Unlock → BTC
 ```
 
-### EVM Bridge:
+### Rancangan EVM Bridge
 ```
 AIN (AINCORE) → Lock → Mint wAIN (Ethereum/BSC)
 wAIN → Burn → Unlock → AIN
 ```
 
-### Bridge Security:
+### Mekanisme yang direncanakan
 - **Multi-sig Federation** - Multiple parties harus sign
 - **Timelock** - Delay untuk prevent flash attacks
 - **Fraud Proofs** - Challenge period untuk dispute
@@ -350,10 +352,7 @@ await connection.sendTransaction(withdrawTx.toString());
 **A:** 1000 AIN untuk jadi validator.
 
 ### Q: Apa bedanya dengan Aptos/Sui?
-**A:** 
-- Aptos/Sui fokus ke high TPS saja
-- AINCORE punya **DePIN Mining** - mine dengan IoT devices
-- AINCORE punya **BTC Bridge** - bisa wrap Bitcoin
+**A:** AINCORE merencanakan integrasi perangkat IoT melalui DePIN serta bridge Bitcoin. Pada kandidat ini, daftar feeder oracle kosong dan otoritas mint wBTC belum diaktifkan. Pengguna belum dapat memperoleh reward perangkat atau membungkus BTC melalui layanan ini.
 
 ### Q: Apakah ada staking pool?
 **A:** Ya, bisa delegate stake ke validator lain.

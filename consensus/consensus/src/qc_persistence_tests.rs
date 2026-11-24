@@ -34,6 +34,7 @@ impl TestDir {
     fn seed(&self, minority: bool) {
         let db = self.open();
         let _seed = db.seeding();
+        initialize_test_signer(&db, &[7; 32], 0);
         let mut set = vec![validator_for(&[7; 32], 40, "local")];
         if minority {
             set.push(validator_for(&[8; 32], 60, "other"));
@@ -94,14 +95,22 @@ fn unknown_epoch_cannot_borrow_live_committee_to_sign() {
     let _seed = db.seeding();
     db.delete("genesis:validator_set:v1").unwrap();
     db.put("consensus:epoch", "10").unwrap();
+    db.put("consensus:epoch_start_height:10", "11").unwrap();
+    db.put(crate::v4::epoch::EPOCH_ACTIVE_KEY, "10").unwrap();
+    let mut ctx = ctx_for(12);
+    assert_eq!(epoch_for_block_height(&db, ctx.block_height), Some(10));
     for epoch in [0, 9, 10, 11, u64::MAX] {
-        let mut ctx = ctx_for(10);
         ctx.epoch = epoch;
+        assert!(load_validator_set_for_epoch(&db, epoch).is_none());
         let before = rows(&db);
         assert!(matches!(produce_and_store_qc(&db, &[7; 32], "local", &ctx), QcOutcome::Skipped),
             "missing epoch {epoch} snapshot was replaced with the live committee");
         assert_eq!(rows(&db), before);
     }
+    let snapshot = db.get("sys:validator_set:v1").unwrap().unwrap();
+    db.put("sys:validator_set:epoch:10", &snapshot).unwrap();
+    ctx.epoch = 10;
+    assert!(matches!(produce_and_store_qc(&db, &[7; 32], "local", &ctx), QcOutcome::Complete(_)));
 }
 
 #[test]
@@ -112,13 +121,24 @@ fn invalid_epoch_snapshot_cannot_fall_back_to_live_committee() {
             dir.seed(false);
             let db = dir.open();
             let _seed = db.seeding();
-            db.put(&format!("sys:validator_set:epoch:{epoch}"), invalid).unwrap();
+            db.put("consensus:epoch", &epoch.to_string()).unwrap();
+            db.put(crate::v4::epoch::EPOCH_ACTIVE_KEY, &epoch.to_string()).unwrap();
+            if epoch != 0 {
+                db.put(&format!("consensus:epoch_start_height:{epoch}"), "9").unwrap();
+            }
+            let key = format!("sys:validator_set:epoch:{epoch}");
+            db.put(&key, invalid).unwrap();
             let mut ctx = ctx_for(10);
             ctx.epoch = epoch;
+            assert_eq!(epoch_for_block_height(&db, ctx.block_height), Some(epoch));
+            assert!(load_validator_set_for_epoch(&db, epoch).is_none());
             let before = rows(&db);
             assert!(matches!(produce_and_store_qc(&db, &[7; 32], "local", &ctx), QcOutcome::Skipped),
                 "invalid epoch {epoch} snapshot {invalid:?} was silently substituted");
             assert_eq!(rows(&db), before);
+            let valid = db.get("sys:validator_set:v1").unwrap().unwrap();
+            db.put(&key, &valid).unwrap();
+            assert!(matches!(produce_and_store_qc(&db, &[7; 32], "local", &ctx), QcOutcome::Complete(_)));
         }
     }
 }
@@ -154,28 +174,46 @@ fn retained_epoch_survives_live_changes_but_pruned_epoch_fails_closed() {
     let _seed = db.seeding();
     db.put("sys:validator_set:epoch:3", &snapshot).unwrap();
     db.put("consensus:epoch", "3").unwrap();
+    db.put(crate::v4::epoch::EPOCH_ACTIVE_KEY, "3").unwrap();
     db.put("consensus:epoch_start_height:3", "9").unwrap();
     let mut ctx = ctx_for(10);
     ctx.epoch = 3;
     let QcOutcome::Partial(original) = produce_and_store_qc(&db, &[7; 32], "local", &ctx) else {
-        panic!("historical minority fixture must sign");
+        panic!("the minority signer must vote in its active epoch");
     };
     let new_set = vec![validator_for(&[99; 32], 100, "replacement")];
     db.put("sys:validator_set:v1", &serde_json::to_string(&new_set).unwrap()).unwrap();
-    db.put("consensus:epoch", "4").unwrap();
-    db.put("consensus:epoch_start_height:4", "21").unwrap();
     drop(db);
 
     let db = dir.open();
+    let before = rows(&db);
     let QcOutcome::Partial(replay) = produce_and_store_qc(&db, &[7; 32], "local", &ctx) else {
-        panic!("retained historical committee must remain usable after reopen");
+        panic!("the frozen committee must remain usable after the live set changes");
     };
     assert_eq!(original, replay);
+    assert_eq!(rows(&db), before);
+
+    let peer = signed_vote_msg(&[8; 32], "other", &original.vote);
     let _seed = db.seeding();
     db.delete("sys:validator_set:epoch:3").unwrap();
     let before = rows(&db);
     assert!(matches!(produce_and_store_qc(&db, &[7; 32], "local", &ctx), QcOutcome::Skipped));
+    assert!(matches!(collect_vote_and_try_aggregate(&db, &peer, Some(&ctx.block_hash)), QcOutcome::Skipped));
     assert_eq!(rows(&db), before);
+
+    db.put("sys:validator_set:epoch:3", &snapshot).unwrap();
+    db.put("consensus:epoch", "4").unwrap();
+    db.put("consensus:epoch_start_height:4", "21").unwrap();
+    db.put(crate::v4::epoch::EPOCH_ACTIVE_KEY, "4").unwrap();
+    assert_eq!(epoch_for_block_height(&db, ctx.block_height), Some(3));
+    let before = rows(&db);
+    assert!(matches!(produce_and_store_qc(&db, &[7; 32], "local", &ctx), QcOutcome::Skipped));
+    assert_eq!(rows(&db), before);
+    let QcOutcome::Complete(cert) = collect_vote_and_try_aggregate(&db, &peer, Some(&ctx.block_hash)) else {
+        panic!("a late peer vote must still aggregate with the stored vote under the retained committee");
+    };
+    let retained = load_validator_set_for_epoch(&db, 3).unwrap();
+    verify_qc(&cert, &retained, &ctx.chain_id).unwrap();
 }
 
 #[test]
@@ -298,6 +336,7 @@ fn every_context_field_and_either_slot_are_guarded() {
             }
             if field == 5 {
                 db.put("consensus:epoch", "1").unwrap();
+                db.put(crate::v4::epoch::EPOCH_ACTIVE_KEY, "1").unwrap();
                 db.put("consensus:epoch_start_height:1", "2").unwrap();
                 assert_eq!(epoch_for_block_height(&db, ctx.block_height), Some(ctx.epoch));
             }
@@ -312,6 +351,7 @@ fn every_context_field_and_either_slot_are_guarded() {
             assert_eq!(rows(&db), before_attempt);
             if field == 5 {
                 db.delete("consensus:epoch").unwrap();
+                db.put(crate::v4::epoch::EPOCH_ACTIVE_KEY, "0").unwrap();
                 db.delete("consensus:epoch_start_height:1").unwrap();
             }
             assert_eq!(rows(&db), before);

@@ -79,8 +79,12 @@ A validator does not use this section. Its backup is its key, once:
 sudo cp /data/aincore/node.key /secure/offline/location/node.key
 ```
 
-For an RPC or observer node, stop the node for a fully consistent RocksDB copy
-(brief downtime). `backup_node.sh` refuses (exit 3) without `--not-a-validator`.
+For an RPC or observer node, stop the node and fence automatic restarts for the
+entire backup (brief downtime). `backup_node.sh` refuses (exit 3) without
+`--not-a-validator`. Run as the database owner on a local POSIX filesystem with
+Python 3 installed. The script holds the existing RocksDB `LOCK` with a POSIX
+record lock through the copy; it refuses a busy, missing or symlinked lock file.
+Do not delete `LOCK` or replace the datadir to bypass this protection.
 
 ```bash
 # 1. Stop the node (whatever your process manager uses), e.g.:
@@ -105,15 +109,19 @@ Output: `./backups/aincore-backup-port9001-<UTC>.tar.gz` plus a sibling
 `MANIFEST` (`not_a_validator=yes`, `includes_node_key=no`) and `genesis.json`;
 it never holds `node.key` (B467).
 
-### Hot backup (no downtime)
+### Hot backup is not supported
 
-If you cannot stop the node, use `--hot`. The copy relies on RocksDB WAL
-recovery at restore time and may capture an in-flight write. A **stopped**
-backup is the gold copy.
+`--hot` is refused. An ordinary tar copy while RocksDB is writing or compacting
+is not a coordinated snapshot; WAL recovery does not establish that the copied
+files form a consistent set. The previous hot-copy instructions were unsafe.
 
-```bash
-scripts/backup_node.sh --datadir ./data --port 9001 --not-a-validator --hot
-```
+A future live backup must use the documented
+[RocksDB Checkpoint](https://github.com/facebook/rocksdb/wiki/Checkpoints) or
+[BackupEngine](https://github.com/facebook/rocksdb/wiki/How-to-backup-RocksDB)
+mechanism and pass real recovery tests. The lock used here matches
+[RocksDB's POSIX file locking](https://github.com/facebook/rocksdb/blob/v8.1.1/env/fs_posix.cc),
+preventing a normal DB opener during a stopped copy. It is not protection
+against a privileged operator replacing files or an unsupported filesystem.
 
 ### Snapshot integrity (sha256)
 
@@ -177,13 +185,16 @@ epochs in a row.
 
 ## 5. Restoring a node that is not a validator
 
-Restore into a **fresh** datadir. The script:
+Restore into a **fresh** datadir, with the target node stopped and automatic
+restarts fenced until verification is complete. Use only your trusted backup;
+its checksum is an integrity check, not proof of its publisher. The script:
 
 - refuses (exit 3) without `--not-a-validator`: you confirm the restored node
   is not a validator and will never run a validator's `node.key`, above all not
   the key of the node the backup was taken from;
 - refuses to clobber a non-empty existing DB unless `--force` (which moves the
-  old DB aside, never deletes it);
+  old DB aside, never deletes it), validates the archive before moving that DB,
+  and rejects ambiguous DB entries or a symlinked DB destination;
 - never restores a `node.key`: the node generates a new keypair on first boot.
   It refuses (exit 3) a datadir that already holds a `node.key` (B373), since
   that key would boot on the older database;
@@ -238,6 +249,7 @@ the scripts faithfully round-trip a datadir of a node that is not a validator.
 set -e
 DRILL="$(mktemp -d)"
 mkdir -p "$DRILL/data/validator_9001.db"
+touch "$DRILL/data/validator_9001.db/LOCK"
 # Simulate chain DB contents + identity.
 printf 'CURRENT\n' > "$DRILL/data/validator_9001.db/CURRENT"
 head -c 32 /dev/urandom > "$DRILL/data/validator_9001.db/000001.sst"

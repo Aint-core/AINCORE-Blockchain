@@ -908,7 +908,7 @@ mod fee_market_admission {
     #[test]
     fn a_used_sequence_number_is_refused() {
         let db = temp_db("b16_stale_nonce");
-        let (stale, sender) = signed_tx(21, 2, 1000, 1);
+        let (stale, sender) = signed_tx(21, 2, 100_000, 1);
         let key = ed25519_dalek::SigningKey::from_bytes(&[21; 32]);
         executor::test_support::set_sequence_number(
             &db,
@@ -920,7 +920,7 @@ mod fee_market_admission {
         let mut mp = Mempool::with_storage(db);
         let err = mp.add_transaction(stale).expect_err("seq 2 is used");
         assert!(err.contains("already used"), "got: {err}");
-        let (next, _) = signed_tx(21, 3, 1000, 1);
+        let (next, _) = signed_tx(21, 3, 100_000, 1);
         mp.add_transaction(next).expect("seq 3 is the next one");
     }
 
@@ -929,12 +929,12 @@ mod fee_market_admission {
     #[test]
     fn a_sequence_number_far_ahead_is_refused() {
         let db = temp_db("b16_far_nonce");
-        let (far, sender) = signed_tx(22, crate::MAX_NONCE_AHEAD, 1000, 1);
+        let (far, sender) = signed_tx(22, crate::MAX_NONCE_AHEAD, 100_000, 1);
         fund(&db, &sender, 1_000_000_000);
         let mut mp = Mempool::with_storage(db);
         let err = mp.add_transaction(far).expect_err("100 ahead");
         assert!(err.contains("or more above"), "got: {err}");
-        let (last, _) = signed_tx(22, crate::MAX_NONCE_AHEAD - 1, 1000, 1);
+        let (last, _) = signed_tx(22, crate::MAX_NONCE_AHEAD - 1, 100_000, 1);
         mp.add_transaction(last).expect("99 ahead is admitted");
     }
 
@@ -943,12 +943,12 @@ mod fee_market_admission {
     #[test]
     fn the_payer_must_cover_its_waiting_transactions() {
         let db = temp_db("b16_waiting_total");
-        let (first, sender) = signed_tx(23, 0, 1000, 1);
-        let (second, _) = signed_tx(23, 1, 1000, 1);
+        let (first, sender) = signed_tx(23, 0, 100_000, 1);
+        let (second, _) = signed_tx(23, 1, 100_000, 1);
         let cost = executor_gas(&first) as u128;
         assert_eq!(executor_gas(&second) as u128, cost);
         fund(&db, &sender, cost + cost / 2);
-        let (other, other_sender) = signed_tx(24, 0, 1000, 1);
+        let (other, other_sender) = signed_tx(24, 0, 100_000, 1);
         fund(&db, &other_sender, cost);
         let mut mp = Mempool::with_storage(db);
         mp.add_transaction(first).expect("one is covered");
@@ -967,11 +967,46 @@ mod fee_market_admission {
     #[test]
     fn admission_admits_affordable_tx() {
         let db = temp_db("admission_affordable");
-        let (tx, sender) = signed_tx(12, 0, 1000, 5); // needs gas_limit x 5
+        // Cover the existing-account precharge as well as the publish floor.
+        let (tx, sender) = signed_tx(12, 0, 100_000, 5); // needs gas_limit x 5
         fund(&db, &sender, 10_000_000);
         let mut mp = Mempool::with_storage(db);
         mp.add_transaction(tx)
             .expect("affordable tx must be admitted");
+    }
+
+    #[test]
+    fn admission_enforces_the_exact_committed_precharge_boundary() {
+        let db = temp_db("precharge_boundary");
+        let (probe, sender) = signed_tx(217, 0, 100_000, 1);
+        fund(&db, &sender, 1_000_000_000_000_000_000);
+        let parsed = serde_json::from_str::<executor::Transaction>(&probe).unwrap();
+        let owed = executor::precharge_gas(&db, &parsed).unwrap();
+        assert!(owed > publish_floor_of(&parsed.payload) + 1);
+        // Size the canonical encoding, not the generic fixture's larger JSON.
+        // Otherwise the purported one-unit-short input can contain extra gas.
+        let with_execution = |execution| {
+            use ed25519_dalek::Signer;
+            let key = ed25519_dalek::SigningKey::from_bytes(&[217; 32]);
+            let mut tx = serde_json::from_str::<executor::Transaction>(&probe).unwrap();
+            tx.gas_limit = 0;
+            tx.gas_limit = executor::admission::gas_limit_covering(
+                executor::admission::canonical_json(&tx).len(), execution);
+            tx.signature = hex::encode(key.sign(
+                executor::admission::signing_message(&tx).as_bytes()).to_bytes());
+            let raw = executor::admission::canonical_json(&tx);
+            assert_eq!(tx.gas_limit - executor::admission::intrinsic_gas(raw.len()), execution);
+            assert_eq!(executor::precharge_gas(&db, &tx), Some(owed));
+            raw
+        };
+        let mut mp = Mempool::with_storage(Arc::clone(&db));
+        let below = with_execution(owed - 1);
+        let error = mp.add_transaction(below).expect_err("one gas unit short");
+        assert!(error.contains("owed before execution"), "{error}");
+        assert!(mp.is_empty(), "a refused transaction occupied the pool");
+        let exact = with_execution(owed);
+        mp.add_transaction(exact.clone()).expect("exact precharge is admitted");
+        assert_eq!(mp.get_pending_transactions(1), vec![exact]);
     }
 
     #[test]
@@ -1017,7 +1052,7 @@ mod fee_market_admission {
             "paymaster": hex::encode(pm.verifying_key().to_bytes()),
             "paymaster_signature": "00".repeat(64),
         });
-        let signed = sign_ed25519(tx, &key, 1000);
+        let signed = sign_ed25519(tx, &key, 100_000);
         let mut v: serde_json::Value = serde_json::from_str(&signed).unwrap();
         let parsed: executor::Transaction = serde_json::from_value(v.clone()).unwrap();
         let pm_sig = pm.sign(&executor::admission::paymaster_message(&parsed));
@@ -1201,7 +1236,7 @@ mod fee_market_admission {
         assert_eq!(mp.len(), 0, "and gone: no block would charge it");
 
         let db = temp_db("b94_balance");
-        let (tx, sender) = signed_tx(93, 0, 1_000, 1);
+        let (tx, sender) = signed_tx(93, 0, 100_000, 1);
         fund(&db, &sender, 1_000_000_000_000_000_000);
         let mut mp = Mempool::with_storage(Arc::clone(&db));
         mp.add_transaction(tx).expect("admitted");
@@ -1217,8 +1252,8 @@ mod fee_market_admission {
     #[test]
     fn an_unpaid_transaction_leaves_like_a_parked_one() {
         let db = temp_db("b188_ttl");
-        let (tx, sender) = signed_tx(94, 0, 1_000, 1);
-        let (next, _) = signed_tx(94, 1, 1_000, 1);
+        let (tx, sender) = signed_tx(94, 0, 100_000, 1);
+        let (next, _) = signed_tx(94, 1, 100_000, 1);
         fund(&db, &sender, 1_000_000_000_000_000_000);
         let mut mp = Mempool::with_storage(Arc::clone(&db));
         mp.add_transaction(tx).expect("admitted");
@@ -1279,8 +1314,8 @@ mod fee_market_admission {
     #[test]
     fn a_covered_run_is_unpaid_no_more() {
         let db = temp_db("b193_covered");
-        let (tx, sender) = signed_tx(95, 0, 1_000, 1);
-        let (next, _) = signed_tx(95, 1, 1_000, 1);
+        let (tx, sender) = signed_tx(95, 0, 100_000, 1);
+        let (next, _) = signed_tx(95, 1, 100_000, 1);
         let rich = 1_000_000_000_000_000_000u128;
         fund(&db, &sender, rich);
         let mut mp = Mempool::with_storage(Arc::clone(&db));

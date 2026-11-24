@@ -144,6 +144,11 @@ DB_NAME="validator_${PORT}.db"
 DEST_DB="${DATADIR%/}/${DB_NAME}"
 DEST_KEY="${DATADIR%/}/node.key"
 
+if [[ -L "$DEST_DB" || ( -e "$DEST_DB" && ! -d "$DEST_DB" ) ]]; then
+  echo "ERROR: target DB must be a real directory, not a symlink or another file: $DEST_DB" >&2
+  exit 3
+fi
+
 # --- never clobber a non-empty existing DB ----------------------------------
 DB_NONEMPTY=0
 if [[ -d "$DEST_DB" ]] && [[ -n "$(ls -A "$DEST_DB" 2>/dev/null)" ]]; then
@@ -171,14 +176,6 @@ if [[ -e "$DEST_KEY" || -L "$DEST_KEY" ]]; then
   exit 3
 fi
 
-if [[ "$DB_NONEMPTY" == 1 ]]; then
-  ASIDE="${DEST_DB}.pre-restore.$(date -u +%Y%m%dT%H%M%SZ)"
-  echo "==> --force: moving existing DB aside -> $ASIDE"
-  mv "$DEST_DB" "$ASIDE"
-fi
-
-mkdir -p "$DATADIR"
-
 # --- extract into staging, then place deliberately --------------------------
 STAGING="$(mktemp -d)"
 cleanup() { rm -rf "$STAGING"; }
@@ -191,11 +188,27 @@ tar xzf "$BACKUP" -C "$STAGING"
 # target port — we always place it at validator_{--port}.db).
 SRC_DB=""
 for d in "$STAGING"/validator_*.db; do
-  [[ -d "$d" ]] || continue
+  [[ -e "$d" || -L "$d" ]] || continue
+  if [[ ! -d "$d" || -L "$d" || -n "$SRC_DB" ]]; then
+    echo "ERROR: backup must contain exactly one real validator_*.db directory" >&2
+    exit 3
+  fi
   SRC_DB="$d"
-  break
 done
 [[ -n "$SRC_DB" ]] || { echo "ERROR: no validator_*.db inside backup" >&2; exit 3; }
+
+# Validate the archive before moving any existing database. The node must
+# remain stopped/fenced throughout restore, including this installation step.
+mkdir -p "$DATADIR"
+if [[ "$DB_NONEMPTY" == 1 ]]; then
+  ASIDE="${DEST_DB}.pre-restore.$(date -u +%Y%m%dT%H%M%SZ).$$"
+  [[ ! -e "$ASIDE" && ! -L "$ASIDE" ]] || { echo "ERROR: recovery copy already exists: $ASIDE" >&2; exit 3; }
+  echo "==> --force: moving existing DB aside -> $ASIDE"
+  mv "$DEST_DB" "$ASIDE"
+elif [[ -d "$DEST_DB" ]]; then
+  # mv would otherwise nest the restored DB inside the existing empty folder.
+  rmdir "$DEST_DB"
+fi
 
 echo "==> Installing chain DB -> $DEST_DB"
 mv "$SRC_DB" "$DEST_DB"

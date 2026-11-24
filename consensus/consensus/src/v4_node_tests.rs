@@ -14,6 +14,18 @@ use std::sync::{Arc, Mutex};
 use storage::object::{Object, Owner};
 use storage::StateDB;
 
+#[path = "v4_finality_recovery_tests.rs"]
+mod finality_recovery;
+
+#[path = "v4_egress_node_tests.rs"]
+mod egress_recovery;
+
+#[path = "v4_egress_transaction_tests.rs"]
+mod egress_transactions;
+
+#[path = "certified_orphan_recovery_tests.rs"]
+mod certified_orphan_recovery;
+
 const PINNED: u64 = 1_700_000_000;
 const GENESIS_IDENTITY: &str = "v4-node-test-genesis-identity";
 
@@ -214,6 +226,7 @@ impl Cluster {
             for (address, amount) in &self.funded {
                 executor::test_support::set_ain_balance(&db, address, *amount);
             }
+            executor::test_support::seed_supply(&db);
         }
         seed_state_tree(&db);
     }

@@ -42,6 +42,30 @@ fn retry(db: &StateDB, cursor: &mut String) -> Vec<QcOutcome> {
 }
 
 #[test]
+fn finality_waits_for_the_recovered_signer_and_its_active_epoch() {
+    let dir = TestDir::new();
+    dir.seed(false);
+    let db = dir.open();
+    pending(&db, 1);
+    let origin = db.get("consensus:guard_origin").unwrap().unwrap();
+    db.delete("consensus:guard_origin").unwrap();
+    let active = crate::v4::epoch::EPOCH_ACTIVE_KEY;
+    for (marker, epoch) in [(None, "0"), (Some("unrelated"), "0"),
+                             (Some(origin.as_str()), "1"), (Some(origin.as_str()), "invalid")] {
+        if let Some(value) = marker {
+            db.put("consensus:guard_origin", value).unwrap();
+        }
+        db.put(active, epoch).unwrap();
+        let before = rows(&db);
+        assert!(matches!(retry(&db, &mut String::new()).as_slice(), [QcOutcome::Skipped]));
+        assert_eq!(rows(&db), before);
+    }
+    db.put(active, "0").unwrap();
+    assert!(matches!(retry(&db, &mut String::new()).as_slice(), [QcOutcome::Complete(_)]));
+    assert!(db.get(PENDING).unwrap().is_none());
+}
+
+#[test]
 fn partial_replays_after_reopen_until_complete_aggregation() {
     let dir = TestDir::new();
     dir.seed(true);
@@ -67,6 +91,8 @@ fn partial_replays_after_reopen_until_complete_aggregation() {
         collect_vote_and_try_aggregate(&db, &remote, Some(&message.vote.block_hash)),
         QcOutcome::Complete(_)
     ));
+    // Retiring already certified work remains possible while abstaining.
+    db.delete("consensus:guard_origin").unwrap();
     assert!(matches!(
         retry(&db, &mut String::new())[0],
         QcOutcome::Complete(_)

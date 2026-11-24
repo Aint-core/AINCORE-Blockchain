@@ -455,6 +455,29 @@ impl Iterator for StoreIterator<'_> {
 }
 
 impl StateDB {
+    /// Read a fixed set of RPC fields from one committed RocksDB sequence
+    /// without taking the block writer's lock or exposing a raw database handle.
+    pub fn committed_text<const N: usize>(
+        &self,
+        keys: [&str; N],
+    ) -> Result<[Option<String>; N], StorageError> {
+        if self.db.stage.is_some() {
+            return Err(StorageError::DatabaseOperation(
+                "committed snapshot requested from a staged view".into(),
+            ));
+        }
+        let snapshot = self.db.shared.raw.snapshot();
+        let mut rows = std::array::from_fn(|_| None);
+        for (key, row) in keys.into_iter().zip(&mut rows) {
+            if let Some(bytes) = snapshot.get(key.as_bytes())? {
+                *row = Some(String::from_utf8(bytes).map_err(|_| {
+                    StorageError::SerializationError(format!("{key} is not UTF-8"))
+                })?);
+            }
+        }
+        Ok(rows)
+    }
+
     /// G3 CM-1: consensus-state writes staged in this transaction view.
     pub fn staged_state_changes(&self) -> Option<Vec<(String, Option<Vec<u8>>)>> {
         self.db.staged_state_changes()
@@ -622,6 +645,34 @@ mod tests {
             .iterator(IteratorMode::Start)
             .map(Result::unwrap)
             .collect()
+    }
+
+    #[test]
+    fn committed_text_sees_only_published_rows() {
+        let dir = TempDir::new();
+        let db = dir.open();
+        let keys = ["sys:total_supply", "total_burned"];
+        db.block_transaction(|view| {
+            view.put(keys[0], "100")?;
+            view.put(keys[1], "0")?;
+            Ok(())
+        })
+        .unwrap();
+        db.block_transaction(|view| {
+            view.put(keys[0], "95")?;
+            view.put(keys[1], "5")?;
+            assert_eq!(
+                db.committed_text(keys)?,
+                [Some("100".into()), Some("0".into())]
+            );
+            assert!(view.committed_text(keys).is_err());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            db.committed_text(keys).unwrap(),
+            [Some("95".into()), Some("5".into())]
+        );
     }
 
     /// B121 witness: seeding relaxes WG-1 and lets a fixture use made-up

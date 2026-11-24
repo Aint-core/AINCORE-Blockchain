@@ -1,0 +1,39 @@
+{
+  "passed": false,
+  "stage": "failed",
+  "started_at": 1792673432.8504717,
+  "scope": "real disposable lab observer sync/backup/restore, historical receipt/balance/nonce and RPC-verified QC checks; not validator recovery or independent cryptographic verification",
+  "binary_sha256": "6882bbd71cc21c8db20c8fdb3825d6e81d335025bf5e46e4495d80778bf890b4",
+  "genesis_sha256": "fb8479b39650654f608b6b159821764e9de31d9da7a1340afddfd26282cde61d",
+  "script_sha256": {
+    "backup_node.sh": "7a6048cf5afd091a1ed3bc75b20edb949321682bae4b73ebe9fbcb1b297f9614",
+    "restore_node.sh": "6f28c46378ea49f998d95d4b4ee50dd98ca17293ae9f3b4aa96903144aa38f59",
+    "observer_backup_probe.py": "6e466ffe3d8b4946d8941812abfb6d6edbdf66ecbc92d85fe28f8161acdec762",
+    "node_exit_probe.py": "d036cff7f9f1e1e6c6f7c71d3b81a47c8182c018d172f013647d1a6252ef82f6"
+  },
+  "steps": [],
+  "reference": {
+    "1263": [
+      1263,
+      [
+        "c47fbde410d91b99d84054c717813767fb620f0cba89b01c49a4c0e1b1077877",
+        "02f14fe2e94d2a421f875b34b9ba903c7e5625811c2d59478399fc6339885748",
+        "08d4c986de4a78b1864cd93b374cd8f0eed2a95da8cb7135b4ac66c7452130b5",
+        "b7d6c37768367acba72e6e93764ba451c0f129afadf970b4e4091a9612d99601"
+      ]
+    ],
+    "2082": [
+      2082,
+      [
+        "d0ce34a7cc74cd99f443d1fb352a47fd16a60f22e25d781a4a52a0fc518de432",
+        "8888d0f54e15db6f39b020dd199e0f3f456b9b346e14778fc90b1acfd446559a",
+        "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc",
+        "82b4cc29dc8ad959b91ec440f2a6aec4dacaa20213f912b1688773dbdafeee32"
+      ]
+    ]
+  },
+  "reference_height": 2082,
+  "error": "RuntimeError: missing observer identity",
+  "forced_cleanup": true,
+  "finished_at": 1792673523.3133073
+}

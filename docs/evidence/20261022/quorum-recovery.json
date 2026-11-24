@@ -1,0 +1,58 @@
+{
+  "passed": true,
+  "chain_id": "AINCORE-LAB-646F5C8B4FEBB6A2",
+  "scope": "lab only; node RPC QC verification",
+  "candidate_binary_sha256": {
+    "alpha@192.168.18.202": "3a777d89c2f0f289a6f1097ff6180dfa03c1b53f05eefd22f89a9c09537163c3",
+    "pi@192.168.18.66": "9ea933d682dee4a582e88a3efa42a43e0635efc8febc731ca87cc6fb30c79f86"
+  },
+  "replay_after_restart": {
+    "code": -32010,
+    "message": "Transaction rejected by mempool: Sequence number 1 is already used: the sender's next is 3"
+  },
+  "post_replay_heights": [
+    1777,
+    1777,
+    1777,
+    1777
+  ],
+  "shutdown_status": {
+    "2": {
+      "MainPID": "0",
+      "Result": "success",
+      "ExecMainCode": "1",
+      "ExecMainStatus": "0",
+      "SubState": "exited"
+    },
+    "3": {
+      "MainPID": "0",
+      "Result": "success",
+      "ExecMainCode": "1",
+      "ExecMainStatus": "0",
+      "SubState": "exited"
+    }
+  },
+  "no_quorum": {
+    "before": [
+      1778,
+      1778
+    ],
+    "after": [
+      1778,
+      1778
+    ],
+    "observation_seconds": 30,
+    "settle_seconds": 30
+  },
+  "healed_heights": [
+    1781,
+    1781,
+    1781,
+    1781
+  ],
+  "checked_heights": [
+    1263,
+    1778,
+    1781
+  ]
+}

@@ -114,6 +114,44 @@ fn hex32(s: &str) -> Option<[u8; 32]> {
     hex::decode(s).ok()?.try_into().ok()
 }
 
+impl Checkpoint {
+    fn matches(&self, height: u64, hash: &str, root: &str) -> bool {
+        self.height == height
+            && self.block_hash.eq_ignore_ascii_case(hash)
+            && self.state_root.eq_ignore_ascii_case(root)
+    }
+
+    /// Compare the same pinned tuple used by restore against retained local history.
+    /// If both records remain, they must describe the same block.
+    pub fn matches_retained(&self, storage: &StateDB) -> Result<Option<bool>, String> {
+        let block: Option<Block> = storage
+            .try_get(&format!("block_{}", self.height))
+            .map_err(|e| e.to_string())?
+            .map(|raw| serde_json::from_str(&raw))
+            .transpose()
+            .map_err(|e| format!("invalid retained checkpoint block: {e}"))?;
+        let qc: Option<QuorumCertificate> = storage
+            .try_get(&format!("consensus:qc:{}", self.height))
+            .map_err(|e| e.to_string())?
+            .map(|raw| serde_json::from_str(&raw))
+            .transpose()
+            .map_err(|e| format!("invalid retained checkpoint QC: {e}"))?;
+        if let (Some(b), Some(q)) = (&block, &qc) {
+            check_qc_header(&b.header, q)?;
+            if b.anchor_hash != q.anchor_hash {
+                return Err("retained checkpoint block and QC disagree on their anchor".into());
+            }
+        }
+        Ok(match (block, qc) {
+            (Some(b), _) => {
+                Some(self.matches(b.header.height, &b.header.hash, &b.header.state_root))
+            }
+            (_, Some(q)) => Some(self.matches(q.block_height, &q.block_hash, &q.state_root)),
+            _ => None,
+        })
+    }
+}
+
 impl std::str::FromStr for Checkpoint {
     type Err = String;
 
@@ -881,6 +919,11 @@ pub struct Restored {
 /// see it) booted with continuous guards and none of its proposals. Those
 /// guards now stay, like the attestation and QC signing guards.
 fn cleared_by_restore(key: &[u8]) -> bool {
+    // Remove old-chain alarms in the paginated, checked clear while the restore
+    // marker is durable. A resume repeats the clear before installing the state.
+    if key.starts_with(b"alarm:") {
+        return true;
+    }
     match classify(key) {
         Some(KeyClass::State | KeyClass::Chain | KeyClass::Tree | KeyClass::Dead) => true,
         Some(KeyClass::Local) => {
@@ -898,7 +941,7 @@ fn cleared_by_restore(key: &[u8]) -> bool {
     }
 }
 
-fn clear(storage: &Arc<StateDB>) -> Result<(), String> {
+fn clear(storage: &Arc<StateDB>, batch_size: usize) -> Result<(), String> {
     let mut from: Vec<u8> = Vec::new();
     loop {
         let mut doomed = Vec::new();
@@ -912,7 +955,7 @@ fn clear(storage: &Arc<StateDB>) -> Result<(), String> {
                 continue;
             }
             doomed.push(key.to_vec());
-            if doomed.len() == CLEAR_BATCH {
+            if doomed.len() == batch_size {
                 from = key.to_vec();
                 from.push(0);
                 finished = false;
@@ -950,12 +993,13 @@ fn check_anchor_header(
     h: &blockchain::BlockHeader,
     qc: &QuorumCertificate,
 ) -> Result<(), String> {
-    if h.height != cp.height
-        || !h.hash.eq_ignore_ascii_case(&cp.block_hash)
-        || !h.state_root.eq_ignore_ascii_case(&cp.state_root)
-    {
+    if !cp.matches(h.height, &h.hash, &h.state_root) {
         return Err("the block is not the checkpoint's".into());
     }
+    check_qc_header(h, qc)
+}
+
+fn check_qc_header(h: &blockchain::BlockHeader, qc: &QuorumCertificate) -> Result<(), String> {
     if qc.block_height != h.height
         || qc.block_hash != h.hash
         || qc.state_root != h.state_root
@@ -1482,7 +1526,7 @@ fn restored_committee(
     }
     .ok_or("the restored state has no committee for the checkpoint's epoch")?;
     if let Some(me) = plan.local_signer {
-        if recorded_validator(storage, me) {
+        if recorded_validator(storage, me)? {
             return Err(sn6_refusal(me));
         }
     }
@@ -1497,24 +1541,64 @@ fn restored_committee(
 /// restored state holds none, so only the genesis committee and the active
 /// set were seen. The executor's record of C_E (`recorded_committee`) is
 /// state, and is read too.
-pub fn recorded_validator(storage: &StateDB, key: &str) -> bool {
-    let current = storage
-        .get("consensus:epoch")
-        .ok()
-        .flatten()
-        .and_then(|e| e.parse::<u64>().ok())
-        .unwrap_or(0);
-    let v4 = consensus::v4::is_v4_chain(storage);
-    let holds = |set: Option<Vec<consensus::qc::ValidatorInfo>>| {
-        set.is_some_and(|set| set.iter().any(|v| v.address == key))
+pub fn recorded_validator(storage: &StateDB, key: &str) -> Result<bool, String> {
+    let read = |k: &str| {
+        storage
+            .try_get(k)
+            .map_err(|e| format!("SN-6: read {k}: {e}"))
     };
-    (0..=current).rev().take(64).any(|epoch| {
-        let set = consensus::qc_producer::load_validator_set_for_epoch(storage, epoch);
-        holds(set) || (v4 && holds(consensus::v4::epoch::recorded_committee(storage, epoch)))
-    }) || storage
-        .get_active_validators()
-        .iter()
-        .any(|(address, _)| address == key)
+    let member = |set: &[consensus::qc::ValidatorInfo]| -> Result<bool, String> {
+        if set.is_empty() || set.iter().any(|v| v.address.trim().is_empty()) {
+            return Err("SN-6: invalid retained validator committee".into());
+        }
+        Ok(set.iter().any(|v| v.address == key))
+    };
+    let decode = |raw: &[u8]| -> Result<Vec<consensus::qc::ValidatorInfo>, String> {
+        serde_json::from_slice(raw).map_err(|e| format!("SN-6: invalid validator record: {e}"))
+    };
+    // A node may have signed in a committee it has since left. Check every
+    // retained record, including genesis and an epoch staged ahead of activation.
+    if let Some(epoch) = read("consensus:epoch")? {
+        epoch
+            .parse::<u64>()
+            .map_err(|e| format!("SN-6: invalid stored epoch: {e}"))?;
+    }
+    let live = storage
+        .get_recorded_validators_checked()
+        .map_err(|e| format!("SN-6: {e}"))?;
+    if live.iter().any(|(address, _)| address == key) {
+        return Ok(true);
+    }
+    let genesis = read("genesis:validator_set:v1")?.ok_or("SN-6: missing genesis committee")?;
+    if member(&decode(genesis.as_bytes())?)? {
+        return Ok(true);
+    }
+    for prefix in ["sys:validator_set:epoch:", "consensus:epoch_start:"] {
+        for row in storage.db.prefix_iterator(prefix.as_bytes()) {
+            let (k, v) = row.map_err(|e| format!("SN-6: read committee history: {e}"))?;
+            let Some(suffix) = k.strip_prefix(prefix.as_bytes()) else {
+                break;
+            };
+            let epoch = std::str::from_utf8(suffix)
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .ok_or("SN-6: invalid epoch key in committee history")?;
+            let set = if prefix == "consensus:epoch_start:" {
+                let start: consensus::v4::epoch::EpochStart = serde_json::from_slice(&v)
+                    .map_err(|e| format!("SN-6: invalid epoch start: {e}"))?;
+                if start.epoch != epoch {
+                    return Err("SN-6: epoch start filed under a different epoch".into());
+                }
+                start.committee
+            } else {
+                decode(&v)?
+            };
+            if member(&set)? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Whether `signer` may sign the checkpoint's block, by the rule sync checks
@@ -1600,7 +1684,7 @@ fn bootstrap_record(
     // below the restored anchor is ordered again (the GC floor), and the
     // next anchor is scanned above the finalized round.
     if let Some(me) = plan.local_signer {
-        if recorded_validator(storage, me) {
+        if recorded_validator(storage, me)? {
             return Err(sn6_refusal(me));
         }
     }
@@ -1658,11 +1742,6 @@ fn bootstrap_record(
         batch.put(key.as_bytes(), value.as_bytes());
     }
     batch.delete(b"sync:halt_reason");
-    // B61: alarms described the replaced chain; kept, they halted ordering
-    // on the restored one.
-    for (key, _) in storage.scan_prefix("alarm:") {
-        batch.delete(key.as_bytes());
-    }
     // Genesis rows outside the state (stdlib pins, version), from this
     // node's own build; the state rows came with the restore.
     for (key, value) in plan.genesis {
@@ -1691,16 +1770,21 @@ struct FirstAttempt {
 /// nothing left to check another key against: a resume under a validator
 /// key after a first attempt under a new key restored it.
 fn check_datadir(storage: &StateDB, plan: &RestorePlan<'_>) -> Result<FirstAttempt, String> {
-    let marker = storage.get(RESTORE_MARKER).map_err(|e| e.to_string())?;
-    let holds_chain = storage
-        .get("genesis_initialized")
-        .map_err(|e| e.to_string())?
-        .is_some()
-        || storage
-            .get("latest_height")
-            .map_err(|e| e.to_string())?
-            .is_some();
-    if holds_chain && marker.is_none() && !plan.replace_existing {
+    let marker = storage.try_get(RESTORE_MARKER).map_err(|e| e.to_string())?;
+    // A marked datadir may hold a partial new state. Its first attempt
+    // recorded whether an old chain existed before clearing anything.
+    let mut holds_chain = false;
+    if marker.is_none() {
+        for key in ["genesis_initialized", "latest_height", "genesis:validator_set:v1",
+                    "sys:validator_set:v1", "sys:validators", "consensus:epoch",
+                    "consensus:guard_origin", "genesis_identity"] {
+            if storage.try_get(key).map_err(|e| e.to_string())?.is_some() {
+                holds_chain = true;
+                break;
+            }
+        }
+    }
+    if holds_chain && !plan.replace_existing {
         return Err(
             "this datadir already holds a chain; restoring replaces it, so it must be asked for"
                 .into(),
@@ -1729,8 +1813,10 @@ fn check_datadir(storage: &StateDB, plan: &RestorePlan<'_>) -> Result<FirstAttem
             plan.local_signer.unwrap_or("(none)")
         ));
     }
-    if let Some(me) = plan.local_signer {
-        if recorded_validator(storage, me) {
+    // A resume has already checked the old chain and pinned its signer;
+    // its partial replacement does not yet carry the full validator records.
+    if let Some(me) = plan.local_signer.filter(|_| holds_chain) {
+        if recorded_validator(storage, me)? {
             return Err(sn6_refusal(me));
         }
     }
@@ -2124,7 +2210,7 @@ where
     let mut failures = 0usize;
     let mut busy = 0usize;
     'restore: loop {
-        clear(storage)?;
+        clear(storage, CLEAR_BATCH)?;
         let mut restore = state_commit::Restore::begin(
             Arc::clone(storage),
             cp.height,
@@ -2318,7 +2404,12 @@ where
             None
         };
         let record = bootstrap_record(storage, tree, plan, &block, &qc, next.as_ref())?;
-        storage.write_batch(record).map_err(|e| e.to_string())?;
+        storage
+            .restore_transaction(|view| {
+                view.try_scan_prefix_at_most("alarm:", 0)?;
+                view.write_batch(record)
+            })
+            .map_err(|e| e.to_string())?;
         return Ok(Restored {
             height: cp.height,
             leaves,

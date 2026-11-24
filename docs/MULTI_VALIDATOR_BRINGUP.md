@@ -5,32 +5,21 @@ generate per-validator node keys, build a single shared `genesis.json` that
 embeds each validator's BLS finality identity, and start the nodes so they peer
 and produce quorum certificates (QCs) that verify against one another.
 
-> **Why a tool is required.** A multi-validator genesis **cannot** self-derive
-> BLS keys. Each validator's BLS finality key is derived from *its own*
-> `node.key` seed (`bls_seed = SHA256("AINCORE_VALIDATOR_BLS_V1" || node.key)`),
-> which only the genesis ceremony operator can collect ahead of time. If
-> `genesis.json` omits the per-validator BLS keys, every booting node
-> self-derives a *different* key for the same peer address, writes a divergent
-> `sys:validator_set:v1`, and **no QC ever verifies across nodes** (this is
-> rejected on purpose — see `node::genesis::resolve_genesis_bls_identity`,
-> SEC-#5). The `genesis-tool gen-multi` subcommand closes that gap: it derives
-> every validator's `address`, `public_key`, `bls_public_key`, and `bls_pop`
-> from the supplied seeds and writes them into one shared `genesis.json`.
+> Each validator derives its Ed25519 and BLS identities on its own machine.
+> The coordinator verifies its signed public entry and includes it in the shared
+> genesis file. Each operator keeps its own seed.
 
 ---
 
 ## 0. Prerequisites
 
-Compile the Move stdlib bytecode and build the binaries:
+From the root of the pinned release checkout, build the two binaries and use that
+checkout's committed Move bytecode in `core/vm_move/stdlib/bytecode`. The tool
+hashes this directory into genesis. Each initializing node needs the same bytecode.
 
 ```bash
-cargo run -p move_compiler_tool    # produces vm_move/stdlib/bytecode/*.mv
-cargo build --release -p node -p genesis-tool
+cargo build --locked --release -p node -p genesis-tool
 ```
-
-The genesis loader needs the stdlib bytecode directory at
-`vm_move/stdlib/bytecode` (default) on the machine that initializes each node's
-datadir.
 
 ---
 
@@ -70,16 +59,20 @@ val3 seed: 3333333333333333333333333333333333333333333333333333333333333333  sta
 
 ## 2. Build the shared `genesis.json`
 
-**Independent operators (the mainnet path).** The coordinator puts the entries in one
-JSON array, adds each validator's `stake_ain` (whole AIN), and runs:
+**Independent operators (the mainnet path).** Collect the signed entries in
+`entries.json` with `stake_ain` in whole AIN and the bootstrap fields described below.
+Prepare the approved scoring outputs first. Run `genesis-tool clock-cap --intervals intervals.txt`
+on consecutive block timestamp intervals from the release candidate. Set `BLOCK_TIME_MS`
+and `CLOCK_CAP_SECS` to the two values it prints, and `GENESIS_TIME` to the agreed Unix
+launch time. Then generate the file once.
 
 ```bash
 ./target/release/genesis-tool gen-multi \
   --entries-file entries.json \
-  --chain-id AINCORE-MAINNET-1 --mainnet \
-  --treasury-reserve-ain 50000 \
-  --block-time-ms <t_b measured on the release candidate> \
-  --out genesis.json
+  --allocations-file score/allocations.json --accounts-file score/accounts.json \
+  --s-min-ain 18500000 --chain-id AINCORE-MAINNET-1 --mainnet \
+  --block-time-ms "${BLOCK_TIME_MS:?}" --clock-cap-secs "${CLOCK_CAP_SECS:?}" \
+  --genesis-time "${GENESIS_TIME:?}" --out genesis.json
 ```
 
 **A chain id is used once (B348).** A transaction signs its chain id, not its
@@ -101,8 +94,8 @@ to `--validator`, which puts seeds in shell history and `ps`:
 ```bash
 ./target/release/genesis-tool gen-multi \
   --seeds-file seeds.txt \
-  --chain-id AINCORE-LOCALTEST \
-  --block-time-ms 6650 \
+  --chain-id "${REHEARSAL_CHAIN_ID:?set a fresh rehearsal ID}" \
+  --block-time-ms "${BLOCK_TIME_MS:?}" --clock-cap-secs "${CLOCK_CAP_SECS:?}" \
   --out genesis.json
 ```
 
@@ -111,52 +104,34 @@ Entries and seeds give byte-identical validator entries (witness:
 
 **Bootstrap weight (G5 amendment A4).** For a launch without a pre-mine, give each launch
 operator a `bootstrap_ain` in its entry (it may own `stake_ain: 0`) and pass `--s-min-ain`,
-the genesis committee's weight. Stake plus bootstrap weight must sum to exactly `s_min`, and no
-operator may reach a third of it. Liquid balances for the incentivized testnet's public track
-go in `--accounts-file` as `[{"address": "...", "balance_ain": N}]`. Bootstrap weight is
-never a coin: the supply at genesis is the owned stake, the treasury reserve and the
-accounts. A stake is 0 (with bootstrap weight) or at least 1,000 AIN.
+the genesis committee's weight. Stake plus bootstrap weight must sum to exactly
+`s_min`. Each party's total weight must stay strictly below one third. Liquid
+balances for the incentivized testnet's public track go in `--accounts-file` as
+`[{"address": "...", "balance_ain": N}]`. Bootstrap adds voting weight only.
+Genesis supply equals owned stake plus liquid genesis accounts. The generator
+omits the treasury reserve. The loader accepts only zero if an older file
+supplies that field. Owned stake is zero with bootstrap weight or at least
+1,000 AIN.
 
 For mainnet, the incentivized testnet's scoring writes these inputs (G5 A4-S6). Stop a testnet
 node at least 7 days (W) after the announced snapshot and run, on its datadir:
 
 ```bash
-genesis-tool score-testnet --datadir /data/aincore --from-height <first> --to-height <snapshot> \
-  --founder <founder-testnet-addresses> --out-dir score/
+./target/release/genesis-tool score-testnet --datadir /data/aincore \
+  --from-height "${FIRST_HEIGHT:?}" --to-height "${SNAPSHOT_HEIGHT:?}" \
+  --founder "${FOUNDER_ADDRESSES:?comma-separated testnet validator addresses}" \
+  --faucet "${TESTNET_FAUCET_ADDRESS:?}" --out-dir score/
 ```
 
 It writes `allocations.json` (each qualified operator's bonded stake and bootstrap weight),
 `accounts.json` (the public track) and `report.json` (every number behind them). Every
 qualified operator sends its `validator-entry` made with the key it qualified with; the founder
-adds its own entries with `bootstrap_ain` (at most 30 % of `s_min` in total). Then
-`gen-multi --entries-file entries.json --allocations-file score/allocations.json
---accounts-file score/accounts.json --s-min-ain 18500000 ...` sets each allocated entry from
-the scoring. `gen-multi` builds the result with the node's own genesis rules before writing it
-and prints the genesis identity.
+adds its own entries with `bootstrap_ain` (at most 30 % of `s_min` in total). The generator
+matches each scored allocation to its public entry by address, validates the result
+using the node's genesis rules and prints the genesis identity. Inspect the values in the generated file before distribution.
 
-This writes a `genesis.json` whose per-validator entries match exactly what the
-loader expects:
-
-```json
-{
-  "chain_id": "AINCORE-MAINNET-1",
-  "validators": [
-    {
-      "address": "10ba682c8ad13513971e8b56881aab8bd702bb807796eca81932c735a94d6e6d",
-      "public_key": "d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737",
-      "stake": "1000000000000000000000000",
-      "bls_public_key": "aea18b00...e073374b",   // 48 bytes (MinPk)
-      "bls_pop": "a7b8bb0b...e4cd7a1d"            // 96 bytes, PoP over bls_public_key
-    }
-    /* ... one entry per validator ... */
-  ],
-  "treasury_reserve": "50000000000000000000000",
-  "epoch_block_interval": 1000,
-  "reward_period_blocks": 20,
-  "max_block_interval_secs": 14,
-  "stdlib_hash": "…",
-  "genesis_time": 1790000000
-}
+```bash
+jq '{chain_id, epoch_block_interval, reward_period_blocks, max_block_interval_secs, stdlib_hash, genesis_time}' genesis.json
 ```
 
 Distribute this **identical** `genesis.json` to every validator node. Order does
@@ -210,25 +185,21 @@ port + 100):
 /ip4/<host>/tcp/<base_port>      or      /dns4/<hostname>/tcp/<base_port>
 ```
 
-Example three-node bring-up on one host (distinct ports), each pointed at the
-other two as bootnodes:
+For a three-node rehearsal on one host, use the rehearsal genesis generated above. Each process takes its chain ID from that file and dials the two other nodes:
 
 ```bash
 # Terminal 1 — validator 1 (P2P 9001, RPC 8001)
 AINCORE_GENESIS_PATH=$PWD/genesis.json \
-AINCORE_CHAIN_ID=AINCORE-MAINNET-1 \
 ./target/release/node --datadir data/val1 --port 9001 \
   --bootnodes /ip4/127.0.0.1/tcp/9002,/ip4/127.0.0.1/tcp/9003
 
 # Terminal 2 — validator 2 (P2P 9002, RPC 8002)
 AINCORE_GENESIS_PATH=$PWD/genesis.json \
-AINCORE_CHAIN_ID=AINCORE-MAINNET-1 \
 ./target/release/node --datadir data/val2 --port 9002 \
   --bootnodes /ip4/127.0.0.1/tcp/9001,/ip4/127.0.0.1/tcp/9003
 
 # Terminal 3 — validator 3 (P2P 9003, RPC 8003)
 AINCORE_GENESIS_PATH=$PWD/genesis.json \
-AINCORE_CHAIN_ID=AINCORE-MAINNET-1 \
 ./target/release/node --datadir data/val3 --port 9003 \
   --bootnodes /ip4/127.0.0.1/tcp/9001,/ip4/127.0.0.1/tcp/9002
 ```
@@ -282,4 +253,3 @@ so values can never silently drift:
 function the QC producer and genesis loader use, and the genesis-tool tests
 assert the generated `genesis.json` loads and that two validators compute an
 identical `validator_set_hash`.
-```

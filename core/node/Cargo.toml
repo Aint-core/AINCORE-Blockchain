@@ -44,30 +44,29 @@ bcs = "0.1"
 # --- Async & Web API ---
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
-actix-web = "4.4"
+actix-web = "4.20"
 actix-rt = "2.9"
 actix-cors = "0.6"
 actix-governor = "0.4"
 rocksdb = "0.21.0"
 
 # --- P2P Layer ---
-libp2p = { version = "0.54", features = [
+libp2p = { version = "0.57.1", features = [
     "tcp",
     "yamux",
     "noise",
-    "mdns",
+    "ed25519",
     "identify",
-    "kad",
     "tokio",
     "dns",
     "macros",
-    "autonat",
     "dcutr",
     "relay",
     # G4 S1: committee sessions (`sessions.rs`).
     "request-response"
 ] }
-async-trait = "0.1"
+# The DNS transport and its system-configuration fallback use the same resolver.
+hickory-resolver = { version = "0.26.3", default-features = false }
 futures = "0.3"
 prometheus = "0.13"
 lazy_static = "1.4"

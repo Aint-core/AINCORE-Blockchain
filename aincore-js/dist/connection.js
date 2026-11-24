@@ -55,6 +55,9 @@ const HEAVY_METHODS = new Set([
     'aincore_estimateGas',
     'aincore_verifyQuorumCertificate',
 ]);
+// The node budgets 8 MiB of serialized blocks per range; allow room for
+// JSON-RPC envelopes and the JSON representation of binary payloads.
+const MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
 class Connection {
     constructor(endpoint, indexerEndpoint) {
         /**
@@ -78,6 +81,7 @@ class Connection {
         this.indexerUrl = indexerEndpoint;
         this.client = axios_1.default.create({
             baseURL: endpoint,
+            maxContentLength: MAX_RESPONSE_BYTES,
             headers: {
                 'Content-Type': 'application/json',
             },
@@ -101,7 +105,7 @@ class Connection {
     async getWithRetry(url, config = {}) {
         for (let attempt = 0;; attempt++) {
             try {
-                return await axios_1.default.get(url, { timeout: this.timeoutMs, ...config });
+                return await axios_1.default.get(url, { timeout: this.timeoutMs, ...config, maxContentLength: MAX_RESPONSE_BYTES });
             }
             catch (error) {
                 const status = error?.response?.status;

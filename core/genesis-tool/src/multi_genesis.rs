@@ -565,6 +565,25 @@ pub struct ClockCapArgs {
     pub intervals: PathBuf,
 }
 
+/// Pick the smallest cap satisfying both the measured loss budget and genesis policy.
+fn measured_genesis_clock(
+    intervals: &[u64],
+) -> Result<(u64, u64, u128), Box<dyn std::error::Error>> {
+    let total: u128 = intervals.iter().copied().map(u128::from).sum();
+    if total == 0 {
+        return Err("no time measured".into());
+    }
+    let count = intervals.len() as u128;
+    let mean_ms = (total / count) * 1_000 + ((total % count) * 1_000).div_ceil(count);
+    let mean_ms = u64::try_from(mean_ms)?;
+    let (min_cap, _) = node::genesis::clock_cap_bounds(mean_ms)?;
+    let loss_cap = node::genesis::clock_cap_from_intervals(intervals).ok_or("no time measured")?;
+    let cap = min_cap.max(loss_cap);
+    // gen-multi validates these same parameters. Refuse an unusable recommendation.
+    node::genesis::derive_chain_params(mean_ms, cap)?;
+    Ok((mean_ms, cap, total))
+}
+
 /// Print the measured mean block time and C_tau (G5 P-1, S6), the two
 /// inputs `gen-multi` takes.
 pub fn run_clock_cap(args: ClockCapArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -584,11 +603,10 @@ pub fn run_clock_cap(args: ClockCapArgs) -> Result<(), Box<dyn std::error::Error
         )
         .into());
     }
-    let total: u64 = intervals.iter().sum();
-    let block_time_ms = (total * 1_000).div_ceil(intervals.len() as u64);
-    let cap = node::genesis::clock_cap_from_intervals(&intervals).ok_or("no time measured")?;
+    let (block_time_ms, cap, total) = measured_genesis_clock(&intervals)?;
     let lost = |c: u64| -> f64 {
-        intervals.iter().map(|&x| x.saturating_sub(c)).sum::<u64>() as f64 * 100.0 / total as f64
+        let seconds: u128 = intervals.iter().map(|&x| u128::from(x.saturating_sub(c))).sum();
+        seconds as f64 * 100.0 / total as f64
     };
     println!("intervals: {}  mean: {block_time_ms} ms", intervals.len());
     println!(
@@ -802,6 +820,30 @@ pub fn run(args: GenMultiArgs) -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn measured_clock_parameters_can_be_used_by_gen_multi() {
+        // Histogram of the 2,256 adjacent intervals retained by both R18 validators.
+        let counts = [
+            (0, 2), (3, 8), (4, 138), (5, 364), (6, 1227), (7, 404), (8, 45),
+            (9, 41), (10, 13), (11, 10), (12, 1), (13, 2), (36, 1),
+        ];
+        let intervals: Vec<_> = counts
+            .into_iter()
+            .flat_map(|(seconds, n)| std::iter::repeat_n(seconds, n))
+            .collect();
+        assert_eq!(measured_genesis_clock(&intervals).unwrap(), (6042, 13, 13629));
+        assert_eq!(measured_genesis_clock(&[6; 1000]).unwrap(), (6000, 12, 6000));
+    }
+
+    #[test]
+    fn incompatible_clock_samples_do_not_produce_a_genesis_command() {
+        let mut intervals = [6; 1000];
+        intervals[0] = 1000;
+        assert!(measured_genesis_clock(&intervals).is_err());
+        assert!(measured_genesis_clock(&[0; 1000]).is_err());
+        assert!(measured_genesis_clock(&[u64::MAX; 1000]).is_err());
+    }
 
     /// B15: the Rust copy of the emission rate is staking.move's.
     #[test]

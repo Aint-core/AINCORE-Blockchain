@@ -1,0 +1,62 @@
+{
+  "reproduced": true,
+  "isolated_control_passed": true,
+  "builds": [
+    {
+      "label": "a_shared",
+      "command": [
+        "cargo",
+        "build",
+        "--offline",
+        "--release",
+        "--verbose",
+        "--manifest-path",
+        "/home/alpha/aincore-cache-repro-20261023/a/Cargo.toml",
+        "--target-dir",
+        "/home/alpha/aincore-cache-repro-20261023/shared"
+      ],
+      "build_exit": 0,
+      "binary_sha256": "d7078e21263f3953ad1df3c077bc6f3a4de4dc4279bb739246b4c4a7aed38e19",
+      "source_sha256": "b4974d1d0133d10864b17a9bbc80bb8327d22efb86bb18c7f582f3211ebd108e",
+      "process_exit": 0
+    },
+    {
+      "label": "b_shared",
+      "command": [
+        "cargo",
+        "build",
+        "--offline",
+        "--release",
+        "--verbose",
+        "--manifest-path",
+        "/home/alpha/aincore-cache-repro-20261023/b/Cargo.toml",
+        "--target-dir",
+        "/home/alpha/aincore-cache-repro-20261023/shared"
+      ],
+      "build_exit": 0,
+      "binary_sha256": "d7078e21263f3953ad1df3c077bc6f3a4de4dc4279bb739246b4c4a7aed38e19",
+      "source_sha256": "e8ab6336cd28929978c853dbff37430cffb34783cc49a5c63f3db36e06c36503",
+      "process_exit": 0
+    },
+    {
+      "label": "b_isolated",
+      "command": [
+        "cargo",
+        "build",
+        "--offline",
+        "--release",
+        "--verbose",
+        "--manifest-path",
+        "/home/alpha/aincore-cache-repro-20261023/b/Cargo.toml",
+        "--target-dir",
+        "/home/alpha/aincore-cache-repro-20261023/isolated-b"
+      ],
+      "build_exit": 0,
+      "binary_sha256": "b874fff0dc7b96996ceda67ab1e06edc1c92368a7b0d9613068b4b661d83ec21",
+      "source_sha256": "e8ab6336cd28929978c853dbff37430cffb34783cc49a5c63f3db36e06c36503",
+      "process_exit": 17
+    }
+  ],
+  "rustc": "rustc 1.95.0 (59807616e 2026-04-14)\nbinary: rustc\ncommit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860\ncommit-date: 2026-04-14\nhost: x86_64-unknown-linux-gnu\nrelease: 1.95.0\nLLVM version: 22.1.2\n",
+  "cargo": "cargo 1.95.0 (f2d3ce0bd 2026-03-21)\n"
+}

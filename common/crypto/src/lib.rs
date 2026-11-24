@@ -6,6 +6,7 @@ use std::fmt;
 // Core cryptographic primitives
 pub mod address;
 pub mod ecdsa;
+pub mod key_file;
 pub mod poseidon;
 
 // Zero-Knowledge Proofs

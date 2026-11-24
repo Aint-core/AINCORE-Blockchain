@@ -49,6 +49,7 @@ fn local_signing_rejects_committee_outside_its_height_interval() {
         let dir = TestDir::new();
         let db = dir.open();
         rotated(&db);
+        initialize_test_signer(&db, &[7 + epoch as u8; 32], epoch);
         let (ctx, _) = context_and_vote(&db, height, epoch);
         let before = rows(&db);
         assert!(
@@ -113,6 +114,7 @@ fn boundary_and_successor_accept_only_their_respective_committees() {
             let dir = TestDir::new();
             let db = dir.open();
             rotated(&db);
+            initialize_test_signer(&db, &[7 + epoch as u8; 32], epoch);
             let (ctx, msg) = context_and_vote(&db, height, epoch);
             let set = load_validator_set_for_epoch(&db, epoch).unwrap();
             let cert = build_qc(
@@ -186,7 +188,9 @@ fn invalid_or_missing_activation_metadata_cannot_publish_anything() {
         let dir = TestDir::new();
         let db = dir.open();
         rotated(&db);
+        initialize_test_signer(&db, &[8; 32], 1);
         let (ctx, msg) = context_and_vote(&db, 21, 1);
+        assert_eq!(epoch_for_block_height(&db, ctx.block_height), Some(1));
         let set = load_validator_set_for_epoch(&db, 1).unwrap();
         let cert = build_qc(
             &msg.vote,
@@ -212,6 +216,11 @@ fn invalid_or_missing_activation_metadata_cannot_publish_anything() {
         ));
         assert!(!import_finality_qc(&db, &cert).unwrap());
         assert_eq!(rows(&db), before);
+        db.put("consensus:epoch_start_height:1", "21").unwrap();
+        let QcOutcome::Complete(resumed) = produce_and_store_qc(&db, &[8; 32], "local", &ctx) else {
+            panic!("restoring the sole missing activation boundary should permit signing");
+        };
+        assert_eq!(resumed.finality_vote(), msg.vote);
     }
 }
 

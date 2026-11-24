@@ -4,6 +4,8 @@
 //! passes by deciding nothing.
 
 use super::*;
+#[path = "closed_payload_tests.rs"]
+mod closed_payload_tests;
 use crate::qc::derive_validator_bls_seed;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -4198,6 +4200,29 @@ fn kill_m80_a_synced_database_never_takes_a_guard_origin() {
         c.engine(0).storage.get("consensus:guard_origin").unwrap().is_none(),
         "a store with 5 blocks took a first guard origin"
     );
+}
+
+#[test]
+fn a_store_with_local_finality_history_is_not_a_first_launch() {
+    let dir = TempDb::new("qc-origin");
+    let db = StateDB::open(dir.0.to_str().unwrap()).unwrap();
+    let storage = &db;
+    assert!(Engine::never_signed(storage));
+    for key in [
+        format!("consensus:qc_signing:v1:{}:{}:height:1", "12".repeat(32), "34".repeat(48)),
+        "consensus:qc_vote:1:local".to_owned(),
+    ] {
+        storage.put(&key, "retained").unwrap();
+        assert!(!Engine::never_signed(storage));
+        storage.delete(&key).unwrap();
+        assert!(Engine::never_signed(storage));
+    }
+    let mut invalid = storage::rocksdb::WriteBatch::default();
+    invalid.put(b"latest_height", [0xff]);
+    invalid.put(epoch::EPOCH_ACTIVE_KEY.as_bytes(), [0xff]);
+    db.write_batch(invalid).unwrap();
+    assert!(!Engine::never_signed(storage));
+    assert!(epoch::active_epoch(storage).is_err());
 }
 
 /// KILL(M19), EP-3: E+1's sentinel is EPOCH_GENESIS over the chain, E+1, its

@@ -5,6 +5,13 @@ on:
     types: [created]
   workflow_dispatch:
 
+# Both the signing action and the final asset upload consume this literal list.
+env:
+  RELEASE_ARCHIVES: |-
+    aincore-node-x86_64-unknown-linux-gnu.tar.gz
+    aincore-node-aarch64-unknown-linux-gnu.tar.gz
+    aincore-node-aarch64-apple-darwin.tar.gz
+
 jobs:
   security-gate:
     name: Release security witnesses and regression
@@ -12,15 +19,31 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install native dependencies
         run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev protobuf-compiler clang libclang-dev
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.90.0
+        uses: dtolnay/rust-toolchain@1961bfc0c4a8bf07e0a0c98e1e2459c642ea70a0 # 1.95.0
       - name: Test gate itself
         run: python3 -m unittest discover -s scripts/tests -p 'test_release_security_gate.py' -v
       - name: Test interrupted runner reporting
         run: python3 -m unittest discover -s scripts/tests -p 'test_hardening_runner.py' -v
+      - name: Test process-exit evidence controls
+        run: python3 -m unittest discover -s scripts/tests -p 'test_node_exit_probe.py' -v
+      - name: Test steady-state evidence controls
+        run: python3 -m unittest discover -s scripts/tests -p 'test_two_host_check.py' -v
+      - name: Test observer backup and restore guards
+        run: |
+          python3 -m unittest discover -s scripts/tests -p 'test_backup_safety.py' -v
+          python3 -m unittest discover -s scripts/tests -p 'test_restore_safety.py' -v
+          python3 -m unittest discover -s scripts/tests -p 'test_observer_backup_probe.py' -v
+          bash scripts/dr/dr_roundtrip_test.sh
+      - name: Test runtime packaging
+        run: |
+          python3 -m unittest discover -s scripts/tests -p 'test_release_package.py' -v
+          python3 -m unittest discover -s scripts/tests -p 'test_release_package_smoke.py' -v
       - name: Require security witnesses, including ignored blockers
         run: python3 scripts/release_security_gate.py
       - name: Regression suite
@@ -30,7 +53,7 @@ jobs:
       - name: Strict admission-path lint
         run: cargo clippy --locked -p blockchain -p chain_sync -p consensus -p executor -p network -p node -p storage -p vm_move -p state_commit --all-targets -- -D warnings
       - name: Retain gate evidence even on failure
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: release-security-evidence
@@ -42,7 +65,7 @@ jobs:
     name: Build on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     permissions:
-      contents: write
+      contents: read
     strategy:
       matrix:
         include:
@@ -50,13 +73,24 @@ jobs:
             target: x86_64-unknown-linux-gnu
             artifact_name: aincore-node
             asset_name: aincore-node-x86_64-unknown-linux-gnu.tar.gz
-          - os: macos-14
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact_name: aincore-node
+            asset_name: aincore-node-aarch64-unknown-linux-gnu.tar.gz
+          - os: macos-15
             target: aarch64-apple-darwin
             artifact_name: aincore-node
             asset_name: aincore-node-aarch64-apple-darwin.tar.gz
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install smoke-test Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
 
       - name: Install native dependencies (Linux)
         if: runner.os == 'Linux'
@@ -67,23 +101,139 @@ jobs:
         run: brew install pkg-config openssl@3 protobuf
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.90.0
+        uses: dtolnay/rust-toolchain@1961bfc0c4a8bf07e0a0c98e1e2459c642ea70a0 # 1.95.0
         with:
           targets: ${{ matrix.target }}
 
       - name: Build Release Binary
-        run: cargo build --locked --release -p node --target ${{ matrix.target }}
+        run: cargo build --locked --release -p node -p genesis-tool --target ${{ matrix.target }}
 
       - name: Package Binary (Unix/macOS)
-        run: |
-          cd target/${{ matrix.target }}/release
-          tar -czvf ../../../${{ matrix.asset_name }} node
-          cd ../../..
-
-      - name: Upload Release Asset
-        uses: softprops/action-gh-release@v1
-        if: startsWith(github.ref, 'refs/tags/')
-        with:
-          files: ${{ matrix.asset_name }}
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # BSD tar otherwise adds AppleDouble metadata outside the runtime manifest.
+          COPYFILE_DISABLE: "1"
+        run: |
+          bash scripts/package_node_release.sh \
+            target/${{ matrix.target }}/release/node \
+            ${{ matrix.asset_name }}
+
+      - name: Boot the extracted artifact with a disposable test genesis
+        timeout-minutes: 8
+        shell: bash
+        run: |
+          mkdir release-smoke
+          tar xzf ${{ matrix.asset_name }} -C release-smoke
+          (cd release-smoke && shasum -a 256 -c SHA256SUMS)
+          umask 077
+          python3 -c 'import secrets; print(secrets.token_hex(32) + ":1000000")' > release-smoke-seeds.txt
+          trap 'rm -f release-smoke-seeds.txt' EXIT
+          target/${{ matrix.target }}/release/genesis-tool gen-multi \
+            --seeds-file release-smoke-seeds.txt --chain-id AINCORE-RELEASE-SMOKE \
+            --block-time-ms 3000 --clock-cap-secs 9 --out release-smoke-genesis.json
+          python3 -B scripts/release_package_smoke.py \
+            --runtime release-smoke --genesis release-smoke-genesis.json
+
+      - name: Retain package smoke evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: package-smoke-${{ matrix.target }}
+          path: |
+            release-smoke/release-smoke.json
+            release-smoke/clean_shutdown.log
+          if-no-files-found: warn
+
+      - name: Stage the smoke-tested archive for the tagged release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-package-${{ matrix.target }}
+          path: |
+            ${{ matrix.asset_name }}
+            ${{ matrix.asset_name }}.sha256
+          if-no-files-found: error
+          compression-level: 0
+
+  attest:
+    outputs:
+      archive-hashes: ${{ steps.check.outputs.hashes }}
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      attestations: write
+      id-token: write
+    steps:
+      - name: Download the tested archives from this run
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-package-*
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Check each archive against its sidecar
+        id: check
+        shell: bash
+        run: |
+          manifest="$RUNNER_TEMP/release-archive-hashes"
+          while IFS= read -r archive; do
+            sha256sum "$archive" | tee -a "$manifest" | cmp - "$archive.sha256"
+          done <<< "$RELEASE_ARCHIVES"
+          {
+            echo 'hashes<<END'
+            cat "$manifest"
+            echo 'END'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Attest the three release archives
+        id: sign
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ env.RELEASE_ARCHIVES }}
+
+      - name: Verify the signed bundle for every target before publication
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUNDLE: ${{ steps.sign.outputs.bundle-path }}
+        run: |
+          while IFS= read -r archive; do
+            gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-ref "$GITHUB_REF" --source-digest "$GITHUB_SHA" \
+              --deny-self-hosted-runners --bundle "$BUNDLE"
+          done <<< "$RELEASE_ARCHIVES"
+
+  publish:
+    needs: attest
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download the same immutable workflow artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-package-*
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Require the bytes and sidecars verified by the signing job
+        env:
+          ATTESTED_HASHES: ${{ needs.attest.outputs.archive-hashes }}
+        shell: bash
+        run: |
+          sha256sum --check - <<< "$ATTESTED_HASHES"
+          while IFS= read -r archive; do
+            sha256sum "$archive" | cmp - "$archive.sha256"
+          done <<< "$RELEASE_ARCHIVES"
+
+      - name: Upload the attested release archives and their checksums
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
+        with:
+          fail_on_unmatched_files: true
+          files: |
+            ${{ env.RELEASE_ARCHIVES }}
+            aincore-node-x86_64-unknown-linux-gnu.tar.gz.sha256
+            aincore-node-aarch64-unknown-linux-gnu.tar.gz.sha256
+            aincore-node-aarch64-apple-darwin.tar.gz.sha256

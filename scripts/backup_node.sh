@@ -28,15 +28,16 @@
 # It writes a timestamped tar.gz PLUS a sibling .sha256 file, which
 # scripts/restore_node.sh verifies before it restores.
 #
-# CONSISTENCY: RocksDB is only crash-consistent on a live copy. For a clean
-# backup either (a) STOP the node first (recommended — pass --assume-stopped to
-# acknowledge), or (b) accept a hot copy (--hot), which relies on RocksDB WAL
-# recovery on restore and may capture an in-flight write. Stopped is safest.
+# CONSISTENCY: STOP the observer and fence automatic restarts first. The copy
+# holds RocksDB's POSIX LOCK until tar finishes. Raw live copying is NOT a
+# consistent snapshot: --hot is refused. A live backup needs a coordinated
+# RocksDB Checkpoint/BackupEngine implementation, not an ordinary tar of a DB.
+# Requires Python 3 on a POSIX host and a local filesystem supporting locks.
 #
 # Usage:
 #   backup_node.sh --datadir ./data --port 9001 --not-a-validator \
 #                  [--out-dir ./backups] [--genesis ./genesis.json] \
-#                  [--assume-stopped | --hot] [--keep N]
+#                  --assume-stopped [--keep N]
 #
 #   --not-a-validator  required: you confirm this node's key is not a
 #                      validator's (its address is not in /get_validators).
@@ -48,7 +49,7 @@ DATADIR=""
 PORT=""
 OUT_DIR="./backups"
 GENESIS=""
-MODE="" # "stopped" or "hot" — must be chosen explicitly
+MODE="" # "stopped" must be acknowledged explicitly
 KEEP=0  # 0 = keep all; N>0 = prune to newest N backups
 NOT_A_VALIDATOR=0
 
@@ -64,7 +65,10 @@ while [[ $# -gt 0 ]]; do
     --out-dir)        OUT_DIR="${2:-}"; shift 2 ;;
     --genesis)        GENESIS="${2:-}"; shift 2 ;;
     --assume-stopped) MODE="stopped"; shift ;;
-    --hot)            MODE="hot"; shift ;;
+    --hot)
+      echo "ERROR: --hot is unsupported: raw copying a live RocksDB is not a consistent backup." >&2
+      echo "       Stop and fence the observer, then use --assume-stopped." >&2
+      exit 3 ;;
     --keep)           KEEP="${2:-}"; shift 2 ;;
     --not-a-validator) NOT_A_VALIDATOR=1; shift ;;
     -h|--help)        usage 0 ;;
@@ -98,22 +102,11 @@ DB_PATH="${DATADIR%/}/${DB_NAME}"
 [[ -d "$DB_PATH" ]] || { echo "ERROR: chain DB not found: $DB_PATH" >&2; exit 3; }
 
 if [[ -z "$MODE" ]]; then
-  echo "ERROR: choose --assume-stopped (recommended: stop the node first) or --hot" >&2
-  echo "       a hot copy relies on RocksDB WAL recovery and may catch an in-flight write" >&2
+  echo "ERROR: stop and fence the observer, then acknowledge with --assume-stopped" >&2
   exit 3
 fi
 
-if [[ "$MODE" == "stopped" ]]; then
-  # Best-effort warning if a process still holds the DB LOCK (Linux only; no-op
-  # elsewhere). We do not abort — operator asserted stopped — but we surface it.
-  if command -v fuser >/dev/null 2>&1; then
-    if fuser "$DB_PATH/LOCK" >/dev/null 2>&1; then
-      echo "WARNING: $DB_PATH/LOCK still held by a running process — node may NOT be stopped." >&2
-      echo "         The backup may be inconsistent. Stop the node and retry." >&2
-    fi
-  fi
-fi
-
+command -v python3 >/dev/null || { echo "ERROR: Python 3 is required to hold the RocksDB lock" >&2; exit 3; }
 command -v tar >/dev/null || { echo "ERROR: tar not found" >&2; exit 3; }
 SHA_CMD=""
 if command -v sha256sum >/dev/null 2>&1; then
@@ -161,7 +154,34 @@ TAR_ARGS=(-C "$DATADIR" "$DB_NAME")
 TAR_ARGS+=(-C "$STAGING" "MANIFEST")
 [[ -n "$GENESIS" ]] && TAR_ARGS+=(-C "$STAGING" "genesis.json")
 
-tar czf "$ARCHIVE" "${TAR_ARGS[@]}"
+# RocksDB's POSIX environment uses F_SETLK, not flock. Keep this parent alive
+# while tar runs so a concurrent DB opener cannot acquire the same file lock.
+python3 - "$DB_PATH/LOCK" "$ARCHIVE" "${TAR_ARGS[@]}" <<'PY'
+import fcntl
+import os
+import stat
+import subprocess
+import sys
+
+lock_path, archive, *tar_args = sys.argv[1:]
+try:
+    fd = os.open(lock_path, os.O_RDWR | os.O_NOFOLLOW)
+    with os.fdopen(fd, "r+b") as lock:
+        if not stat.S_ISREG(os.fstat(lock.fileno()).st_mode):
+            raise OSError("LOCK is not a regular file")
+        fcntl.lockf(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # Exclusive creation also prevents overwriting a same-second backup.
+        with open(archive, "xb") as output:
+            try:
+                subprocess.run(["tar", "czf", "-", *tar_args], stdout=output, check=True)
+            except BaseException:
+                os.unlink(archive)
+                raise
+except (OSError, subprocess.CalledProcessError) as error:
+    print(f"ERROR: backup refused or copy failed: {error}", file=sys.stderr)
+    print("Stop and fence the observer; retain its existing LOCK file.", file=sys.stderr)
+    sys.exit(3)
+PY
 
 # Integrity hash, checked by restore_node.sh (tamper detection at rest).
 HASH="$($SHA_CMD "$ARCHIVE" | awk '{print $1}')"

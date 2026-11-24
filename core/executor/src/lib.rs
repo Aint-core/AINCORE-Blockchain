@@ -20,8 +20,7 @@ pub fn expected_chain_id() -> String {
 }
 // V3 CONSTANTS
 // SEC-#14: 150M AIN hard cap (in quanta). Minting is cap-clamped in
-// staking.move (distribute_rewards); this constant backs the executor-side
-// defense-in-depth tripwire in `append_supply_tracker_updates`.
+// staking.move (distribute_rewards); RPC validates the cumulative issuance against it.
 // Block rewards are handled exclusively by staking.move (halving model); the
 // executor only distributes transaction fees, no inflationary minting here.
 pub const MAX_SUPPLY: u128 = 150_000_000 * 1_000_000_000_000_000_000; // 150 Million AIN
@@ -61,9 +60,70 @@ use state_gas::GasEstimate;
 
 /// Seeding for other crates' tests (`test-support` feature): enough of what
 /// genesis writes for a transaction to execute.
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_support {
     use storage::StateDB;
+
+    /// Complete the supply records for a synthetic genesis before building its
+    /// state tree. Some fixtures seed only coin stores and no validator set.
+    pub fn seed_supply(db: &StateDB) {
+        let _seed = db.seeding();
+        let set_key = super::validator_set_key();
+        let net = if let Some(raw) = db.get(&set_key).unwrap() {
+            super::decode_validator_set_hex(&raw).unwrap().total_supply
+        } else {
+            let net = db
+                .scan_prefix("resource_")
+                .into_iter()
+                .filter(|(key, _)| {
+                    key.ends_with("_0x1::coin::CoinStore<0x1::staking::AincoreCoin>")
+                })
+                .map(|(_, raw)| bcs::from_bytes::<u128>(&hex::decode(raw).unwrap()).unwrap())
+                .sum();
+            let set = super::MoveValidatorSet {
+                validators: vec![],
+                unbonding_queue: vec![],
+                total_supply: net,
+                current_epoch: 0,
+            };
+            db.put(&set_key, &super::encode_validator_set_hex(&set).unwrap())
+                .unwrap();
+            net
+        };
+        db.put("sys:total_supply", &net.to_string()).unwrap();
+        let stats_key = super::supply_stats_key();
+        let burned = if let Some(raw) = db.get(&stats_key).unwrap() {
+            super::decode_supply_stats_hex(&raw)
+                .unwrap()
+                .cumulative_burned
+        } else {
+            let stats = super::MoveSupplyStats {
+                cumulative_burned: 0,
+            };
+            db.put(&stats_key, &super::encode_supply_stats_hex(&stats).unwrap())
+                .unwrap();
+            0
+        };
+        db.put("total_burned", &burned.to_string()).unwrap();
+    }
+
+    /// Build the same typed native-coin entry call used by the CLI.
+    pub fn ain_transfer_payload(from: &str, to: &str, amount: u128) -> String {
+        let call = vm_move::EntryFunctionCall {
+            module: move_core_types::language_storage::ModuleId::new(
+                super::system_address(),
+                move_core_types::identifier::Identifier::new("coin").unwrap(),
+            ),
+            function: "transfer".to_string(),
+            ty_args: vec![super::aincore_coin_type()],
+            args: vec![
+                bcs::to_bytes(&super::parse_move_address(from).unwrap()).unwrap(),
+                bcs::to_bytes(&super::parse_move_address(to).unwrap()).unwrap(),
+                bcs::to_bytes(&amount).unwrap(),
+            ],
+        };
+        hex::encode(bcs::to_bytes(&vm_move::TransactionPayload::EntryFunction(call)).unwrap())
+    }
 
     /// Every stdlib module, as genesis installs it, and the chain
     /// parameters and clock the epoch and reward code read.
@@ -1275,41 +1335,104 @@ pub fn next_chain_clock(db: &StateDB, height: u64, block_timestamp: u64) -> Chai
 /// G5 DOC-1: the emission as the RPC reports it, read from Move state.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EmissionView {
-    /// Cumulative minted: the net supply plus everything burned (AUDIT-#8).
+    pub net_supply: u128,
+    pub cumulative_burned: u128,
     pub minted: u128,
-    /// The reserve the emission draws on: MAX_SUPPLY minus `minted`.
     pub remaining: u128,
-    /// Consensus time of the last payout (0 before the first).
     pub last_reward_time: u64,
 }
 
-/// G5 DOC-1: the committed emission state. Unreadable state reads as none.
-pub fn emission_view(db: &StateDB) -> EmissionView {
-    let read = |tag: &str| {
-        db.get(&vm_move::state_keys::resource_key_str(
-            &system_address(),
-            tag,
-        ))
-        .ok()
-        .flatten()
-    };
-    let net = read("0x1::staking::ValidatorSet")
-        .and_then(|raw| decode_validator_set_hex(&raw))
-        .map(|set| set.total_supply)
-        .unwrap_or(0);
-    let burned = read("0x1::staking::SupplyStats")
-        .and_then(|raw| decode_supply_stats_hex(&raw))
-        .map(|stats| stats.cumulative_burned)
-        .unwrap_or(0);
-    let minted = net.saturating_add(burned);
-    EmissionView {
-        minted,
-        remaining: MAX_SUPPLY.saturating_sub(minted),
-        last_reward_time: read("0x1::staking::EmissionState")
-            .and_then(|raw| hex::decode(raw).ok())
-            .and_then(|bytes| bcs::from_bytes::<u64>(&bytes).ok())
-            .unwrap_or(0),
+fn required_move_resource<T: serde::de::DeserializeOwned>(
+    raw: Option<&str>,
+    tag: &str,
+) -> Result<T, String> {
+    let raw = raw.ok_or_else(|| format!("missing {tag}"))?;
+    let bytes = hex::decode(raw).map_err(|_| format!("invalid hex in {tag}"))?;
+    bcs::from_bytes(&bytes).map_err(|_| format!("invalid BCS in {tag}"))
+}
+
+fn emission_resource_keys() -> [String; 3] {
+    [
+        validator_set_key(),
+        supply_stats_key(),
+        vm_move::state_keys::resource_key_str(&system_address(), "0x1::staking::EmissionState"),
+    ]
+}
+
+impl EmissionView {
+    fn from_rows([set, stats, emission]: [Option<String>; 3]) -> Result<Self, String> {
+        let set: MoveValidatorSet = required_move_resource(set.as_deref(), "ValidatorSet")?;
+        let stats: MoveSupplyStats = required_move_resource(stats.as_deref(), "SupplyStats")?;
+        // Genesis creates EmissionState lazily on the first payout.
+        let last_reward_time = match emission.as_deref() {
+            Some(raw) => required_move_resource(Some(raw), "EmissionState")?,
+            None => 0,
+        };
+        let minted = set
+            .total_supply
+            .checked_add(stats.cumulative_burned)
+            .ok_or("cumulative minted supply overflow")?;
+        let remaining = MAX_SUPPLY
+            .checked_sub(minted)
+            .ok_or("minted supply exceeds cap")?;
+        Ok(Self {
+            net_supply: set.total_supply,
+            cumulative_burned: stats.cumulative_burned,
+            minted,
+            remaining,
+            last_reward_time,
+        })
     }
+}
+
+/// The canonical Move supply and reserve at one committed version.
+pub fn emission_view(db: &StateDB) -> Result<EmissionView, String> {
+    let keys = emission_resource_keys();
+    let rows = db
+        .committed_text(keys.each_ref().map(String::as_str))
+        .map_err(|e| e.to_string())?;
+    EmissionView::from_rows(rows)
+}
+
+pub struct EconomicsView {
+    pub emission: EmissionView,
+    pub clock: ChainClock,
+    pub epoch_blocks: u64,
+    pub reward_period: u64,
+    pub max_block_interval_secs: u64,
+    pub burn_percentage: u8,
+}
+
+/// Include the clock and policy fields in the same snapshot as issuance.
+pub fn economics_view(db: &StateDB) -> Result<EconomicsView, String> {
+    let [set, stats, emission] = emission_resource_keys();
+    let key = |tag| vm_move::state_keys::resource_key_str(&system_address(), tag);
+    let [set, stats, emission, clock, params, burn] = db
+        .committed_text([
+            &set,
+            &stats,
+            &emission,
+            &key("0x1::chain::Clock"),
+            &key("0x1::chain::Params"),
+            "sys:config:burn_percentage",
+        ])
+        .map_err(|e| e.to_string())?;
+    let params: ChainParamsResource = required_move_resource(params.as_deref(), "Params")?;
+    let burn_percentage = burn
+        .ok_or("missing burn percentage")?
+        .parse::<u8>()
+        .map_err(|_| "invalid burn percentage")?;
+    if burn_percentage > 100 {
+        return Err("burn percentage exceeds 100".into());
+    }
+    Ok(EconomicsView {
+        emission: EmissionView::from_rows([set, stats, emission])?,
+        clock: required_move_resource(clock.as_deref(), "Clock")?,
+        epoch_blocks: params.epoch_blocks,
+        reward_period: params.reward_period,
+        max_block_interval_secs: params.max_block_interval_secs,
+        burn_percentage,
+    })
 }
 
 /// G5 P-1: the genesis-pinned (I, R, C_tau), for readers (the RPC).
@@ -2516,58 +2639,49 @@ impl Executor {
         hex::encode(hasher.finalize())
     }
 
+    /// Mirror the two canonical Move counters from the actual changeset. A
+    /// reduction of net supply alone does not identify its cause.
     fn append_supply_tracker_updates(&self, updates: &mut Vec<(String, Option<String>)>) {
-        let key = validator_set_key();
-        let new_supply = updates
-            .iter()
-            .rev()
-            .find_map(|(k, v)| if k == &key { v.as_deref() } else { None })
-            .and_then(decode_validator_set_hex)
-            .map(|set| set.total_supply);
-
-        let Some(new_supply) = new_supply else {
-            return;
-        };
-
-        // SEC-#14: defense-in-depth cap tripwire. Net supply is mirrored from the
-        // Move ValidatorSet.total_supply, whose minting is cap-clamped in
-        // staking.move (distribute_rewards), so it must never exceed MAX_SUPPLY
-        // here. If it ever does, a mint path has regressed past the 150M cap —
-        // surface it loudly for monitoring/forensics. This is a read-only alert:
-        // the executor must NOT abort an in-flight committed block (that would
-        // itself diverge state); the alarm is the actionable signal.
-        if new_supply > MAX_SUPPLY {
-            eprintln!(
-                "🚨 [SECURITY][SUPPLY_CAP] tracked supply {} exceeds MAX_SUPPLY {} — a mint path breached the 150M cap",
-                new_supply, MAX_SUPPLY
-            );
-        }
-
-        let old_supply = self
-            .db
-            .get("sys:total_supply")
-            .ok()
-            .flatten()
-            .and_then(|s| s.parse::<u128>().ok());
-
-        if old_supply != Some(new_supply) {
-            updates.push(("sys:total_supply".to_string(), Some(new_supply.to_string())));
-        }
-
-        if let Some(old_supply) = old_supply {
-            if old_supply > new_supply {
-                let burned_delta = old_supply - new_supply;
-                let prev_burned = self
-                    .db
-                    .get("total_burned")
-                    .ok()
-                    .flatten()
-                    .and_then(|s| s.parse::<u128>().ok())
-                    .unwrap_or(0);
-                let new_burned = prev_burned.saturating_add(burned_delta);
-                updates.push(("total_burned".to_string(), Some(new_burned.to_string())));
+        let set_key = validator_set_key();
+        let stats_key = supply_stats_key();
+        let mut mirrors = Vec::new();
+        for (key, value) in updates.iter() {
+            let (mirror, parsed) = if key == &set_key {
+                (
+                    "sys:total_supply",
+                    required_move_resource::<MoveValidatorSet>(value.as_deref(), "ValidatorSet")
+                        .map(|set| set.total_supply),
+                )
+            } else if key == &stats_key {
+                (
+                    "total_burned",
+                    required_move_resource::<MoveSupplyStats>(value.as_deref(), "SupplyStats")
+                        .map(|stats| stats.cumulative_burned),
+                )
+            } else {
+                continue;
+            };
+            let amount = match parsed {
+                Ok(amount) => amount,
+                Err(error) => {
+                    self.refuse_block(error);
+                    return;
+                }
+            };
+            if key == &set_key && amount > MAX_SUPPLY {
+                eprintln!("tracked net supply {amount} exceeds maximum {MAX_SUPPLY}");
+            }
+            let value = amount.to_string();
+            match self.db.try_get(mirror) {
+                Ok(old) if old.as_deref() == Some(value.as_str()) => {}
+                Ok(_) => mirrors.push((mirror.to_owned(), Some(value))),
+                Err(err) => {
+                    self.refuse_block(err.to_string());
+                    return;
+                }
             }
         }
+        updates.extend(mirrors);
     }
 
     /// A plain staged write. Since G3 the state root covers every
@@ -2599,51 +2713,6 @@ impl Executor {
         self.db
             .write_batch(write_batch)
             .map_err(|e| format!("{} write batch failed: {}", context, e))
-    }
-
-    fn sync_supply_trackers_from_validator_set(&self) {
-        let Some(new_supply) = self
-            .db
-            .get(&validator_set_key())
-            .ok()
-            .flatten()
-            .and_then(|value| decode_validator_set_hex(&value))
-            .map(|set| set.total_supply)
-        else {
-            return;
-        };
-
-        let old_supply = self
-            .db
-            .get("sys:total_supply")
-            .ok()
-            .flatten()
-            .and_then(|s| s.parse::<u128>().ok());
-
-        if old_supply != Some(new_supply) {
-            // Through the write log: this key feeds a later epoch block's
-            // logged update, so leaving it outside the root means a divergence
-            // here is invisible until it resurfaces in a block that cannot
-            // explain it.
-            self.system_put("sys:total_supply", &new_supply.to_string());
-        }
-
-        if let Some(old_supply) = old_supply {
-            if old_supply > new_supply {
-                let burned_delta = old_supply - new_supply;
-                let prev_burned = self
-                    .db
-                    .get("total_burned")
-                    .ok()
-                    .flatten()
-                    .and_then(|s| s.parse::<u128>().ok())
-                    .unwrap_or(0);
-                self.system_put(
-                    "total_burned",
-                    &prev_burned.saturating_add(burned_delta).to_string(),
-                );
-            }
-        }
     }
 
     /// SEC-#13: canonical, genesis-pinned default for the epoch-block interval.
@@ -2732,8 +2801,6 @@ impl Executor {
                     eprintln!("🚨 [EPOCH_ADVANCE_COMMIT_FAIL] {}", err);
                     // B150: fails the block (B140), never half applied.
                     self.refuse_block(err);
-                } else {
-                    self.sync_supply_trackers_from_validator_set();
                 }
             }
             Ok((_gas_used, _updates, status)) => eprintln!(
@@ -2819,8 +2886,6 @@ impl Executor {
                     eprintln!("🚨 [REWARD_PAYOUT_COMMIT_FAIL] {}", err);
                     // B150: fails the block (B140), never half applied.
                     self.refuse_block(err);
-                } else {
-                    self.sync_supply_trackers_from_validator_set();
                 }
             }
             Ok((_gas_used, _updates, status)) => eprintln!(
@@ -2858,8 +2923,6 @@ impl Executor {
                     eprintln!("🚨 [OFFENSE_SETTLEMENT_COMMIT_FAIL] {}", err);
                     // B150: fails the block (B140), never half applied.
                     self.refuse_block(err);
-                } else {
-                    self.sync_supply_trackers_from_validator_set();
                 }
             }
             Ok((_gas_used, _updates, status)) => eprintln!(
@@ -3809,61 +3872,49 @@ impl Executor {
             return;
         }
 
-        let prev_burned = self
-            .db
-            .get("total_burned")
-            .ok()
-            .flatten()
-            .and_then(|s| s.parse::<u128>().ok())
-            .unwrap_or(0);
-        self.system_put(
-            "total_burned",
-            &prev_burned.saturating_add(amount).to_string(),
-        );
-
-        if let Ok(Some(total_supply_str)) = self.db.get("sys:total_supply") {
-            if let Ok(total_supply) = total_supply_str.parse::<u128>() {
-                let adjusted_supply = total_supply.saturating_sub(amount);
-                self.system_put("sys:total_supply", &adjusted_supply.to_string());
-            }
+        if let Err(error) = self.apply_fee_burn(amount) {
+            self.refuse_block(error);
         }
+    }
 
-        let key = validator_set_key();
-        if let Ok(Some(value)) = self.db.get(&key) {
-            if let Some(mut set) = decode_validator_set_hex(&value) {
-                set.total_supply = set.total_supply.saturating_sub(amount);
-                if let Some(encoded) = encode_validator_set_hex(&set) {
-                    self.system_put(&key, &encoded);
-                }
-            }
-        }
-
-        // AUDIT-#8 (BTC mint-cap): the Move emission anchor now keys off
-        // cumulative MINTED = ValidatorSet.total_supply + SupplyStats.cumulative_burned
-        // (staking.move::distribute_rewards). This Rust-native fee burn just
-        // decremented total_supply by `amount`; credit the SAME `amount` into the
-        // Move SupplyStats resource (lazy-create if absent) so `minted` stays
-        // invariant and burnt fees can NEVER be re-minted as fresh emission.
-        // WITHOUT this, the fee-burn path silently re-opens finding #8 — exactly
-        // the hole the adversarial verifiers caught in the "minimal" hybrid.
-        // `amount` matches the convention used for `total_burned` above (both use
-        // the requested amount; total_supply's saturating_sub only differs in the
-        // impossible case total_supply < a single block's burnt fees).
+    fn apply_fee_burn(&self, amount: u128) -> Result<(), String> {
+        let set_key = validator_set_key();
         let stats_key = supply_stats_key();
-        let prev_move_burned = self
-            .db
-            .get(&stats_key)
-            .ok()
-            .flatten()
-            .and_then(|v| decode_supply_stats_hex(&v))
-            .map(|s| s.cumulative_burned)
-            .unwrap_or(0);
-        let updated_stats = MoveSupplyStats {
-            cumulative_burned: prev_move_burned.saturating_add(amount),
-        };
-        if let Some(encoded) = encode_supply_stats_hex(&updated_stats) {
-            self.system_put(&stats_key, &encoded);
-        }
+        let read = |key: &str| self.db.try_get(key).map_err(|error| error.to_string());
+        let mut set: MoveValidatorSet =
+            required_move_resource(read(&set_key)?.as_deref(), "ValidatorSet")?;
+        let mut stats: MoveSupplyStats =
+            required_move_resource(read(&stats_key)?.as_deref(), "SupplyStats")?;
+        set.total_supply = set
+            .total_supply
+            .checked_sub(amount)
+            .ok_or("fee burn exceeds supply")?;
+        stats.cumulative_burned = stats
+            .cumulative_burned
+            .checked_add(amount)
+            .ok_or("cumulative fee burn overflows")?;
+
+        // The decimal mirrors are outputs. Compute them from the same canonical
+        // values so stale mirrors cannot reset the Move history.
+        let updates = vec![
+            (
+                set_key,
+                Some(encode_validator_set_hex(&set).ok_or("cannot encode ValidatorSet")?),
+            ),
+            (
+                stats_key,
+                Some(encode_supply_stats_hex(&stats).ok_or("cannot encode SupplyStats")?),
+            ),
+            (
+                "sys:total_supply".into(),
+                Some(set.total_supply.to_string()),
+            ),
+            (
+                "total_burned".into(),
+                Some(stats.cumulative_burned.to_string()),
+            ),
+        ];
+        self.commit_kv_updates(updates, "fee burn")
     }
 
     /// Phase 4.A1: Compute stake-proportional block reward payouts.
@@ -4691,13 +4742,6 @@ impl Executor {
         // The Executor only distributes TRANSACTION FEES to the miner.
         // DO NOT mint new coins here — that would cause double inflation!
 
-        let _current_height = self.db.get_chain_height();
-
-        let _total_supply: u128 = match self.db.get("sys:total_supply") {
-            Ok(Some(s)) => s.parse().unwrap_or(0),
-            _ => 0,
-        };
-
         // Fee Logic & Burning (fees only, no inflation)
         // B15 (EIP-1559): every charged gas unit's base fee is burned, so a
         // producer cannot pay it to itself; the tip above it follows the fee
@@ -5478,7 +5522,8 @@ impl Executor {
                 // system_address() (the offender is carried separately).
                 system_address(),
             ) {
-                Ok((_gas_used, vm_changes, status)) if status.success => {
+                Ok((_gas_used, mut vm_changes, status)) if status.success => {
+                    self.append_supply_tracker_updates(&mut vm_changes);
                     // B162: system writes (B140): a refused one fails the
                     // block instead of leaving the offense half recorded.
                     for (k, v) in vm_changes {
@@ -5487,7 +5532,6 @@ impl Executor {
                             None => self.system_delete(&k),
                         }
                     }
-                    self.sync_supply_trackers_from_validator_set();
                     println!("   ⚡ Offense recorded; the fraction settles by G5 SL-5");
                 }
                 Ok((_gas_used, _changes, status)) => {
@@ -7951,6 +7995,7 @@ mod tests {
         let bytes = bcs::to_bytes(&set).expect("validator set BCS");
         db.put(&validator_set_key(), &hex::encode(bytes))
             .expect("validator set stored");
+        super::test_support::seed_supply(db);
     }
 
     fn validator_set(db: &StateDB) -> TestValidatorSet {
@@ -14496,6 +14541,7 @@ mod tests {
     /// G3 S3: genesis commits version 0 of the state tree (`commit_genesis`).
     /// A fixture that writes its own genesis state ends the same way.
     pub(crate) fn seed_genesis_tree(db: &Arc<StateDB>) {
+        super::test_support::seed_supply(db);
         let seeded = state_commit::seed_genesis(db).expect("seed state tree v0");
         db.write_batch(seeded.batch).unwrap();
     }
@@ -14545,6 +14591,37 @@ mod tests {
         let tx_json = signed_tx(&sender_key, &sender, &payload, 0, 100_000, 2);
         seed_genesis_tree(&db);
         (db, sender, tx_json)
+    }
+
+    #[test]
+    fn fee_burn_requires_decodable_supply_and_commits_no_partial_block() {
+        let (db, sender, tx) = g3_burning_transfer("fee_burn_missing_stats");
+        let exec = Executor::new(db.clone());
+        let _seed = db.seeding();
+        let supply = db.get("sys:total_supply").unwrap();
+        let hash = tx_hash_hex(&tx);
+        for stats in [None, Some("00")] {
+            match stats {
+                Some(raw) => db.put(&supply_stats_key(), raw).unwrap(),
+                None => db.delete(&supply_stats_key()).unwrap(),
+            }
+            let result = exec.execute_block_checked_at(
+                vec![tx.clone()],
+                &sender,
+                1,
+                block_time(1),
+                0,
+                &[],
+                &[],
+                |_, _| Ok(()),
+            );
+            assert!(result.unwrap_err().contains("SupplyStats"));
+            assert_eq!(exec.last_executed_height(), 0);
+            assert!(state_commit::root(&db, 1).is_err());
+            assert_eq!(db.get("sys:total_supply").unwrap(), supply);
+            assert_eq!(db.get("total_burned").unwrap().as_deref(), Some("0"));
+            assert!(db.get(&format!("tx_receipt:{hash}")).unwrap().is_none());
+        }
     }
 
     /// G3: the burn path writes `sys:total_supply` with a plain put that never
@@ -16260,7 +16337,7 @@ mod tests {
         load_stdlib(&db);
         let executor = Executor::new(db.clone());
         let _seed = db.seeding();
-        db.put("sys:total_supply", "1000000").unwrap();
+        set_validator_set(&db, "1", 0, 1_000_000);
         let miner = "not_a_hex_address";
         for height in 10..210u64 {
             executor.queue_fee_sweep(miner, 1, height);

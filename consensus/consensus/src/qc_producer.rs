@@ -427,7 +427,9 @@ fn produce_qc_staged(
     node_address: &str,
     ctx: &CommitContext,
 ) -> Result<QcOutcome, String> {
-    if epoch_for_block_height(storage, ctx.block_height) != Some(ctx.epoch) {
+    if epoch_for_block_height(storage, ctx.block_height) != Some(ctx.epoch)
+        || crate::v4::epoch::active_epoch(storage)? != ctx.epoch
+    {
         return Ok(QcOutcome::Skipped);
     }
     // SEC-#16: bind the QC to the validator set FROZEN for this commit's epoch,
@@ -472,6 +474,16 @@ fn produce_qc_staged(
         eprintln!(
             "🚨 [QC] derived BLS pubkey != genesis-registered key for {node_address} — skipping QC production"
         );
+        return Ok(QcOutcome::Skipped);
+    }
+    // Every local vote, including durable pending work, shares the V4 signer's
+    // recovery fence. The marker and epoch are read inside the vote transaction.
+    let Some(genesis) = storage.try_get("genesis_identity").map_err(|e| e.to_string())? else {
+        return Ok(QcOutcome::Skipped);
+    };
+    let origin = crate::v4::guard_origin_with_bls(&ctx.chain_id, &genesis, node_key, &our_pk);
+    let held = storage.try_get("consensus:guard_origin").map_err(|e| e.to_string())?;
+    if held.as_deref() != Some(origin.as_str()) {
         return Ok(QcOutcome::Skipped);
     }
     let signing_bytes = vote.to_signing_bytes();
@@ -1512,6 +1524,7 @@ mod tests {
                 set.push(validator_for(&[8; 32], 60, "other"));
             }
             let _seed = db.seeding();
+            initialize_test_signer(&db, &[7; 32], 0);
             db.put(
                 "genesis:validator_set:v1",
                 &serde_json::to_string(&set).unwrap(),
@@ -1559,6 +1572,7 @@ mod tests {
                 set.push(validator_for(&[8; 32], 60, "other"));
             }
             let _seed = db.seeding();
+            initialize_test_signer(&db, &[7; 32], 0);
             db.put(
                 "genesis:validator_set:v1",
                 &serde_json::to_string(&set).unwrap(),
@@ -1584,6 +1598,15 @@ mod tests {
             drop(db);
             std::fs::remove_dir_all(dir).unwrap();
         }
+    }
+
+    fn initialize_test_signer(db: &StateDB, key: &[u8; 32], active_epoch: u64) {
+        let _seed = db.seeding();
+        let genesis = "12".repeat(32);
+        let origin = crate::v4::guard_origin(&qc::expected_chain_id(), &genesis, key);
+        db.put("genesis_identity", &genesis).unwrap();
+        db.put("consensus:guard_origin", &origin).unwrap();
+        db.put(crate::v4::epoch::EPOCH_ACTIVE_KEY, &active_epoch.to_string()).unwrap();
     }
 
     fn validator_for(node_key: &[u8; 32], stake: u64, address: &str) -> ValidatorInfo {
@@ -1625,6 +1648,7 @@ mod tests {
         let addr = "deadbeef";
         let v = validator_for(&node_key, 1_000_000, addr);
         let _seed = storage.seeding();
+        initialize_test_signer(&storage, &node_key, 0);
         storage
             .put("genesis:validator_set:v1", &serde_json::to_string(&vec![v.clone()]).unwrap())
             .unwrap();
@@ -1658,6 +1682,7 @@ mod tests {
         // Set contains a DIFFERENT validator; our node_key is not registered.
         let other = validator_for(&[9u8; 32], 1_000_000, "aaaa");
         let _seed = storage.seeding();
+        initialize_test_signer(&storage, &[7; 32], 0);
         storage
             .put("genesis:validator_set:v1", &serde_json::to_string(&vec![other]).unwrap())
             .unwrap();
@@ -1668,6 +1693,11 @@ mod tests {
             "node not in validator set must produce no QC"
         );
         assert!(storage.get("consensus:qc:7").unwrap().is_none());
+        initialize_test_signer(&storage, &[9; 32], 0);
+        assert!(matches!(
+            produce_and_store_qc(&storage, &[9; 32], "aaaa", &ctx_for(7)),
+            QcOutcome::Complete(_)
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1678,6 +1708,7 @@ mod tests {
         let storage = StateDB::open(dir.to_str().unwrap()).unwrap();
         let my_key = [7u8; 32];
         // Our node holds 10 of 100 total stake — far below >2/3.
+        initialize_test_signer(&storage, &my_key, 0);
         let me = validator_for(&my_key, 10, "bbbb");
         let big = validator_for(&[9u8; 32], 90, "aaaa");
         let _seed = storage.seeding();
@@ -1852,6 +1883,7 @@ mod tests {
             validator_for(&[13u8; 32], 20, "cccc"),
         ];
         let _seed = storage.seeding();
+        initialize_test_signer(&storage, &key_b, 0);
         storage
             .put(
                 "genesis:validator_set:v1",

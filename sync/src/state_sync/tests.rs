@@ -898,6 +898,20 @@ async fn a_v4_restore_at_a_boundary_holds_the_next_epochs_record() {
     );
 }
 
+#[test]
+fn old_alarms_are_cleared_in_pages_while_restore_is_marked() {
+    let client = temp_db("paged_clear");
+    client.put(RESTORE_MARKER, "{}").unwrap();
+    for height in 1..=7 {
+        client.put(&format!("alarm:decision_conflict:{height}"), "old").unwrap();
+    }
+    clear(&client, 2).unwrap();
+    assert!(client.try_scan_prefix_at_most("alarm:", 0).is_ok());
+    assert!(client.try_get(RESTORE_MARKER).unwrap().is_some());
+    clear(&client, 2).unwrap();
+    assert!(client.try_get(RESTORE_MARKER).unwrap().is_some());
+}
+
 /// B61 witness: a replace-restore drops the replaced chain's alarms (kept,
 /// they halted ordering on the restored state).
 #[tokio::test]
@@ -914,6 +928,8 @@ async fn a_replace_restore_clears_the_old_chains_alarms() {
         .unwrap();
     assert_restored(&client, &a);
     assert_eq!(client.get("alarm:decision_conflict:42").unwrap(), None);
+    assert!(client.try_scan_prefix_at_most("alarm:", 0).is_ok());
+    assert_eq!(client.get(RESTORE_MARKER).unwrap(), None);
 }
 
 /// The block and QC a peer offers must be the checkpoint's, field by field.
@@ -3245,9 +3261,16 @@ fn validators_are_what_the_restored_state_records() {
     let genesis_member = committee()[0].address.clone();
     let epoch_one = committee_of([8; 32], 2)[0].address.clone();
     for key in [&genesis_member, &epoch_one, &"ab".repeat(32), &proposer().1] {
-        assert!(recorded_validator(&client, key), "{key}");
+        assert!(recorded_validator(&client, key).unwrap(), "{key}");
     }
-    assert!(!recorded_validator(&client, &outsider().1));
+    assert!(!recorded_validator(&client, &outsider().1).unwrap());
+    // Incomplete records cannot authorize replacing this observer's database.
+    {
+        let _seed = client.seeding();
+        client.put("consensus:epoch", "unknown").unwrap();
+        assert!(recorded_validator(&client, &outsider().1).is_err());
+        client.put("consensus:epoch", "1").unwrap();
+    }
     let signing = committee_of([8; 32], 2);
     assert!(
         signed_by_a_validator(&client, &signing, &epoch_one),
@@ -3933,6 +3956,12 @@ async fn a_replace_restore_resumes_only_under_its_first_key() {
         client.put("latest_height", "3").unwrap();
         client
             .put(
+                "genesis:validator_set:v1",
+                &serde_json::to_string(&committee()).unwrap(),
+            )
+            .unwrap();
+        client
+            .put(
                 "sys:validators",
                 &serde_json::to_string(&vec![(validator.clone(), 100u64)]).unwrap(),
             )
@@ -3965,8 +3994,8 @@ async fn a_replace_restore_resumes_only_under_its_first_key() {
         "the old chain cleared"
     );
     assert!(
-        !recorded_validator(&client, &validator),
-        "nothing left records the validator key"
+        recorded_validator(&client, &validator).is_err(),
+        "partial restore cannot establish validator membership"
     );
 
     // Resumed under the validator key: refused, before anything is asked.
@@ -4090,13 +4119,19 @@ fn a_v4_validator_is_what_the_restored_state_records() {
         consensus::v4::epoch::committee_of(&client, 2).is_none(),
         "vacuous: epoch 2's own record is held"
     );
-    assert!(recorded_validator(&client, &later[0].address), "epoch 2");
     assert!(
-        recorded_validator(&client, &committee()[0].address),
+        recorded_validator(&client, &later[0].address).unwrap(),
+        "epoch 2"
+    );
+    assert!(
+        recorded_validator(&client, &committee()[0].address).unwrap(),
         "genesis"
     );
-    assert!(recorded_validator(&client, &proposer().1), "the active set");
-    assert!(!recorded_validator(&client, &outsider().1));
+    assert!(
+        recorded_validator(&client, &proposer().1).unwrap(),
+        "the active set"
+    );
+    assert!(!recorded_validator(&client, &outsider().1).unwrap());
 }
 
 /// B396 witness: a V4 checkpoint past epoch 0 that is no epoch boundary is

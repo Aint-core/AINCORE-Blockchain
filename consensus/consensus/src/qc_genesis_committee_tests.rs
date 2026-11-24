@@ -4,7 +4,8 @@ use super::*;
 fn epoch_zero_uses_frozen_genesis_before_and_after_rotation() {
     let dir = TestDir::new();
     dir.seed(false);
-    {
+    let ctx = ctx_for(10);
+    let original = {
         let db = dir.open();
         let initial = db.get("sys:validator_set:v1").unwrap().unwrap();
         let _seed = db.seeding();
@@ -19,21 +20,23 @@ fn epoch_zero_uses_frozen_genesis_before_and_after_rotation() {
             load_validator_set_for_epoch(&db, 0).unwrap(),
             serde_json::from_str::<Vec<ValidatorInfo>>(&initial).unwrap()
         );
-        assert!(matches!(
-            produce_and_store_qc(&db, &[7; 32], "local", &ctx_for(10)),
-            QcOutcome::Complete(_)
-        ));
+        let QcOutcome::Complete(cert) = produce_and_store_qc(&db, &[7; 32], "local", &ctx) else {
+            panic!("the genesis signer should certify the block while epoch zero is active");
+        };
         db.put("consensus:epoch", "1").unwrap();
         db.put("consensus:epoch_start_height:1", "21").unwrap();
-    }
+        db.put(crate::v4::epoch::EPOCH_ACTIVE_KEY, "1").unwrap();
+        cert
+    };
     let db = dir.open();
-    assert!(
-        matches!(
-            produce_and_store_qc(&db, &[7; 32], "local", &ctx_for(10)),
-            QcOutcome::Complete(_)
-        ),
-        "retained frozen genesis must permit identical historical replay"
-    );
+    let before = rows(&db);
+    assert_eq!(epoch_for_block_height(&db, ctx.block_height), Some(0));
+    let retained = load_validator_set_for_epoch(&db, 0).unwrap();
+    let cert = stored_qc(&db, ctx.block_height).unwrap();
+    assert_eq!(cert, original);
+    verify_qc(&cert, &retained, &ctx.chain_id).unwrap();
+    assert!(matches!(produce_and_store_qc(&db, &[7; 32], "local", &ctx), QcOutcome::Skipped));
+    assert_eq!(rows(&db), before);
     assert!(
         db.get("sys:validator_set:epoch:0").unwrap().is_none(),
         "lookup must not migrate metadata"

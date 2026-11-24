@@ -59,65 +59,37 @@ impl Wallet {
     }
 
     pub fn load_or_create(path: &Path) -> Result<Self> {
-        if path.exists() {
-            let bytes = fs::read(path).context("Failed to read keyfile")?;
+        let allow_plain = std::env::var("AINCORE_ALLOW_PLAINTEXT_WALLET")
+            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false);
+        Self::load_keyfile(path, allow_plain)
+    }
 
-            // Try to decode as hex string first (trim whitespace)
-            let key_bytes = if let Ok(s) = String::from_utf8(bytes.clone()) {
-                let s = s.trim();
-                if let Ok(decoded) = hex::decode(s) {
-                    decoded
-                } else {
-                    bytes
+    fn load_keyfile(path: &Path, allow_creation: bool) -> Result<Self> {
+        use std::io::ErrorKind;
+        let key = match crypto::key_file::read_ed25519(path) {
+            Ok(key) => key,
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                if !allow_creation {
+                    anyhow::bail!(
+                        "no key file at {} (plaintext keys are not made in secure mode): make an encrypted keystore with `aincore-cli keys generate` and sign with `--keystore <file>`, or set AINCORE_ALLOW_PLAINTEXT_WALLET=1 for local dev",
+                        path.display()
+                    );
                 }
-            } else {
-                bytes
-            };
-
-            let key_pair = SigningKey::from_bytes(
-                key_bytes
-                    .as_slice()
-                    .try_into()
-                    .context("Invalid key length")?,
-            );
-            Ok(Self {
-                key: Key::Ed25519(Box::new(key_pair)),
-            })
-        } else {
-            let allow_plain = std::env::var("AINCORE_ALLOW_PLAINTEXT_WALLET")
-                .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-                .unwrap_or(false);
-            if !allow_plain {
-                anyhow::bail!(
-                    "no key file at {} (plaintext keys are not made in secure mode): make an encrypted keystore with `aincore-cli keys generate` and sign with `--keystore <file>`, or set AINCORE_ALLOW_PLAINTEXT_WALLET=1 for local dev",
-                    path.display()
-                );
+                let candidate = Self::new();
+                let hex_key = hex::encode(candidate.ed25519_secret()?);
+                match crypto::key_file::publish_new(path, hex_key.as_bytes()) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+                    Err(e) => return Err(e).context("Failed to create keyfile"),
+                }
+                crypto::key_file::read_ed25519(path).context("Failed to read installed keyfile")?
             }
-            let wallet = Self::new();
-            // SECURITY (audit M-6): wallet.key holds the plaintext spending key — write
-            // it owner-only (0600), matching the node.key hardening; never leave the
-            // secret world-readable (default 0644).
-            #[cfg(unix)]
-            {
-                use std::io::Write as _;
-                use std::os::unix::fs::OpenOptionsExt;
-                let mut f = fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(0o600)
-                    .open(path)
-                    .context("Failed to create keyfile")?;
-                f.write_all(hex::encode(wallet.ed25519_secret()?).as_bytes())
-                    .context("Failed to write keyfile")?;
-            }
-            #[cfg(not(unix))]
-            {
-                fs::write(path, hex::encode(wallet.ed25519_secret()?))
-                    .context("Failed to write keyfile")?;
-            }
-            Ok(wallet)
-        }
+            Err(e) => return Err(e).context("Failed to read keyfile"),
+        };
+        Ok(Self {
+            key: Key::Ed25519(Box::new(key)),
+        })
     }
 
     fn public_key_bytes(&self) -> Vec<u8> {
@@ -141,5 +113,68 @@ impl Wallet {
             Key::Ed25519(k) => hex::encode(k.sign(message).to_bytes()),
             Key::MlDsa65(k) => hex::encode(k.sign(message)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Barrier;
+
+    #[test]
+    fn concurrent_plaintext_wallet_creators_use_the_same_key() {
+        let dir =
+            std::env::temp_dir().join(format!("aincore-wallet-{:032x}", rand::random::<u128>()));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("wallet.key");
+        let start = Barrier::new(2);
+        let initialize = || {
+            start.wait();
+            Wallet::load_keyfile(&path, true).unwrap().public_key()
+        };
+        let (a, b) = std::thread::scope(|scope| {
+            let first = scope.spawn(initialize);
+            let second = initialize();
+            (first.join().unwrap(), second)
+        });
+        assert_eq!(a, b);
+        assert_eq!(a, Wallet::load_keyfile(&path, false).unwrap().public_key());
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(text.len(), 64);
+        assert!(text.bytes().all(|b| b.is_ascii_hexdigit()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn existing_raw_and_hex_wallets_open_with_creation_disabled() {
+        let dir =
+            std::env::temp_dir().join(format!("aincore-formats-{:032x}", rand::random::<u128>()));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("wallet.key");
+        assert!(Wallet::load_keyfile(&path, false).is_err());
+        assert!(!path.exists());
+        let key = SigningKey::generate(&mut OsRng);
+        let public = hex::encode(key.verifying_key().as_bytes());
+        for content in [
+            key.to_bytes().to_vec(),
+            format!("  {}\n", hex::encode_upper(key.to_bytes())).into_bytes(),
+        ] {
+            crypto::key_file::publish_new(&path, &content).unwrap();
+            assert_eq!(
+                Wallet::load_keyfile(&path, false).unwrap().public_key(),
+                public
+            );
+            fs::remove_file(&path).unwrap();
+        }
+        fs::remove_dir(dir).unwrap();
     }
 }

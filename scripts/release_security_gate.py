@@ -3,6 +3,7 @@
 
 import argparse
 import datetime
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -10,22 +11,38 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "scripts/release_security_witnesses.json"
 PACKAGES = {
     "blockchain", "chain_sync", "consensus", "executor", "node", "state_commit", "storage",
-    "vm_move", "network",
+    "vm_move", "network", "mempool",
 }
 NAME = re.compile(r"[A-Za-z_][A-Za-z_0-9]*(?:::[A-Za-z_][A-Za-z_0-9]*)+")
 
 
-def run(command, timeout=1800):
+class GateInterrupted(BaseException):
+    def __init__(self, signum):
+        self.signum = signum
+        super().__init__(f"interrupted by signal {signum}")
+
+
+def stop_process_group(process):
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    return process.communicate()
+
+
+def run(command, timeout=1800, cwd=None):
     record = {"command": command, "timeout": False}
     try:
         process = subprocess.Popen(
-            command, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            command, cwd=ROOT if cwd is None else cwd,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, errors="replace", start_new_session=True,
             env={**os.environ, "CARGO_TERM_COLOR": "never"},
         )
@@ -33,16 +50,38 @@ def run(command, timeout=1800):
             stdout, stderr = process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             # Kill the cargo process group, including test/compiler children.
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            stdout, stderr = process.communicate()
+            stdout, stderr = stop_process_group(process)
             record["timeout"] = True
+        except BaseException:
+            # The child session must not survive a canceled gate.
+            stop_process_group(process)
+            raise
         record.update(returncode=process.returncode, stdout=stdout, stderr=stderr)
     except OSError as error:
         record.update(returncode=-1, stdout="", stderr=str(error))
     return record
+
+
+def atomic_report(path, report):
+    """Replace one snapshot only after flushing it; retain the old one on error."""
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=f".{path.name}.", delete=False) as output:
+            temporary = Path(output.name)
+            json.dump(report, output, indent=2)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+        descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def successful(record):
@@ -89,13 +128,25 @@ def one_pass(record, name):
             and f"test {name} ... ok" in record["stdout"].splitlines())
 
 
-def evaluate(manifest, execute=run, offline=False):
+def evaluate(manifest, execute=run, offline=False, checkpoint=None):
     validate_manifest(manifest)
-    report = {"manifest": manifest, "commands": [], "errors": [], "witnesses": []}
+    report = {"manifest": manifest, "commands": [], "errors": [], "witnesses": [],
+              "complete": False, "passed": False, "active_command": None,
+              "required_count": sum(len(p["required"]) for p in manifest["packages"].values())}
+
+    def publish():
+        if checkpoint is not None:
+            checkpoint(report)
+
+    publish()
 
     def capture(command):
+        report["active_command"] = command
+        publish()
         result = execute(command)
         report["commands"].append(result)
+        report["active_command"] = None
+        publish()
         return result
 
     # Unit tests and workspace feature unification can hide cfg(test) helpers
@@ -123,6 +174,7 @@ def evaluate(manifest, execute=run, offline=False):
                     report["errors"].append(f"{package}: {label}: {sorted(names)}")
         except ValueError as error:
             report["errors"].append(f"{package}: {error}")
+            publish()
             continue
         # Continue after a red witness so the report retains every blocker.
         for name in policy["required"]:
@@ -134,39 +186,99 @@ def evaluate(manifest, execute=run, offline=False):
             report["witnesses"].append({"package": package, "name": name, "passed": passed})
             if not passed:
                 report["errors"].append(f"{package}: witness did not pass exactly once: {name}")
+            publish()
+    if len(report["witnesses"]) != report["required_count"]:
+        report["errors"].append("Not all required witnesses completed")
+    report["complete"] = True
     report["passed"] = not report["errors"]
     return report
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--offline", action="store_true")
-    parser.add_argument("--report", type=Path, default=ROOT / "target/release-security-gate.json")
-    args = parser.parse_args()
+    parser.add_argument("--report", type=Path, help="New report path; never overwrite a prior run")
+    parser.add_argument("--source-root", type=Path, default=ROOT,
+                        help="Isolated candidate root; defaults to this script's checkout")
+    args = parser.parse_args(argv)
+    root = args.source_root.resolve()
+    manifest_path = root / "scripts/release_security_witnesses.json"
+    path = args.report or root / "target/release-security-gate.json"
     metadata = {
         "started_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "source_root": str(root),
+        "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "source_note": "HEAD alone does not identify a dirty worktree's compiled contents.",
-        "environment": [run(command, timeout=30) for command in (
+        "environment": [],
+    }
+    latest = {"passed": False, "complete": False, "errors": [], "commands": [],
+              "witnesses": [], "active_command": None}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with path.open("x") as output:
+            json.dump({**latest, **metadata}, output)
+            output.flush()
+            os.fsync(output.fileno())
+    except FileExistsError:
+        parser.error(f"Refusing to overwrite existing report: {path}")
+
+    def checkpoint(report):
+        nonlocal latest
+        latest = {**report, **metadata}
+        latest["updated_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        atomic_report(path, latest)
+        if report["active_command"] is not None:
+            print(f"Witnesses {len(report['witnesses'])}/{report['required_count']}: "
+                  + " ".join(report["active_command"]), flush=True)
+
+    def interrupt(signum, frame):
+        raise GateInterrupted(signum)
+
+    handlers = {s: signal.signal(s, interrupt) for s in
+                (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+    code = 1
+    try:
+        manifest_bytes = manifest_path.read_bytes()
+        metadata["manifest_sha256"] = hashlib.sha256(manifest_bytes).hexdigest()
+        metadata["environment"] = [run(command, timeout=30, cwd=root) for command in (
             ["rustc", "--version"], ["cargo", "--version"],
             ["git", "rev-parse", "HEAD"], ["git", "status", "--porcelain"],
-        )],
-    }
-    try:
-        report = evaluate(json.loads(MANIFEST.read_text()), offline=args.offline)
-    except (ValueError, OSError, TypeError) as error:
-        report = {"passed": False, "errors": [str(error)]}
-    if not all(successful(item) for item in metadata["environment"]):
-        report["passed"] = False
-        report["errors"].append("Could not collect complete source/toolchain metadata")
+        )]
+        if not all(successful(item) for item in metadata["environment"]):
+            raise ValueError("Could not collect complete source/toolchain metadata")
+        if metadata["environment"][-1]["stdout"].strip():
+            raise ValueError("Refusing a dirty candidate source tree")
+        report = evaluate(json.loads(manifest_bytes),
+                          execute=lambda command: run(command, cwd=root),
+                          offline=args.offline, checkpoint=checkpoint)
+        after = [run(command, timeout=30, cwd=root) for command in (
+            ["git", "rev-parse", "HEAD"], ["git", "status", "--porcelain"],
+        )]
+        metadata["source_after"] = after
+        if (not all(successful(item) for item in after)
+                or after[0]["stdout"] != metadata["environment"][-2]["stdout"]
+                or after[1]["stdout"].strip()
+                or manifest_path.read_bytes() != manifest_bytes):
+            report["errors"].append("Source changed during the gate; result is not attributable")
+            report["passed"] = False
+        code = 0 if report["passed"] else 1
+    except (ValueError, OSError, TypeError, GateInterrupted, KeyboardInterrupt) as error:
+        report = {**latest, "complete": False, "passed": False,
+                  "errors": [*latest["errors"], str(error) or "interrupted"]}
+        code = 128 + error.signum if isinstance(error, GateInterrupted) else 1
+        if isinstance(error, KeyboardInterrupt):
+            code = 130
+    finally:
+        for signum, handler in handlers.items():
+            signal.signal(signum, handler)
     report.update(metadata)
     report["finished_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    args.report.parent.mkdir(parents=True, exist_ok=True)
-    args.report.write_text(json.dumps(report, indent=2) + "\n")
+    atomic_report(path, report)
     print("Release witness gate: " + ("PASS" if report["passed"] else "FAIL"))
     for error in report["errors"]:
         print(error)
-    print(f"Report: {args.report}")
-    return 0 if report["passed"] else 1
+    print(f"Report: {path}")
+    return code
 
 
 if __name__ == "__main__":

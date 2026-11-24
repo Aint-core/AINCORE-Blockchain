@@ -1,0 +1,14 @@
+test_each_default_run_gets_a_fresh_build_directory (test_hardening_runner.RunnerTests.test_each_default_run_gets_a_fresh_build_directory) ... ok
+test_existing_report_and_artifacts_are_not_reused (test_hardening_runner.RunnerTests.test_existing_report_and_artifacts_are_not_reused) ... ok
+test_explicit_report_is_the_artifact_handoff (test_hardening_runner.RunnerTests.test_explicit_report_is_the_artifact_handoff) ... ok
+test_interruption_cannot_report_success (test_hardening_runner.RunnerTests.test_interruption_cannot_report_success) ... ok
+test_only_complete_run_reports_success (test_hardening_runner.RunnerTests.test_only_complete_run_reports_success) ... ok
+test_probe_failure_cannot_be_overridden_by_later_stages (test_hardening_runner.RunnerTests.test_probe_failure_cannot_be_overridden_by_later_stages) ... ok
+test_real_process_probe_receives_this_runs_binary (test_hardening_runner.RunnerTests.test_real_process_probe_receives_this_runs_binary) ... ok
+test_source_mutation_cannot_report_success (test_hardening_runner.RunnerTests.test_source_mutation_cannot_report_success) ... ok
+test_stage_failure_preserves_exit_code (test_hardening_runner.RunnerTests.test_stage_failure_preserves_exit_code) ... ok
+
+----------------------------------------------------------------------
+Ran 9 tests in 0.515s
+
+OK

@@ -18,6 +18,16 @@ function throws(what: string, f: () => unknown): void {
 async function main(): Promise<void> {
     const sender = Keypair.fromSeed(new Uint8Array(32).fill(7));
     const recipient = Keypair.fromSeed(new Uint8Array(32).fill(8));
+    const original = Keypair.generate();
+    const backup = Buffer.from(original.secretKey, 'hex');
+    const restored = Keypair.fromSecretKey(backup);
+    if (original.address !== restored.address || !original.verify(backup, restored.sign(backup))) {
+        throw new Error('valid backup failed round trip');
+    }
+    backup[backup.length - 1] ^= 1;
+    throws('inconsistent backup public key', () => Keypair.fromSecretKey(backup));
+    const mismatched = { publicKey: Buffer.from(recipient.publicKey, 'hex'), secretKey: Buffer.from(original.secretKey, 'hex') };
+    throws('inconsistent imported public key', () => new Keypair(mismatched));
     // B129: a typo in an address, a negative amount, an amount past u128.
     const typo = recipient.address.slice(0, 63) + 'g';
     throws('a non-hex address', () => Transaction.createTransfer(sender, typo, 1n));
@@ -53,6 +63,9 @@ async function main(): Promise<void> {
 
     // B123: pending and aborted are not confirmed; success in a block is.
     const connection = new Connection('http://127.0.0.1:1');
+    if ((connection as any).client.defaults.maxContentLength !== 32 * 1024 * 1024) {
+        throw new Error('RPC response size limit is missing');
+    }
     let answer: any = { tx_hash: 'h', status: 'pending', confirmations: 0 };
     (connection as any).request = async (method: string) => {
         if (method === 'aincore_getTransactionReceipt') return answer;
@@ -105,7 +118,8 @@ async function main(): Promise<void> {
     // a guessed object with chain id 'AINCORE-MAINNET-1' instead.
     const get = axios.get;
     let reply: any = { network: 'AINCORE-TESTNET-V9', node_id: null, latest_block: 12, current_round: null, peer_count: 3, committee_sessions: 2, tps: 0.5, protocol_version: 1 };
-    (axios as any).get = async (url: string) => {
+    (axios as any).get = async (url: string, config: { maxContentLength?: number }) => {
+        if (config.maxContentLength !== 32 * 1024 * 1024) throw new Error('REST response size limit is missing');
         if (!url.endsWith('/get_network_info')) throw new Error(`unexpected GET ${url}`);
         return { status: 200, data: reply };
     };

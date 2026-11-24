@@ -29,6 +29,66 @@ Never fault-inject against the user's live nodes.
 
 ## Ordered release gates
 
+Current execution plan and evidence ledger (2026-10-22):
+[MAINNET_LAUNCH_PLAN.md](MAINNET_LAUNCH_PLAN.md). It implements G0-G7 below;
+historical findings and the initial-state table are not a current bug count.
+
+### Closure policy, 2026-10-21
+
+G0-G7 below remain the release contract, not a continuously expanding feature
+list. Freeze the proposed launch features before the release candidate; new
+features, cosmetic work, and optional optimizations do not reopen launch scope.
+A newly reproduced launch-scope safety, liveness, funds, recovery, or resource
+exhaustion defect does reopen its affected gate. Never relabel a failed witness
+as optional merely to release. Date-based soak alone is not clearance.
+
+Shutdown closure item (updated 2026-10-22): the Pi lab's process-shutdown SIGABRT. A
+candidate API-thread join passed the previous 61 node tests, but a new real
+HTTP shutdown regression exposed a deadlock in that candidate: awaiting the
+Actix stop acknowledgement without polling the Server. The candidate now polls
+both concurrently. Commit `7b1ae83` passed 62 node tests, both architecture
+builds, five ARM64 process shutdown/replay cycles, and the four-validator
+quorum-loss/heal test. The complete release regression on that commit later
+passed on NAS, including 131 mandatory witnesses. A subsequent exit-code fix
+at `1943b4e` passed native/ARM process tests and finite lab checks; the full
+`e1a8799` candidate gate is still running. See the current launch ledger rather
+than treating the older result as clearance for every later revision.
+This is a code lifecycle defect; it is not evidence of insufficient Pi RAM.
+Detailed reproduction and logs: `TWO_HOST_LAB_AUDIT_20261020.md`.
+
+The targeted closure evidence uses the actual candidate binaries: normal process exits,
+unchanged identity/genesis, valid retained certificates/receipts, rejected replay
+without a second balance/nonce effect, and the four-validator quorum-loss/heal
+gate. Keep unsuccessful reports. Run the existing full release gate on the
+same candidate revision, with no skipped required witnesses. Five clean shutdown
+cycles are a bounded regression criterion, not a universal no-crash proof.
+
+Mainnet still requires G7: review independent of the implementation agent,
+resolved critical/high findings, measured operator/failure-domain separation,
+restoration and upgrade evidence, published limits and explicit launch approval.
+Four processes on two machines at one site are a lab, not four independent
+operators. Completing these requirements enables a launch decision; speculative
+future features do not need to be added before that decision.
+
+Research-to-code discipline:
+
+- [NIST SSDF 1.1](https://csrc.nist.gov/pubs/sp/800/218/final): reduce and address
+  vulnerabilities and their root causes; not a promise of zero vulnerabilities.
+- [Rust thread ownership](https://doc.rust-lang.org/std/thread/fn.spawn.html):
+  dropping a JoinHandle detaches its thread. The reproduced shutdown fix retains
+  and joins the API thread before process teardown.
+- [RocksDB upstream reproduction](https://github.com/facebook/rocksdb/issues/11349):
+  a matching detached-thread/DB destructor failure, supporting but not replacing
+  our own captured backtrace and regression.
+- [Bullshark](https://arxiv.org/abs/2201.05677): a consensus-design reference.
+  Its proof and performance numbers do not transfer to AINCORE without mapping
+  the actual implementation and fault model to its assumptions.
+
+For each new defect, preserve the minimal failing witness, identify the actual
+cause, apply a scoped repair, rerun the witness and affected regressions, and
+record source/artifact identity. Do not replace this loop with paper citations
+or repeated broad audits that discard previous evidence.
+
 | Gate | Required evidence | Initial state |
 |---|---|---|
 | G0: Reference and block identity | Forged parent author/round cannot reach an orderable DAG; block identity binds all consensus fields; gossip, fetch, and recovery agree | Parent proof enforcement implemented locally; signed block substitution reproduced through sync persistence, canonical version/activation contract still open |

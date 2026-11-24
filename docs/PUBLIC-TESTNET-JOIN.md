@@ -1,8 +1,6 @@
 # AINCORE Testnet — Join as an Observer (copy‑paste guide)
 
-This gets a brand‑new machine syncing the AINCORE testnet as an **observer** (it
-never mines; its address is never in the validator set). Follow it top to
-bottom — every command is paste‑ready.
+This guide is for the **observer network `AINCORE-LATEST-FRESH-1`** and its network-specific join bundle. The chain ID, snapshot, digests and seed address below belong to that network. Operators joining the upcoming validator testnet need its announced genesis hash, chain ID, signed release and validator entry instructions. The current runtime archive ships the node and Move bytecode. Obtain the network’s genesis separately. [Runtime package and verification](RELEASE_PACKAGE.md)
 
 There are two supported paths:
 

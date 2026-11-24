@@ -1,0 +1,59 @@
+{
+  "passed": false,
+  "stage": "complete",
+  "chain_id": "AINCORE-LAB-646F5C8B4FEBB6A2",
+  "binary_sha256": "3a777d89c2f0f289a6f1097ff6180dfa03c1b53f05eefd22f89a9c09537163c3",
+  "genesis_sha256": "fb8479b39650654f608b6b159821764e9de31d9da7a1340afddfd26282cde61d",
+  "scope": "fresh isolated observer process exits; not validator recovery",
+  "cases": [
+    {
+      "scenario": "p2p_busy",
+      "passed": false,
+      "log": "/home/alpha/aincore-launch-20261022/exit-baseline/p2p_busy.log",
+      "command": [
+        "/home/alpha/aincore-shutdown-fix-20261021/bin/node-x86_64",
+        "--port",
+        "43559",
+        "--rpc-port",
+        "55725",
+        "--datadir",
+        "/home/alpha/aincore-launch-20261022/exit-baseline/p2p_busy"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 0.966
+    },
+    {
+      "scenario": "clean_shutdown",
+      "passed": true,
+      "log": "/home/alpha/aincore-launch-20261022/exit-baseline/clean_shutdown.log",
+      "command": [
+        "/home/alpha/aincore-shutdown-fix-20261021/bin/node-x86_64",
+        "--port",
+        "59389",
+        "--rpc-port",
+        "47391",
+        "--datadir",
+        "/home/alpha/aincore-launch-20261022/exit-baseline/clean_shutdown"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 4.535
+    },
+    {
+      "scenario": "flush_denied",
+      "passed": false,
+      "log": "/home/alpha/aincore-launch-20261022/exit-baseline/flush_denied.log",
+      "command": [
+        "/home/alpha/aincore-shutdown-fix-20261021/bin/node-x86_64",
+        "--port",
+        "52505",
+        "--rpc-port",
+        "54349",
+        "--datadir",
+        "/home/alpha/aincore-launch-20261022/exit-baseline/flush_denied"
+      ],
+      "injected_fault": "own fresh database directory mode 0500",
+      "exit_code": 0,
+      "elapsed_seconds": 4.361
+    }
+  ]
+}

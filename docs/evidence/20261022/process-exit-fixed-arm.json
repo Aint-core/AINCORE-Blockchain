@@ -1,0 +1,59 @@
+{
+  "passed": true,
+  "stage": "complete",
+  "chain_id": "AINCORE-LAB-646F5C8B4FEBB6A2",
+  "binary_sha256": "6882bbd71cc21c8db20c8fdb3825d6e81d335025bf5e46e4495d80778bf890b4",
+  "genesis_sha256": "fb8479b39650654f608b6b159821764e9de31d9da7a1340afddfd26282cde61d",
+  "scope": "fresh isolated observer process exits; not validator recovery",
+  "cases": [
+    {
+      "scenario": "p2p_busy",
+      "passed": true,
+      "log": "/home/pi/aincore-exit-probe-20261022/results/p2p_busy.log",
+      "command": [
+        "/home/pi/aincore-exit-probe-20261022/node",
+        "--port",
+        "46657",
+        "--rpc-port",
+        "51723",
+        "--datadir",
+        "/home/pi/aincore-exit-probe-20261022/results/p2p_busy"
+      ],
+      "exit_code": 1,
+      "elapsed_seconds": 0.115
+    },
+    {
+      "scenario": "clean_shutdown",
+      "passed": true,
+      "log": "/home/pi/aincore-exit-probe-20261022/results/clean_shutdown.log",
+      "command": [
+        "/home/pi/aincore-exit-probe-20261022/node",
+        "--port",
+        "34351",
+        "--rpc-port",
+        "57737",
+        "--datadir",
+        "/home/pi/aincore-exit-probe-20261022/results/clean_shutdown"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 3.211
+    },
+    {
+      "scenario": "flush_denied",
+      "passed": true,
+      "log": "/home/pi/aincore-exit-probe-20261022/results/flush_denied.log",
+      "command": [
+        "/home/pi/aincore-exit-probe-20261022/node",
+        "--port",
+        "39667",
+        "--rpc-port",
+        "33789",
+        "--datadir",
+        "/home/pi/aincore-exit-probe-20261022/results/flush_denied"
+      ],
+      "injected_fault": "own fresh database directory mode 0500",
+      "exit_code": 1,
+      "elapsed_seconds": 3.205
+    }
+  ]
+}

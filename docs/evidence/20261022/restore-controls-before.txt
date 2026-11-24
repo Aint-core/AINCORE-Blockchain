@@ -1,0 +1,111 @@
+test_ambiguous_archive_does_not_pick_first_db (test_restore_safety.RestoreSafetyTests.test_ambiguous_archive_does_not_pick_first_db) ... FAIL
+test_destination_symlink_refused (test_restore_safety.RestoreSafetyTests.test_destination_symlink_refused) ... FAIL
+test_empty_existing_destination_not_nested (test_restore_safety.RestoreSafetyTests.test_empty_existing_destination_not_nested) ... ERROR
+test_force_retains_old_db_when_archive_valid (test_restore_safety.RestoreSafetyTests.test_force_retains_old_db_when_archive_valid) ... ok
+test_invalid_archive_with_valid_hash_does_not_move_old_db (test_restore_safety.RestoreSafetyTests.test_invalid_archive_with_valid_hash_does_not_move_old_db) ... ERROR
+test_missing_db_in_archive_does_not_move_old_db (test_restore_safety.RestoreSafetyTests.test_missing_db_in_archive_does_not_move_old_db) ... ERROR
+
+======================================================================
+ERROR: test_empty_existing_destination_not_nested (test_restore_safety.RestoreSafetyTests.test_empty_existing_destination_not_nested)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/pi/aincore-backup-safety-20261022/scripts/tests/test_restore_safety.py", line 63, in test_empty_existing_destination_not_nested
+    self.assertEqual((self.db / "CURRENT").read_text(), "restored-9002")
+                     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/usr/lib/python3.13/pathlib/_local.py", line 548, in read_text
+    return PathBase.read_text(self, encoding, errors, newline)
+           ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/pathlib/_abc.py", line 632, in read_text
+    with self.open(mode='r', encoding=encoding, errors=errors, newline=newline) as f:
+         ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/pathlib/_local.py", line 539, in open
+    return io.open(self, mode, buffering, encoding, errors, newline)
+           ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: '/tmp/tmpqblexu4k/destination/validator_9001.db/CURRENT'
+
+======================================================================
+ERROR: test_invalid_archive_with_valid_hash_does_not_move_old_db (test_restore_safety.RestoreSafetyTests.test_invalid_archive_with_valid_hash_does_not_move_old_db)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/pi/aincore-backup-safety-20261022/scripts/tests/test_restore_safety.py", line 47, in test_invalid_archive_with_valid_hash_does_not_move_old_db
+    self.assert_original_untouched(self.restore("--force"))
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/pi/aincore-backup-safety-20261022/scripts/tests/test_restore_safety.py", line 41, in assert_original_untouched
+    self.assertEqual((self.db / "CURRENT").read_text(), "original")
+                     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/usr/lib/python3.13/pathlib/_local.py", line 548, in read_text
+    return PathBase.read_text(self, encoding, errors, newline)
+           ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/pathlib/_abc.py", line 632, in read_text
+    with self.open(mode='r', encoding=encoding, errors=errors, newline=newline) as f:
+         ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/pathlib/_local.py", line 539, in open
+    return io.open(self, mode, buffering, encoding, errors, newline)
+           ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: '/tmp/tmpcwp345cc/destination/validator_9001.db/CURRENT'
+
+======================================================================
+ERROR: test_missing_db_in_archive_does_not_move_old_db (test_restore_safety.RestoreSafetyTests.test_missing_db_in_archive_does_not_move_old_db)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/pi/aincore-backup-safety-20261022/scripts/tests/test_restore_safety.py", line 52, in test_missing_db_in_archive_does_not_move_old_db
+    self.assert_original_untouched(self.restore("--force"))
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/pi/aincore-backup-safety-20261022/scripts/tests/test_restore_safety.py", line 41, in assert_original_untouched
+    self.assertEqual((self.db / "CURRENT").read_text(), "original")
+                     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/usr/lib/python3.13/pathlib/_local.py", line 548, in read_text
+    return PathBase.read_text(self, encoding, errors, newline)
+           ~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/pathlib/_abc.py", line 632, in read_text
+    with self.open(mode='r', encoding=encoding, errors=errors, newline=newline) as f:
+         ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/pathlib/_local.py", line 539, in open
+    return io.open(self, mode, buffering, encoding, errors, newline)
+           ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: '/tmp/tmp0dh28b_2/destination/validator_9001.db/CURRENT'
+
+======================================================================
+FAIL: test_ambiguous_archive_does_not_pick_first_db (test_restore_safety.RestoreSafetyTests.test_ambiguous_archive_does_not_pick_first_db)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/pi/aincore-backup-safety-20261022/scripts/tests/test_restore_safety.py", line 57, in test_ambiguous_archive_does_not_pick_first_db
+    self.assert_original_untouched(self.restore("--force"))
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/pi/aincore-backup-safety-20261022/scripts/tests/test_restore_safety.py", line 40, in assert_original_untouched
+    self.assertNotEqual(result.returncode, 0, result.stdout)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 == 0 : 🔒 sha256 verified: 21e9f8fdf1834da1bcc75e4f6b7309de9dc53de70d8030bc72722aceb4fc8ffc
+==> --force: moving existing DB aside -> /tmp/tmpi3uw8_78/destination/validator_9001.db.pre-restore.20261022T123640Z
+==> Extracting backup into staging...
+==> Installing chain DB -> /tmp/tmpi3uw8_78/destination/validator_9001.db
+==> NOT restoring node.key: the node generates a fresh keypair on boot.
+
+✅ Restore complete into: /tmp/tmpi3uw8_78/destination
+   chain DB: /tmp/tmpi3uw8_78/destination/validator_9001.db
+   identity: NEW (fresh keypair on boot); see /tmp/tmpi3uw8_78/destination/RESTORED_FROM_BACKUP
+   Start the node pointed at this datadir + --port 9001.
+
+
+======================================================================
+FAIL: test_destination_symlink_refused (test_restore_safety.RestoreSafetyTests.test_destination_symlink_refused)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/pi/aincore-backup-safety-20261022/scripts/tests/test_restore_safety.py", line 83, in test_destination_symlink_refused
+    self.assertNotEqual(result.returncode, 0, result.stdout)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 == 0 : 🔒 sha256 verified: 8e696d144ff3728955960882d64e7e9050ec9cb5cd62cb1c4a4b2de602746c47
+==> Extracting backup into staging...
+==> Installing chain DB -> /tmp/tmpv4ya5tcf/destination/validator_9001.db
+==> NOT restoring node.key: the node generates a fresh keypair on boot.
+
+✅ Restore complete into: /tmp/tmpv4ya5tcf/destination
+   chain DB: /tmp/tmpv4ya5tcf/destination/validator_9001.db
+   identity: NEW (fresh keypair on boot); see /tmp/tmpv4ya5tcf/destination/RESTORED_FROM_BACKUP
+   Start the node pointed at this datadir + --port 9001.
+
+
+----------------------------------------------------------------------
+Ran 6 tests in 0.348s
+
+FAILED (failures=2, errors=3)

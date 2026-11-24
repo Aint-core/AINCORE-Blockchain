@@ -790,11 +790,36 @@ pub fn clock_cap_from_intervals(intervals: &[u64]) -> Option<u64> {
     if total == 0 {
         return None;
     }
-    let max = *intervals.iter().max()?;
-    (1..=max).find(|&c| {
-        let lost: u128 = intervals.iter().map(|&x| x.saturating_sub(c) as u128).sum();
-        lost * 10_000 <= total * CLOCK_LOSS_BUDGET_BPS as u128
-    })
+    let bps = u128::from(CLOCK_LOSS_BUDGET_BPS);
+    let max_loss = (total / 10_000) * bps + (total % 10_000) * bps / 10_000;
+    let mut low = 1;
+    let mut high = *intervals.iter().max()?;
+    while low < high {
+        let middle = low + (high - low) / 2;
+        let lost: u128 = intervals
+            .iter()
+            .map(|&x| u128::from(x.saturating_sub(middle)))
+            .sum();
+        if lost <= max_loss {
+            high = middle;
+        } else {
+            low = middle + 1;
+        }
+    }
+    Some(low)
+}
+
+/// Whole-second caps allowed for the measured block time (G5 P-1).
+pub fn clock_cap_bounds(block_time_ms: u64) -> Result<(u64, u64), GenesisError> {
+    if !(1_000..=7_200).contains(&block_time_ms) {
+        return Err(GenesisError::InvalidData(format!(
+            "block_time_ms {block_time_ms} is outside [1000, 7200], where I = 1,000 holds"
+        )));
+    }
+    Ok((
+        (2 * block_time_ms).div_ceil(1_000),
+        (4 * block_time_ms).div_ceil(1_000),
+    ))
 }
 
 /// G5 P-1 from the release candidate's measurements: I = 1,000 and R = 20
@@ -811,15 +836,7 @@ pub fn derive_chain_params(
     // I = 1,000 keeps the boundary overhead at or below 1 % and the epoch at
     // or below 2 h only for t_b in [1.0 s, 7.2 s] (P-1's table); outside it
     // the table no longer derives I.
-    if !(1_000..=7_200).contains(&block_time_ms) {
-        return Err(GenesisError::InvalidData(format!(
-            "block_time_ms {block_time_ms} is outside [1000, 7200], where I = 1,000 holds"
-        )));
-    }
-    let (low, high) = (
-        (2 * block_time_ms).div_ceil(1_000),
-        (4 * block_time_ms).div_ceil(1_000),
-    );
+    let (low, high) = clock_cap_bounds(block_time_ms)?;
     if !(low..=high).contains(&clock_cap_secs) {
         return Err(GenesisError::InvalidData(format!(
             "clock cap {clock_cap_secs} s is outside [{low}, {high}] s, 2 to 4 times the \
@@ -4200,6 +4217,10 @@ mod tests {
         intervals.extend([30u64; 10]);
         assert_eq!(clock_cap_from_intervals(&intervals), Some(27));
         assert_eq!(clock_cap_from_intervals(&[6; 100]), Some(6));
+        assert_eq!(
+            clock_cap_from_intervals(&[u64::MAX]),
+            Some(u64::MAX - u64::MAX / 200)
+        );
         assert_eq!(clock_cap_from_intervals(&[]), None);
         assert_eq!(clock_cap_from_intervals(&[0, 0]), None);
     }

@@ -36,10 +36,11 @@ pub(crate) fn build_transport(
     let (relay_transport, relay_behaviour) = relay::client::new(local_peer_id);
     let tcp = || tcp::tokio::Transport::new(tcp::Config::default());
     let tcp_with_dns = libp2p::dns::tokio::Transport::system(tcp()).unwrap_or_else(|e| {
-        eprintln!("⚠️ No system DNS configuration ({e}): host names use the default resolver");
+        eprintln!("⚠️ No system DNS configuration ({e}): host names use Google Public DNS");
         libp2p::dns::tokio::Transport::custom(
             tcp(),
-            libp2p::dns::ResolverConfig::default(),
+            // Preserve Hickory 0.24's fallback. In 0.26, default() has no servers.
+            libp2p::dns::ResolverConfig::udp_and_tcp(&hickory_resolver::config::GOOGLE),
             libp2p::dns::ResolverOpts::default(),
         )
     });
@@ -107,6 +108,7 @@ pub async fn start_p2p(
 ) -> Result<(mpsc::Sender<Outbound>, mpsc::Receiver<(String, String)>), Box<dyn Error>> {
     let SessionWiring {
         book,
+        startup_ready,
         table: session_table,
         asks: mut sync_asks,
         dials: mut sync_dials,
@@ -221,7 +223,7 @@ pub async fn start_p2p(
     let behaviour = P2PBehaviour {
         addresses,
         identify,
-        consensus: sessions::MembersOnly::new(Arc::clone(&book)),
+        consensus: sessions::MembersOnly::new(Arc::clone(&book), local_peer_id),
         sync: sessions::sync_behaviour(),
         dcutr: Toggle::from(dcutr_behaviour),
         relay: Toggle::from(relay_behaviour),
@@ -240,25 +242,6 @@ pub async fn start_p2p(
         libp2p::swarm::Config::with_tokio_executor()
             .with_idle_connection_timeout(Duration::from_secs(20)),
     );
-
-    // B22: bootnodes given without a PeerId are dialled again until reached.
-    let mut unresolved = sessions::Unresolved::new(&bootnodes, std::time::Instant::now());
-    // Add bootnodes
-    for peer_addr in bootnodes {
-        if let Ok(multiaddr) = peer_addr.parse::<Multiaddr>() {
-            println!("🔗 Adding bootnode: {:?}", multiaddr);
-            if let Some(Protocol::P2p(peer_id)) = multiaddr.iter().last() {
-                swarm
-                    .behaviour_mut()
-                    .addresses
-                    .pin_address(&peer_id, multiaddr.clone());
-            }
-            // Force dial
-            if let Err(e) = swarm.dial(multiaddr) {
-                eprintln!("❌ Failed to dial bootnode: {:?}", e);
-            }
-        }
-    }
 
     // === Listen on the libp2p port: base port + 100 (the operators' bootnode convention) ===
     //
@@ -283,6 +266,28 @@ pub async fn start_p2p(
 
     // === Event Loop ===
     tokio::spawn(async move {
+        // Binding above still reports occupied ports synchronously. Do not
+        // select member handlers from the empty, pre-validation boot book.
+        if let Some(ready) = startup_ready {
+            if ready.await.is_err() {
+                eprintln!("[P2P] startup cancelled before sessions were enabled");
+                return;
+            }
+        }
+        // B22: bootnodes without a PeerId are retried until reached. Start
+        // their deadlines only once the network is allowed to run.
+        let mut unresolved = sessions::Unresolved::new(&bootnodes, std::time::Instant::now());
+        for peer_addr in bootnodes {
+            if let Ok(multiaddr) = peer_addr.parse::<Multiaddr>() {
+                println!("🔗 Adding bootnode: {:?}", multiaddr);
+                if let Some(Protocol::P2p(peer_id)) = multiaddr.iter().last() {
+                    swarm.behaviour_mut().addresses.pin_address(&peer_id, multiaddr.clone());
+                }
+                if let Err(e) = swarm.dial(multiaddr) {
+                    eprintln!("❌ Failed to dial bootnode: {:?}", e);
+                }
+            }
+        }
         // The non-member identities each host holds inbound connections
         // for, with each identity's connection count (B67).
         let mut inbound_peers_by_host: std::collections::HashMap<
@@ -389,7 +394,7 @@ pub async fn start_p2p(
                             let wire: Arc<str> = Arc::from(wire);
                             for peer in members(&book) {
                                 if swarm.is_connected(&peer) {
-                                    swarm.behaviour_mut().consensus.send_request(&peer, Arc::clone(&wire));
+                                    swarm.behaviour_mut().consensus.push(&peer, Arc::clone(&wire));
                                 }
                             }
                         }
@@ -405,7 +410,7 @@ pub async fn start_p2p(
                             let wire: Arc<str> = Arc::from(wire);
                             for peer in members(&book) {
                                 if swarm.is_connected(&peer) {
-                                    swarm.behaviour_mut().consensus.send_request(&peer, Arc::clone(&wire));
+                                    swarm.behaviour_mut().consensus.push(&peer, Arc::clone(&wire));
                                 }
                             }
                         }
@@ -416,7 +421,7 @@ pub async fn start_p2p(
                     Outbound::To { address, wire } => {
                         let peer = book.read().ok().and_then(|b| b.peer_of(&address));
                         if let Some(peer) = peer.filter(|p| *p != local_peer_id) {
-                            swarm.behaviour_mut().consensus.send_request(&peer, Arc::from(wire));
+                            swarm.behaviour_mut().consensus.push(&peer, Arc::from(wire));
                         }
                     }
                 },
@@ -553,6 +558,7 @@ pub async fn start_p2p(
                     SwarmEvent::Behaviour(P2PBehaviourEvent::Consensus(request_response::Event::Message {
                         peer,
                         message: request_response::Message::Request { request, channel, .. },
+                        ..
                     })) => {
                         // NI-1: only a session whose key names a member is heard;
                         // anyone else's channel is dropped (it sees a failure).
@@ -596,6 +602,7 @@ pub async fn start_p2p(
                     SwarmEvent::Behaviour(P2PBehaviourEvent::Sync(request_response::Event::Message {
                         peer,
                         message: request_response::Message::Request { request_id, request, channel },
+                        ..
                     })) => {
                         let member = book
                             .read()
@@ -990,22 +997,135 @@ pub async fn start_p2p(
 mod transport_tests {
     use libp2p::Transport;
 
-    /// B130 witness: the transport takes a `/dns4/...` address (a bootnode
-    /// named by host); the bare TCP transport refused it at once
-    /// (`MultiaddrNotSupported`). The dial is not awaited: nothing is sent.
+    fn member_book() -> super::PeerBook {
+        let members: Vec<_> = [31, 32].into_iter().map(|seed| {
+            let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+            let public = key.verifying_key().to_bytes();
+            blockchain::committee::ValidatorInfo {
+                address: crypto::derive_address(&public).unwrap(),
+                stake: 100,
+                ed25519_public_key: hex::encode(public),
+                bls_public_key: String::new(),
+                bls_pop: String::new(),
+            }
+        }).collect();
+        super::PeerBook::new(0, &[&members])
+    }
+
+    fn free_base_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port().checked_sub(100).unwrap()
+    }
+
+    fn startup_db(name: &str) -> super::Arc<storage::StateDB> {
+        super::Arc::new(storage::StateDB::open(&storage::test_dir::test_dir_str(name)).unwrap())
+    }
+
+    async fn connected(a: &network::SessionClient, b: &network::SessionClient) {
+        tokio::time::timeout(super::Duration::from_secs(10), async {
+            while a.sessions().is_empty() || b.sessions().is_empty() {
+                tokio::time::sleep(super::Duration::from_millis(20)).await;
+            }
+        }).await.expect("sessions did not open");
+    }
+
+    #[tokio::test]
+    async fn startup_gate_waits_for_committee_before_opening_sessions() {
+        use super::{sessions, Arc, Duration, RwLock};
+        let a_book = Arc::new(RwLock::new(member_book()));
+        let b_book = Arc::new(RwLock::new(super::PeerBook::default()));
+        let (a_wiring, a_client, _a_serves) = sessions::SessionWiring::new(a_book);
+        let (mut b_wiring, b_client, _b_serves) = sessions::SessionWiring::new(Arc::clone(&b_book));
+        let (ready, wait) = tokio::sync::oneshot::channel();
+        b_wiring.startup_ready = Some(wait);
+        let b_port = free_base_port();
+        let (_b_tx, mut b_rx) = super::start_p2p(b_port, vec![],
+            startup_db("startup_b"), false, false, [32; 32], b_wiring)
+            .await.unwrap();
+        let (a_tx, _a_rx) = super::start_p2p(free_base_port(),
+            vec![format!("/ip4/127.0.0.1/tcp/{}", b_port + 100)],
+            startup_db("startup_a"), false, false, [31; 32], a_wiring)
+            .await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(a_client.sessions().is_empty() && b_client.sessions().is_empty(),
+            "a connection opened while its committee book was still empty");
+        *b_book.write().unwrap() = member_book();
+        ready.send(()).expect("network dropped the startup gate");
+        connected(&a_client, &b_client).await;
+        assert!(b_client.sessions().iter().all(|peer| peer.member.is_some()));
+        // Transport witness only: the node's consensus verifier is not running.
+        let wire = format!("{}startup-witness", consensus::v4::WIRE_PREFIX);
+        a_tx.send(network::Outbound::Broadcast(wire.clone())).await.unwrap();
+        let (_, received) = tokio::time::timeout(Duration::from_secs(2), b_rx.recv())
+            .await.expect("first push needed a handler reconnect").unwrap();
+        assert_eq!(received, wire);
+    }
+
+    #[tokio::test]
+    async fn startup_gate_cancellation_closes_network() {
+        use super::{sessions, Arc, Duration, RwLock};
+        let (mut wiring, client, _serves) = sessions::SessionWiring::new(
+            Arc::new(RwLock::new(super::PeerBook::default())));
+        let (ready, wait) = tokio::sync::oneshot::channel();
+        wiring.startup_ready = Some(wait);
+        let (tx, mut rx) = super::start_p2p(free_base_port(), vec![],
+            startup_db("startup_cancel"), false, false, [32; 32], wiring)
+            .await.unwrap();
+        drop(ready);
+        tokio::time::timeout(Duration::from_secs(2), tx.closed())
+            .await.expect("cancelled startup left the network task running");
+        assert!(rx.recv().await.is_none());
+        assert!(client.sessions().is_empty());
+    }
+
+    #[tokio::test]
+    async fn startup_gate_sync_bootstrap_without_committee_still_works() {
+        use super::{sessions, Arc, Duration, RwLock};
+        let (a_wiring, a_client, mut serves) = sessions::SessionWiring::new(
+            Arc::new(RwLock::new(member_book())));
+        let (b_wiring, b_client, _b_serves) = sessions::SessionWiring::new(
+            Arc::new(RwLock::new(super::PeerBook::default())));
+        let a_port = free_base_port();
+        let (_a_tx, _a_rx) = super::start_p2p(a_port, vec![],
+            startup_db("startup_sync_a"), false, false, [31; 32], a_wiring)
+            .await.unwrap();
+        let (_b_tx, _b_rx) = super::start_p2p(free_base_port(),
+            vec![format!("/ip4/127.0.0.1/tcp/{}", a_port + 100)],
+            startup_db("startup_sync_b"), false, false, [32; 32], b_wiring)
+            .await.unwrap();
+        connected(&a_client, &b_client).await;
+        let peer = sessions::local_keypair(&[31; 32]).public().to_peer_id().to_string();
+        let wire = format!("{}1", consensus::dag::QC_WANT_PREFIX);
+        let ask = b_client.ask(&peer, &wire, Duration::from_secs(3));
+        let answer = async {
+            let request = serves.recv().await.unwrap();
+            assert_eq!(request.wire, wire);
+            request.reply.send(Some("bootstrap-transport-witness".to_string())).unwrap();
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(4), async {
+            tokio::join!(ask, answer)
+        }).await.unwrap();
+        assert_eq!(result.unwrap(), "bootstrap-transport-witness");
+    }
+
+    /// The transport must accept every supported DNS multiaddr. Drop each
+    /// unpolled dial so the test never queries DNS or connects to a peer.
     #[tokio::test]
     async fn a_peer_named_by_host_can_be_dialled() {
         let key = libp2p::identity::Keypair::generate_ed25519();
         let (mut transport, _relay) =
             super::build_transport(&key, libp2p::PeerId::from(key.public())).unwrap();
-        let addr: libp2p::Multiaddr = "/dns4/localhost/tcp/9".parse().unwrap();
-        let opts = libp2p::core::transport::DialOpts {
-            role: libp2p::core::Endpoint::Dialer,
-            port_use: libp2p::core::transport::PortUse::New,
-        };
-        assert!(
-            transport.dial(addr, opts).is_ok(),
-            "a /dns4 address is not supported"
-        );
+        for address in [
+            "/dns/localhost/tcp/9",
+            "/dns4/localhost/tcp/9",
+            "/dns6/localhost/tcp/9",
+            "/dnsaddr/localhost",
+        ] {
+            let opts = libp2p::core::transport::DialOpts {
+                role: libp2p::core::Endpoint::Dialer,
+                port_use: libp2p::core::transport::PortUse::New,
+            };
+            assert!(transport.dial(address.parse().unwrap(), opts).is_ok(), "{address}");
+        }
     }
 }

@@ -137,7 +137,8 @@ restart_node() {
     assert_rpc_ok "$rpc_port" "node-$index-after-restart"
 }
 
-echo "== AINCORE Phase 2 Soak Gate =="
+echo "== Historical Phase 2 RPC smoke (NOT a mainnet/consensus acceptance gate) =="
+echo "This script does not prove advancing certified state or transaction execution."
 echo "duration=${SOAK_SECONDS}s nodes=${NODE_COUNT} run_dir=$RUN_DIR"
 
 if [ "$SKIP_PREFLIGHT" != "1" ]; then
@@ -179,5 +180,5 @@ for i in $(seq 1 "$NODE_COUNT"); do
     assert_rpc_ok "$((BASE_RPC_PORT + i - 1))" "node-$i-final"
 done
 
-echo "Phase 2 soak gate PASSED."
-echo "For long soak: AINCORE_SOAK_SECONDS=604800 AINCORE_SOAK_KEEP_LOGS=1 ./scripts/phase2_soak_gate.sh"
+echo "Historical RPC smoke completed; consensus and mainnet acceptance NOT established."
+echo "Use docs/MAINNET_LAUNCH_PLAN.md for current acceptance requirements."

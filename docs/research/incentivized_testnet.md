@@ -1,8 +1,9 @@
 # Incentivized testnet: how P0 is earned (G5 A4-S6)
 
-Status: proposal, 2026-10-02. BW-1 (`genesis_bootstrap.md`) fixes P0 = 1.5 M AIN: the
-owned supply at mainnet genesis, earned on the incentivized testnet, with the founder
-excluded. This document fixes how it is earned. The rules must be published before the
+Status: proposal, 2026-10-02. The two tracks have a combined pool of up to
+1.5 M AIN for participants other than the founder. The owned supply they contribute
+at genesis is the sum of the actual whole-AIN allocations after rounding and caps.
+This document defines how participants qualify. The rules must be published before the
 incentivized testnet starts; nothing below may change during it.
 
 ## What the research says (`genesis_bootstrap.md`, entry mechanisms)
@@ -36,12 +37,13 @@ advance. In every committee of the window the founder's nodes must hold less tha
 the scoring tool refuses a window where they did not (second review HIGH-3: on a testnet where
 the founder holds most of the weight, whether an operator's vertices are certified is the
 founder's choice, and a deliberate omission looks like latency).
-- The testnet's `s_min` is set so that this follows from IT-5's minimum: the founder's nodes
-  own nothing and hold B = s_min − P, which is below a third once P > ⅔ s_min. Five
-  operators staking IT-3a's 50 k each make P = 250 k, so s_min_testnet = 1.5 × 250 k =
-  **375,000** (the founder's four nodes 93,750 each). Every further operator lowers the
-  founder's share; at 375 k of operator stake the bootstrap reaches 0 and, after U, ends,
-  which the testnet then rehearses too.
+- With testnet `s_min = 375,000`, suppose the founder owns no stake and holds the remaining
+  bootstrap weight. Independent operators must hold at least **250,001** units of committee
+  weight for the founder to hold less than a third. Five operators staking 50,000 test AIN
+  each leave the founder 125,000 of 375,000, exactly one third. The scorer rejects that
+  committee. Six operators staking 50,000 each leave the founder 75,000 (20%). Its four
+  nodes count as one party. Check the actual committee weights for every epoch in the window.
+  At 375,000 of operator stake the bootstrap weight reaches zero and, after U, bootstrap ends.
 - The window starts once the founder holds less than a third, announced in advance. The
   founder holds the faucet, so the faucet's account counts as the founder's if it validates.
 
@@ -79,12 +81,15 @@ the genesis ceremony's, as for Cosmos Hub gentxs:
 - the statements are published with the genesis, so anyone can challenge them.
 
 **IT-4 (operator share).**
-- The qualified operators share 1.0 M equally.
+- Each of the N qualified operators receives `floor(1,000,000 / N)` whole AIN as
+  bonded stake. The remainder stays unissued.
 - With at least five qualified operators no share can reach a third of the mainnet genesis
   committee: even with no founder weight, (18.5 M) / 5 is 20 %.
 
 **IT-5 (bootstrap assignment at mainnet genesis).**
-- B0 = s_min − bonded P0 = 18.5 M − 1.0 M = 17.5 M.
+- B0 = s_min − total bonded operator stake. With the default s_min of 18.5 M and
+  five qualified operators, B0 is 17.5 M. With six, each receives 166,666 AIN,
+  total bonded stake is 999,996 AIN and B0 is 17,500,004 units of voting weight.
 - The founder's validators receive at most 30 % of s_min (5.55 M), decided 2026-10-01, and
   are declared as one entity.
 - The qualified operators share the rest equally.
@@ -104,11 +109,24 @@ account and UTC day of block time:
 Only transactions whose receipt says they succeeded count; validators of the window's
 committees, the founder and the faucet earn nothing on this track. An account counts only if
 its points fall on at least 3 distinct days (Arbitrum's rule against burst farming).
-- **Funding clusters.** An account's funder is the sender of the first successful transfer
-  it received, from genesis on; its cluster is the account the faucet funded at the top of
-  that chain (or the chain's root). The 0.5 M is split pro rata by points among clusters,
-  each capped at 1,000 AIN, and a cluster's share is split among its accounts by points.
-  What the cap leaves is not minted: it stays in the emission reserve.
+- **Funding clusters.** The scorer reads successful transactions from the first block
+  through the snapshot. It recognizes AIN transfers made through the system
+  `coin::transfer<AincoreCoin>` entry function. An account that receives a positive
+  transfer directly from the faucet is the root of its own cluster. For every other
+  account, the scorer totals positive AIN transfers from each other sender up to the recipient's first successful
+  action recognized by the scorer. The largest total determines its funder. Equal totals
+  go to the smallest canonical sender address. The cutoff includes actions such as an
+  undelegation or a self-transfer even when they earn zero points.
+- If the account received no qualifying transfer, its funder is the first distinct
+  paymaster that sponsored a successful transaction for the account before or at that
+  cutoff. The scorer follows funders until it reaches an account whose funder is
+  the faucet. That account is the cluster root, including when the faucet is its
+  qualifying paymaster. Accounts whose funding history has a cycle or no such root share one
+  `unattributed` cluster. [Scoring implementation](../../core/genesis-tool/src/score.rs)
+- The 500,000 AIN public pool is divided among clusters in proportion to their points,
+  rounded down to whole AIN and capped at 1,000 AIN per cluster. Each cluster's share
+  is divided among its accounts in proportion to their points, rounded down again.
+  The balance stays in the emission reserve.
 - Why: transfers cost dust in gas, so without these rules 500 scripted accounts could take
   94 % of the track (second review MEDIUM-4). A farm now needs one faucet claim per cluster,
   and the faucet's claims are the gate (Known limits).

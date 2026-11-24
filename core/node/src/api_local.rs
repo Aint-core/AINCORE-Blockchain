@@ -215,24 +215,29 @@ fn parse_move_address(address: &str) -> Option<move_core_types::account_address:
     .ok()
 }
 
-/// A token id's bytes (hex: its symbol, then its creator's 32 address
-/// bytes, `tokenIdOf` in the SDK) and that creator.
+/// Wallet registration stores the owner's raw token ID, even when no
+/// issuing token exists yet. Only a creator lookup needs an address suffix.
+fn token_id_bytes(value: Option<&serde_json::Value>) -> Result<Vec<u8>, JsonRpcError> {
+    value
+        .and_then(|v| v.as_str())
+        .and_then(|s| hex::decode(s.trim_start_matches("0x")).ok())
+        .ok_or_else(|| JsonRpcError {
+            code: -32602,
+            message: "Invalid params: a hex token id".into(),
+        })
+}
+
 fn token_id_param(
     value: Option<&serde_json::Value>,
 ) -> Result<(Vec<u8>, move_core_types::account_address::AccountAddress), JsonRpcError> {
+    let id = token_id_bytes(value)?;
     let invalid = || JsonRpcError {
         code: -32602,
-        message: "Invalid params: a token id, the hex of its symbol and its creator's address"
-            .into(),
+        message: "Invalid params: a token id must include its creator's address".into(),
     };
-    let id = value
-        .and_then(|v| v.as_str())
-        .and_then(|s| hex::decode(s.trim_start_matches("0x")).ok())
-        .filter(|id| id.len() > 32)
-        .ok_or_else(invalid)?;
-    let creator =
-        move_core_types::account_address::AccountAddress::from_bytes(&id[id.len() - 32..])
-            .map_err(|_| invalid())?;
+    let offset = id.len().checked_sub(32).ok_or_else(invalid)?;
+    let creator = move_core_types::account_address::AccountAddress::from_bytes(&id[offset..])
+        .map_err(|_| invalid())?;
     Ok((id, creator))
 }
 
@@ -695,29 +700,11 @@ fn estimate_payload_gas(payload: &str) -> u64 {
     }
 }
 
-/// Net tracked supply. `sys:total_supply` is already NET of burns (it mirrors
-/// the Move ValidatorSet.total_supply — mints added — and is decremented by
-/// `burn_supply_trackers`). Despite the name, this is NOT gross minted.
-fn total_minted_supply(storage: &Arc<StateDB>) -> u128 {
-    storage
-        .get("sys:total_supply")
-        .ok()
-        .flatten()
-        .or_else(|| storage.get("total_supply").ok().flatten())
-        .and_then(|s| s.parse::<u128>().ok())
-        .unwrap_or(0)
-}
-
-/// SEC-#15: derive the public supply view from the NET tracked supply + the
-/// cumulative burned total. Because the net supply already has burns removed,
-/// `circulating == net` and gross `total_minted == net + burned`. The previous
-/// RPC computed `circulating = net - burned`, subtracting burns a SECOND time
-/// and under-reporting circulating supply by exactly `total_burned`.
-/// Returns `(total_minted_gross, circulating)`.
-fn supply_view(net_supply: u128, total_burned: u128) -> (u128, u128) {
-    let total_minted = net_supply.saturating_add(total_burned);
-    let circulating = net_supply;
-    (total_minted, circulating)
+fn economics_error(reason: String) -> JsonRpcError {
+    JsonRpcError {
+        code: -32000,
+        message: format!("Economic state unavailable: {reason}"),
+    }
 }
 
 fn stored_tx_receipt(storage: &Arc<StateDB>, tx_hash: &str) -> Option<serde_json::Value> {
@@ -913,13 +900,14 @@ const HEAVY_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 /// a read's slot); in the pool it waited behind 8 MiB block reads, and a
 /// client's second call was refused (one heavy call at a time a client), so
 /// a wallet's confirmations failed whenever the reads were busy.
-const READ_METHODS: [&str; 8] = [
+const READ_METHODS: [&str; 9] = [
     "aincore_getBlocks",
     "aincore_getBlockByHash",
     "aincore_getTransactionsByAddress",
     "aincore_getDag",
     "aincore_getTransaction",
     "aincore_getDaStatus",
+    "aincore_getDexPools",
     "aincore_sampleDA",
     "aincore_getStateProof",
 ];
@@ -1326,8 +1314,12 @@ fn handle_rpc_method(
              };
              // G4 S6: sessions, and how many of them name a committee member.
              let (peers_count, committee_sessions) = session_counts(&data.sessions);
+             // Report the same immutable domain used to verify this node's vertices.
+             let (chain_id, genesis_identity) = blockchain::vertex_domain();
 
              Ok(serde_json::json!({
+                 "chain_id": (!chain_id.is_empty()).then_some(chain_id),
+                 "genesis_identity": (!genesis_identity.is_empty()).then_some(genesis_identity),
                  "node_id": node_id,
                  "current_round": current_round,
                  "consensus_busy": consensus_busy,
@@ -1874,6 +1866,7 @@ fn handle_rpc_method(
         },
 
         "aincore_getDexPools" => {
+            let _slot = read_slot(data, "aincore_getDexPools")?;
             let registry = decode_dex_registry(&data.storage);
             let pools: Vec<serde_json::Value> = registry
                 .pools
@@ -1996,7 +1989,7 @@ fn handle_rpc_method(
                     code: -32602,
                     message: "Invalid params: [address, token_id]".into(),
                 })?;
-            let (id, _) = token_id_param(params.get(1))?;
+            let id = token_id_bytes(params.get(1))?;
             let held = token_resource::<MoveTokenWallet>(&data.storage, &owner, "TokenWallet")
                 .and_then(|wallet| wallet.balances.into_iter().find(|b| b.token_id == id));
             Ok(serde_json::json!({
@@ -2026,27 +2019,12 @@ fn handle_rpc_method(
         },
 
         "aincore_getSupply" => {
-            // No params
-            let max_supply: u128 = 150_000_000 * 1_000_000_000_000_000_000; // 150M AIN
-
-            // Genesis writes sys:total_supply; keep total_supply as a legacy fallback only.
-            // SEC-#15: sys:total_supply is already NET of burns, so circulating == net
-            // and gross total_minted == net + burned. Do NOT subtract burns again.
-            let net_supply = total_minted_supply(&data.storage);
-            let total_burned = match data.storage.get("total_burned") {
-                Ok(Some(s)) => s.parse::<u128>().unwrap_or(0),
-                _ => 0,
-            };
-            let (total_minted, circulating) = supply_view(net_supply, total_burned);
-            // G5 DOC-1: the emission draws 1.90 %/yr of what remains of the
-            // cap, by consensus time; there is no per-block reward.
-            let emission = executor::emission_view(&data.storage);
-
+            let emission = executor::emission_view(&data.storage).map_err(economics_error)?;
             Ok(serde_json::json!({
-                "max_supply": max_supply.to_string(),
-                "total_minted": total_minted.to_string(),
-                "total_burned": total_burned.to_string(),
-                "circulating_supply": circulating.to_string(),
+                "max_supply": executor::MAX_SUPPLY.to_string(),
+                "total_minted": emission.minted.to_string(),
+                "total_burned": emission.cumulative_burned.to_string(),
+                "circulating_supply": emission.net_supply.to_string(),
                 "remaining_reserve": emission.remaining.to_string(),
                 "emission_rate_per_year": EMISSION_RATE_PER_YEAR,
                 "last_reward_time": emission.last_reward_time,
@@ -2210,28 +2188,21 @@ fn handle_rpc_method(
             }))
         },
         "aincore_getEconomics" => {
-            // G5 DOC-1: the economics as the chain runs them, from Move state.
-            let burn_percentage = data.storage.get_burn_percentage();
-            let latest_height = data.storage.get_chain_height();
-            let max_supply: u128 = 150_000_000 * 1_000_000_000_000_000_000;
-            let emission = executor::emission_view(&data.storage);
-            let clock = executor::committed_chain_clock(&data.storage);
-            let (epoch_blocks, reward_period, max_block_interval_secs) =
-                executor::pinned_chain_params(&data.storage).unwrap_or((0, 0, 0));
-
+            let economics = executor::economics_view(&data.storage).map_err(economics_error)?;
+            let emission = economics.emission;
             Ok(serde_json::json!({
                 "emission_model": EMISSION_MODEL,
                 "emission_rate_per_year": EMISSION_RATE_PER_YEAR,
-                "max_supply": max_supply.to_string(),
+                "max_supply": executor::MAX_SUPPLY.to_string(),
                 "total_minted": emission.minted.to_string(),
                 "remaining_reserve": emission.remaining.to_string(),
                 "last_reward_time": emission.last_reward_time,
-                "consensus_time": clock.time,
-                "reward_period_blocks": reward_period,
-                "epoch_blocks": epoch_blocks,
-                "max_block_interval_secs": max_block_interval_secs,
-                "burn_percentage": burn_percentage,
-                "block_height": latest_height
+                "consensus_time": economics.clock.time,
+                "reward_period_blocks": economics.reward_period,
+                "epoch_blocks": economics.epoch_blocks,
+                "max_block_interval_secs": economics.max_block_interval_secs,
+                "burn_percentage": economics.burn_percentage,
+                "block_height": economics.clock.height
             }))
         },
 
@@ -3322,6 +3293,7 @@ pub async fn start_api_server(
     sessions: network::SessionTable,
     mempool: Arc<Mutex<mempool::Mempool>>,
     storage: Arc<StateDB>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
 ) -> std::io::Result<()> {
     println!("🌐 Starting REST API server on port {}...", api_port);
 
@@ -3364,8 +3336,8 @@ pub async fn start_api_server(
     // gunakan tokio::task::LocalSet agar runtime single-thread tidak butuh Send
     let local = tokio::task::LocalSet::new();
     local
-        .run_until(
-            HttpServer::new(move || {
+        .run_until(async move {
+            let server = HttpServer::new(move || {
                 use actix_cors::Cors;
                 let cors = if permissive_cors_enabled() {
                     Cors::permissive()
@@ -3400,6 +3372,9 @@ pub async fn start_api_server(
                     .route("/get_network_info", web::get().to(get_network_info_handler))
                     .route("/get_transaction", web::get().to(get_transaction_handler))
             })
+            // Both plaintext listeners serve HTTP/1.1, including the proxy port.
+            .auto_h2c(false)
+            .disable_signals()
             .bind((bind_host.as_str(), api_port))
             .and_then(|server| match proxy_port {
                 // B104: the listener only the header-setting proxy uses.
@@ -3415,8 +3390,23 @@ pub async fn start_api_server(
                 }
                 None => Ok(server),
             })?
-            .run(),
-        )
+            .run();
+            let handle = server.handle();
+            tokio::pin!(server);
+            tokio::select! {
+                result = &mut server => result,
+                () = async {
+                    while !shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                } => {
+                    // stop() completes only while the Server processes the
+                    // stop command; polling them sequentially deadlocks.
+                    let ((), result) = tokio::join!(handle.stop(true), server);
+                    result
+                }
+            }
+        })
         .await
 }
 
@@ -3500,6 +3490,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rpc_shutdown_stops_listener_and_releases_database() {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let db = temp_db("rpc_shutdown_release");
+        let weak_db = Arc::downgrade(&db);
+        let state = test_state(db);
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_shutdown = Arc::clone(&shutdown);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        drop(listener);
+        let thread = std::thread::spawn(move || {
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all().build().unwrap().block_on(start_api_server(
+                    address.port(), state.consensus, state.sessions, state.mempool,
+                    state.storage, server_shutdown,
+                ));
+            done_tx.send(result).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut served = false;
+        while Instant::now() < deadline {
+            if let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(100)) {
+                stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+                stream.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
+                let mut response = String::new();
+                served = stream.read_to_string(&mut response).is_ok()
+                    && response.starts_with("HTTP/1.1 200");
+                if served { break; }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        shutdown.store(true, Ordering::SeqCst);
+        done_rx.recv_timeout(Duration::from_secs(40)).expect("API shutdown timed out")
+            .expect("API failed");
+        thread.join().expect("API thread panicked");
+        assert!(served, "positive control: API did not serve health");
+        assert!(TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_err());
+        assert!(weak_db.upgrade().is_none(), "API retained its database after join");
+    }
+
     /// B65 witness: at most DRY_RUNS_AT_ONCE estimates execute at once; the
     /// next is told to retry, and a finished one frees its slot.
     #[test]
@@ -3543,6 +3578,7 @@ mod tests {
             ("aincore_getDag", serde_json::json!([])),
             ("aincore_getTransaction", serde_json::json!([hash])),
             ("aincore_getDaStatus", serde_json::json!([1])),
+            ("aincore_getDexPools", serde_json::json!([])),
         ] {
             assert!(
                 heavy_method(method).is_some(),
@@ -4378,10 +4414,16 @@ mod tests {
         )
         .unwrap();
         let wallet = MoveTokenWallet {
-            balances: vec![MoveTokenBalance {
-                token_id: id.clone(),
-                balance: 75,
-            }],
+            balances: vec![
+                MoveTokenBalance {
+                    token_id: id.clone(),
+                    balance: 75,
+                },
+                MoveTokenBalance {
+                    token_id: vec![7; 8],
+                    balance: 0,
+                },
+            ],
         };
         db.put(
             &key(&holder, "TokenWallet"),
@@ -4405,6 +4447,12 @@ mod tests {
         );
         assert_eq!(held["balance"], "75");
         assert_eq!(held["registered"], true);
+        let registered = ask(
+            "aincore_getTokenBalance",
+            serde_json::json!([holder, "07".repeat(8)]),
+        );
+        assert_eq!(registered["registered"], true);
+        assert_eq!(registered["balance"], "0");
         let none = ask(
             "aincore_getTokenBalance",
             serde_json::json!([creator, id_hex]),
@@ -4414,6 +4462,17 @@ mod tests {
             ("0".into(), false.into())
         );
         assert!(handle_rpc_method("aincore_getToken", serde_json::json!(["zz"]), &state).is_err());
+    }
+
+    #[test]
+    fn token_lookup_accepts_an_empty_symbol_from_move() {
+        let creator = parse_move_address(&"ab".repeat(32)).unwrap();
+        let raw = serde_json::json!(hex::encode(creator.to_vec()));
+        assert_eq!(
+            token_id_param(Some(&raw)).unwrap(),
+            (creator.to_vec(), creator)
+        );
+        assert!(token_id_param(Some(&serde_json::json!("ab".repeat(31)))).is_err());
     }
 
     /// B194 witness: a proposal is read from `0x1::governance` on chain, by
@@ -5013,6 +5072,7 @@ mod tests {
         let ain: u128 = 1_000_000_000_000_000_000;
         {
             let _seed = db.seeding();
+            db.put("sys:config:burn_percentage", "10").unwrap();
             let put = |tag: &str, bytes: Vec<u8>| {
                 db.put(
                     &vm_move::state_keys::resource_key_str(
@@ -5053,6 +5113,9 @@ mod tests {
         let state = test_state(Arc::clone(&db));
         let remaining = (150_000_000 * ain - 2_000_500 * ain).to_string();
         let supply = handle_rpc_method("aincore_getSupply", serde_json::json!([]), &state).unwrap();
+        assert_eq!(supply["circulating_supply"], (2_000_000 * ain).to_string());
+        assert_eq!(supply["total_burned"], (500 * ain).to_string());
+        assert_eq!(supply["total_minted"], (2_000_500 * ain).to_string());
         assert_eq!(supply["remaining_reserve"], remaining);
         assert_eq!(supply["last_reward_time"], 4_242);
         assert_eq!(supply["emission_rate_per_year"], "0.019");
@@ -5061,6 +5124,7 @@ mod tests {
         assert_eq!(economics["remaining_reserve"], remaining);
         assert_eq!(economics["total_minted"], (2_000_500 * ain).to_string());
         assert_eq!(economics["consensus_time"], 4_300);
+        assert_eq!(economics["block_height"], 77);
         assert_eq!(
             (
                 economics["epoch_blocks"].clone(),
@@ -5396,13 +5460,16 @@ mod tests {
     }
 
     #[test]
-    fn test_supply_reads_genesis_total_supply_key() {
-        let db = temp_db("supply");
+    fn supply_requires_canonical_move_resources() {
+        let db = temp_db("supply_required");
         let _seed = db.seeding();
-        db.put("sys:total_supply", "42").expect("write sys supply");
-        db.put("total_supply", "7").expect("write legacy supply");
-
-        assert_eq!(total_minted_supply(&db), 42);
+        db.put("sys:total_supply", "42").unwrap();
+        let state = test_state(db.clone());
+        let read = || handle_rpc_method("aincore_getSupply", serde_json::json!([]), &state);
+        assert_eq!(read().unwrap_err().code, -32000);
+        // A readable string is not necessarily a valid ValidatorSet.
+        db.put(&executor::validator_set_key(), "00").unwrap();
+        assert_eq!(read().unwrap_err().code, -32000);
     }
 
     #[test]
@@ -5621,18 +5688,5 @@ mod tests {
         assert!(err.message.contains("disabled in secure mode"));
     }
 
-    /// SEC-#15: circulating supply must NOT have burns subtracted twice.
-    #[test]
-    fn supply_view_does_not_double_subtract_burns() {
-        // Net = gross issued (1000) − burned (150) = 850.
-        let (total_minted, circulating) = supply_view(850, 150);
-        assert_eq!(total_minted, 1000, "gross minted = net + burned");
-        assert_eq!(circulating, 850, "circulating = net (NOT net - burned)");
-        // Self-consistent: circulating == total_minted − total_burned.
-        assert_eq!(circulating, total_minted - 150);
 
-        // No burns: minted == circulating == net.
-        let (m, c) = supply_view(500, 0);
-        assert_eq!((m, c), (500, 500));
-    }
 }

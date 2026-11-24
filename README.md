@@ -703,15 +703,16 @@ curl -X POST http://localhost:8002/rpc \
 
 | Network | Chain ID | Usage |
 |---|---|---|
-| **Mainnet** | `AINCORE-MAINNET-1` | Production (set via `AINCORE_CHAIN_ID` env var) |
-| **Current fresh public testnet** | `AINCORE-LATEST-FRESH-1` | Active public observer testnet lineage |
+| **Mainnet** | `AINCORE-MAINNET-1` | Reserved for the approved production genesis |
+| **Observer testnet** | `AINCORE-LATEST-FRESH-1` | Observer onboarding for this existing testnet lineage |
 | **Legacy testnet** | `AINCORE-TESTNET-1` | Older local/test fixtures only |
 
 ### Environment Variables
 
-```bash
-export AINCORE_CHAIN_ID=AINCORE-MAINNET-1  # Required for production
-```
+The node reads the chain ID recorded by genesis in its database. An optional
+`AINCORE_CHAIN_ID` must match that ID or startup fails. For a fresh network,
+verify the genesis hash and runtime package against the approved release record.
+Each scoring testnet or rehearsal needs its own chain ID. [Runtime package](docs/RELEASE_PACKAGE.md)
 
 ---
 

@@ -1,0 +1,23 @@
+{
+  "scope": "native ARM64 release package extracted into fresh folder; no external stdlib copied into runtime cwd",
+  "passed": true,
+  "binary_sha256": "6882bbd71cc21c8db20c8fdb3825d6e81d335025bf5e46e4495d80778bf890b4",
+  "archive_sha256": "1c5a56f689465476c44a56f425e7288d7a44ed5dd864d76a49fb8ae1a279d793",
+  "genesis_sha256": "fb8479b39650654f608b6b159821764e9de31d9da7a1340afddfd26282cde61d",
+  "case": {
+    "scenario": "clean_shutdown",
+    "passed": true,
+    "log": "/home/pi/aincore-backup-safety-20261022/package-after/clean_shutdown.log",
+    "command": [
+      "/home/pi/aincore-backup-safety-20261022/package-after/node",
+      "--port",
+      "47521",
+      "--rpc-port",
+      "54311",
+      "--datadir",
+      "/home/pi/aincore-backup-safety-20261022/package-after/clean_shutdown"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 3.313
+  }
+}

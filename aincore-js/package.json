@@ -1,6 +1,24 @@
 {
   "name": "aincore",
   "version": "1.0.0",
+  "files": [
+    "dist/address.js",
+    "dist/address.d.ts",
+    "dist/bcs.js",
+    "dist/bcs.d.ts",
+    "dist/connection.js",
+    "dist/connection.d.ts",
+    "dist/da.js",
+    "dist/da.d.ts",
+    "dist/index.js",
+    "dist/index.d.ts",
+    "dist/keypair.js",
+    "dist/keypair.d.ts",
+    "dist/stateProof.js",
+    "dist/stateProof.d.ts",
+    "dist/transaction.js",
+    "dist/transaction.d.ts"
+  ],
   "description": "",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -13,13 +31,14 @@
     "test:inputs": "ts-node test_sdk_inputs.ts",
     "test:phase05": "ts-node phase05_live_smoke.ts",
     "dex:seed": "ts-node dex_native_seed_e2e.ts",
-    "test": "npm run test:bcs && npm run test:address && npm run test:state-proof && npm run test:da && npm run test:inputs"
+    "test": "npm run test:bcs && npm run test:address && npm run test:state-proof && npm run test:da && npm run test:inputs && npm run test:package",
+    "test:package": "node test_package.cjs"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "axios": "^1.13.2",
+    "axios": "1.21.1",
     "bip39": "^3.1.0",
     "dotenv": "^17.2.4",
     "tweetnacl": "^1.0.3"

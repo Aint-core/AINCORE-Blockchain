@@ -423,6 +423,15 @@ pub fn note_boot_proof(storage: &StateDB, height: u64) -> Result<(), String> {
 
 /// `consensus:epoch_active`: the active epoch, written at activation.
 pub const EPOCH_ACTIVE_KEY: &str = "consensus:epoch_active";
+
+/// Epoch zero precedes the first activation. An unreadable marker cannot
+/// authorize signing for an earlier epoch.
+pub(crate) fn active_epoch(storage: &StateDB) -> Result<u64, String> {
+    match storage.try_get(EPOCH_ACTIVE_KEY).map_err(|e| e.to_string())? {
+        Some(value) => value.parse().map_err(|_| "invalid active epoch".to_string()),
+        None => Ok(0),
+    }
+}
 /// Standalone engines count their own blocks (one per decided anchor).
 const STANDALONE_HEIGHT_KEY: &str = "consensus:standalone_height";
 
@@ -488,12 +497,7 @@ impl Engine {
     /// RC-1 step 1 for epochs: the active epoch, the one before it, and the
     /// next one if its predecessor already closed.
     pub(super) fn load_epoch_state(&mut self) -> Result<(), String> {
-        let active = self
-            .storage
-            .get(EPOCH_ACTIVE_KEY)
-            .map_err(|e| e.to_string())?
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0);
+        let active = active_epoch(&self.storage)?;
         self.blocks = self
             .storage
             .get(STANDALONE_HEIGHT_KEY)

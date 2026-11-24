@@ -1005,6 +1005,19 @@ impl StateDB {
     /// historical committee or BLS/PoP verifier. Call on the acceptance view.
     /// A present v1 record is authoritative: corruption cannot select legacy.
     pub fn get_active_validators_checked(&self) -> Result<Vec<(String, u64)>, StorageError> {
+        let mut validators = self.get_recorded_validators_checked()?;
+        validators.retain(|(_, stake)| *stake > 0);
+        if validators.is_empty() {
+            return Err(StorageError::DatabaseOperation(
+                "no positive-stake validator eligibility".into(),
+            ));
+        }
+        Ok(validators)
+    }
+
+    /// Strict membership records, including zero-stake entries. Recovery uses
+    /// the recorded identities even after their voting power has fallen to zero.
+    pub fn get_recorded_validators_checked(&self) -> Result<Vec<(String, u64)>, StorageError> {
         let mut validators: Vec<(String, u64)> =
             if let Some(bytes) = self.db.get("sys:validator_set:v1")? {
                 serde_json::from_slice::<Vec<ValidatorSetV1Entry>>(&bytes)
@@ -1038,10 +1051,9 @@ impl StateDB {
                 "duplicate validator address".into(),
             ));
         }
-        validators.retain(|(_, stake)| *stake > 0);
         if validators.is_empty() {
             return Err(StorageError::DatabaseOperation(
-                "no positive-stake validator eligibility".into(),
+                "empty validator records".into(),
             ));
         }
         Ok(validators)

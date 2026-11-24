@@ -1,4 +1,11 @@
 # AINCORE — Rencana Perbaikan Menuju Mainnet
+> Historical plan (August 2026), retained as evidence. Current execution and
+> launch criteria: [MAINNET_LAUNCH_PLAN.md](MAINNET_LAUNCH_PLAN.md) and G0-G7 in
+> [PRODUCTION_READINESS_GOAL.md](PRODUCTION_READINESS_GOAL.md). Statements below
+> about required fresh genesis, old defects, workload and timing describe that
+> checkpoint, not today's authorization or verified state. No reset or migration
+> is authorized by this document.
+
 > Disusun 2026-08-12 dari audit 80-agent + riset paper/dokumentasi/implementasi referensi (Aptos, Sui, Narwhal/Bullshark, Block-STM, Tendermint BFT-time) + pembacaan source move-vm asli di mesin ini.
 
 ## Ringkasan

@@ -1,0 +1,147 @@
+{
+  "passed": true,
+  "stage": "complete",
+  "started_at": 1792672892.8443842,
+  "scope": "real RocksDB observer roundtrip at genesis; no certified-chain replay, transaction history or validator recovery claim",
+  "binary_sha256": "6882bbd71cc21c8db20c8fdb3825d6e81d335025bf5e46e4495d80778bf890b4",
+  "genesis_sha256": "fb8479b39650654f608b6b159821764e9de31d9da7a1340afddfd26282cde61d",
+  "script_sha256": {
+    "backup_node.sh": "7a6048cf5afd091a1ed3bc75b20edb949321682bae4b73ebe9fbcb1b297f9614",
+    "restore_node.sh": "6f28c46378ea49f998d95d4b4ee50dd98ca17293ae9f3b4aa96903144aa38f59",
+    "observer_backup_probe.py": "107e8bdf310025c2084490884b589fede31bf3d1e67932907b260c9bcaafb1ef",
+    "node_exit_probe.py": "d036cff7f9f1e1e6c6f7c71d3b81a47c8182c018d172f013647d1a6252ef82f6"
+  },
+  "steps": [
+    {
+      "step": "live_lock_refused",
+      "exit_code": 3
+    },
+    {
+      "step": "original_shutdown",
+      "exit_code": 0
+    },
+    {
+      "step": "stopped_backup_restore",
+      "database_files": 8,
+      "archive_sha256": "a2eda928c50d89a03b31813f6aecf29b578fd429211418a724715e6ef70f8d00",
+      "key_not_restored": true
+    },
+    {
+      "step": "restored_shutdown",
+      "exit_code": 0
+    }
+  ],
+  "before": {
+    "node_id": "4a02f040f0e77ec977979de4d87b3ffd51c05ae4699beca223445784b0cc1d28",
+    "chain_id": "AINCORE-LAB-646F5C8B4FEBB6A2",
+    "status": {
+      "latest_height": "0",
+      "finalized_round": "0",
+      "last_anchor_round": "0",
+      "finality_digest": ""
+    },
+    "balances": {
+      "7a19b9698e493b2f20c2a3d38e6cf68c83993f11c18106163ac62da53f2f4d8f": {
+        "balance_source": "move_coin_store",
+        "data": "{\"sequence_number\":0,\"balance\":0,\"btc_balance\":0,\"public_key\":\"ee94888274f5db93f25b4d5e6cf8bd06ff0147c8f5d881726ba4fbb2b40ce065\"}",
+        "id": "7a19b9698e493b2f20c2a3d38e6cf68c83993f11c18106163ac62da53f2f4d8f",
+        "move_balance": "0",
+        "owner": {
+          "Address": "7a19b9698e493b2f20c2a3d38e6cf68c83993f11c18106163ac62da53f2f4d8f"
+        },
+        "type_struct": "0x1::account::Account",
+        "version": 0
+      },
+      "2c58e7566b33ce4272191539534484ef2a8bc4f08a7a1a9f88ac70febd625959": {
+        "balance_source": "move_coin_store",
+        "data": "{\"sequence_number\":0,\"balance\":0,\"btc_balance\":0,\"public_key\":\"e459080afb6ef082dbb28bd6b6bb82bb184d3848070e8f69dbba1d73e3f5687d\"}",
+        "id": "2c58e7566b33ce4272191539534484ef2a8bc4f08a7a1a9f88ac70febd625959",
+        "move_balance": "0",
+        "owner": {
+          "Address": "2c58e7566b33ce4272191539534484ef2a8bc4f08a7a1a9f88ac70febd625959"
+        },
+        "type_struct": "0x1::account::Account",
+        "version": 0
+      },
+      "3b94a4d32c0f06b8166228142e3bbe97586428bcc39769323e263f85d2092cc0": {
+        "balance_source": "move_coin_store",
+        "data": "{\"sequence_number\":0,\"balance\":0,\"btc_balance\":0,\"public_key\":\"72cc9c9e652a54660cefc4ace15f81f07ee0d2780bc8ed10465316a24ee08f12\"}",
+        "id": "3b94a4d32c0f06b8166228142e3bbe97586428bcc39769323e263f85d2092cc0",
+        "move_balance": "0",
+        "owner": {
+          "Address": "3b94a4d32c0f06b8166228142e3bbe97586428bcc39769323e263f85d2092cc0"
+        },
+        "type_struct": "0x1::account::Account",
+        "version": 0
+      },
+      "ebea86215d2c3e49ef4a90a693eea38b856ab2e70de841675a5870d147585362": {
+        "balance_source": "move_coin_store",
+        "data": "{\"sequence_number\":0,\"balance\":0,\"btc_balance\":0,\"public_key\":\"a3513965bd9d89aa1ff68870759f5735bdf5762c98e9c4614a981a597e679f5c\"}",
+        "id": "ebea86215d2c3e49ef4a90a693eea38b856ab2e70de841675a5870d147585362",
+        "move_balance": "0",
+        "owner": {
+          "Address": "ebea86215d2c3e49ef4a90a693eea38b856ab2e70de841675a5870d147585362"
+        },
+        "type_struct": "0x1::account::Account",
+        "version": 0
+      }
+    }
+  },
+  "after": {
+    "node_id": "efabd847c11596f8a88f77c74e3ecc9afde52ef972ee9fbf3fff08af375072ae",
+    "chain_id": "AINCORE-LAB-646F5C8B4FEBB6A2",
+    "status": {
+      "latest_height": "0",
+      "finalized_round": "0",
+      "last_anchor_round": "0",
+      "finality_digest": ""
+    },
+    "balances": {
+      "7a19b9698e493b2f20c2a3d38e6cf68c83993f11c18106163ac62da53f2f4d8f": {
+        "balance_source": "move_coin_store",
+        "data": "{\"sequence_number\":0,\"balance\":0,\"btc_balance\":0,\"public_key\":\"ee94888274f5db93f25b4d5e6cf8bd06ff0147c8f5d881726ba4fbb2b40ce065\"}",
+        "id": "7a19b9698e493b2f20c2a3d38e6cf68c83993f11c18106163ac62da53f2f4d8f",
+        "move_balance": "0",
+        "owner": {
+          "Address": "7a19b9698e493b2f20c2a3d38e6cf68c83993f11c18106163ac62da53f2f4d8f"
+        },
+        "type_struct": "0x1::account::Account",
+        "version": 0
+      },
+      "2c58e7566b33ce4272191539534484ef2a8bc4f08a7a1a9f88ac70febd625959": {
+        "balance_source": "move_coin_store",
+        "data": "{\"sequence_number\":0,\"balance\":0,\"btc_balance\":0,\"public_key\":\"e459080afb6ef082dbb28bd6b6bb82bb184d3848070e8f69dbba1d73e3f5687d\"}",
+        "id": "2c58e7566b33ce4272191539534484ef2a8bc4f08a7a1a9f88ac70febd625959",
+        "move_balance": "0",
+        "owner": {
+          "Address": "2c58e7566b33ce4272191539534484ef2a8bc4f08a7a1a9f88ac70febd625959"
+        },
+        "type_struct": "0x1::account::Account",
+        "version": 0
+      },
+      "3b94a4d32c0f06b8166228142e3bbe97586428bcc39769323e263f85d2092cc0": {
+        "balance_source": "move_coin_store",
+        "data": "{\"sequence_number\":0,\"balance\":0,\"btc_balance\":0,\"public_key\":\"72cc9c9e652a54660cefc4ace15f81f07ee0d2780bc8ed10465316a24ee08f12\"}",
+        "id": "3b94a4d32c0f06b8166228142e3bbe97586428bcc39769323e263f85d2092cc0",
+        "move_balance": "0",
+        "owner": {
+          "Address": "3b94a4d32c0f06b8166228142e3bbe97586428bcc39769323e263f85d2092cc0"
+        },
+        "type_struct": "0x1::account::Account",
+        "version": 0
+      },
+      "ebea86215d2c3e49ef4a90a693eea38b856ab2e70de841675a5870d147585362": {
+        "balance_source": "move_coin_store",
+        "data": "{\"sequence_number\":0,\"balance\":0,\"btc_balance\":0,\"public_key\":\"a3513965bd9d89aa1ff68870759f5735bdf5762c98e9c4614a981a597e679f5c\"}",
+        "id": "ebea86215d2c3e49ef4a90a693eea38b856ab2e70de841675a5870d147585362",
+        "move_balance": "0",
+        "owner": {
+          "Address": "ebea86215d2c3e49ef4a90a693eea38b856ab2e70de841675a5870d147585362"
+        },
+        "type_struct": "0x1::account::Account",
+        "version": 0
+      }
+    }
+  },
+  "finished_at": 1792672899.9525497
+}
